@@ -7,9 +7,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tagimage_core::{parse_u64_env, parse_usize_env, ThumbJobPayload};
-use tagimage_db::{claim_next_thumb_job, mark_thumb_failed, mark_thumb_succeeded};
+use tagimage_db::sqlite::{
+    claim_next_sqlite_thumb_job, mark_sqlite_thumb_failed, mark_sqlite_thumb_succeeded,
+    open_sqlite_runtime_db, resolve_sqlite_runtime_path,
+};
 use tokio::time::sleep;
-use tokio_postgres::NoTls;
 
 #[derive(Debug, Clone)]
 struct ThumbJobMetrics {
@@ -207,7 +209,7 @@ fn process_payload(
 }
 
 async fn run_worker_loop(
-    db_url: String,
+    db_path: PathBuf,
     worker_id: String,
     slot: usize,
     worker_count: usize,
@@ -217,19 +219,8 @@ async fn run_worker_loop(
     slow_ms: u128,
     shared_metrics: Arc<Mutex<WorkerMetrics>>,
 ) -> Result<(), String> {
-    let (mut client, connection) = tokio_postgres::connect(&db_url, NoTls)
-        .await
-        .map_err(|e| format!("connect postgres (slot={}): {e}", slot))?;
-
-    let connection_worker_id = worker_id.clone();
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!(
-                "[rust-thumb-worker] postgres connection error worker={} slot={}: {e}",
-                connection_worker_id, slot
-            );
-        }
-    });
+    let conn = open_sqlite_runtime_db(&db_path)
+        .map_err(|e| format!("open sqlite db {} (slot={}): {e}", db_path.display(), slot))?;
 
     eprintln!(
         "[rust-thumb-worker] loop_started worker={} slot={}",
@@ -237,7 +228,7 @@ async fn run_worker_loop(
     );
 
     loop {
-        let claimed = claim_next_thumb_job(&mut client, &worker_id).await?;
+        let claimed = claim_next_sqlite_thumb_job(&conn, &worker_id)?;
         let Some(job) = claimed else {
             {
                 let mut worker_metrics = lock_worker_metrics(&shared_metrics);
@@ -325,8 +316,7 @@ async fn run_worker_loop(
                     "skipped_existing": job_metrics.skipped_existing,
                     "ext": &job_metrics.ext,
                 });
-                if let Err(e) = mark_thumb_succeeded(&mut client, &job, Some(success_metrics)).await
-                {
+                if let Err(e) = mark_sqlite_thumb_succeeded(&conn, &job.id, Some(success_metrics)) {
                     eprintln!(
                         "[rust-thumb-worker] mark success failed worker={} slot={} job={} error={}",
                         worker_id, slot, job.id, e
@@ -347,8 +337,7 @@ async fn run_worker_loop(
                 );
 
                 if let Err(e) =
-                    mark_thumb_failed(&mut client, &job, &err, max_backoff_sec, Some(total_ms))
-                        .await
+                    mark_sqlite_thumb_failed(&conn, &job.id, &err, max_backoff_sec, Some(total_ms))
                 {
                     eprintln!(
                         "[rust-thumb-worker] mark fail failed worker={} slot={} job={} error={}",
@@ -367,9 +356,14 @@ async fn run_worker_loop(
 }
 
 async fn run() -> Result<(), String> {
-    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer".to_string()
-    });
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .ok_or_else(|| "cannot resolve repo root".to_string())?
+        .to_path_buf();
+    let _ = dotenvy::from_path(repo_root.join(".env"));
+    let db_path = resolve_sqlite_runtime_path(&repo_root);
     let poll_ms = std::env::var("IMGVIEWER_THUMB_WORKER_POLL_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -387,8 +381,10 @@ async fn run() -> Result<(), String> {
     let slow_ms = parse_u64_env("IMGVIEWER_THUMB_SLOW_MS", 1000) as u128;
 
     eprintln!(
-        "[rust-thumb-worker] started as {} workers={}",
-        worker_id, worker_count
+        "[rust-thumb-worker] started as {} workers={} sqlite={}",
+        worker_id,
+        worker_count,
+        db_path.display()
     );
 
     let shared_metrics = Arc::new(Mutex::new(WorkerMetrics::new()));
@@ -396,7 +392,7 @@ async fn run() -> Result<(), String> {
 
     for slot in 1..=worker_count {
         workers.spawn(run_worker_loop(
-            db_url.clone(),
+            db_path.clone(),
             worker_id.clone(),
             slot,
             worker_count,

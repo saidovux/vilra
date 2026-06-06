@@ -14,22 +14,22 @@ Tauri shell
   -> Rust workers for thumbnails/metadata/scanner/hash
 ```
 
-The migration is incremental. Current Python and PostgreSQL development mode stays valid until parity is proven.
+The migration is incremental. Current development mode uses Rust-first runtime with a local SQLite DB.
 
 ## 2. Runtime rule
 
-- PostgreSQL may remain in current development/tests.
-- Packaged desktop runtime should not require user-installed PostgreSQL.
+- Normal development/tests should use the local SQLite DB.
+- Packaged desktop runtime should not require a user-installed database server.
 
 ## 3. Database direction
 
 Current DB:
 
-- PostgreSQL
+- SQLite
 
 Target desktop DB:
 
-- SQLite (preferred for packaged Tauri runtime)
+- SQLite
 
 Rationale:
 
@@ -41,8 +41,8 @@ Rationale:
 
 Important constraint:
 
-- Do not migrate DB immediately.
-- First define compatibility layer and a migration path.
+- Do not change public API behavior while packaging work proceeds.
+- Keep the DB file local and explicit through `TAGIMAGE_SQLITE_PATH`.
 
 ## 4. Sidecar strategy
 
@@ -57,16 +57,11 @@ Current stage keeps existing `start.sh` development mode.
 
 ## 5. Migration order
 
-1. Keep current Python/PostgreSQL dev mode stable.
-2. Continue Rust workers on PostgreSQL while behavior is validated.
-3. Add DB abstraction and migration plan.
-4. Introduce SQLite schema equivalent.
-5. Add SQLite support to Rust workers.
-6. Build Rust backend/API compatible with current FastAPI endpoints.
-7. Add Tauri shell.
-8. Package Rust backend/workers as sidecars or integrate into `src-tauri`.
-9. Keep Python path as dev/reference fallback until Rust parity is proven.
-10. Remove Python only after tests and runtime validation.
+1. Keep current Rust-first SQLite dev mode stable.
+2. Preserve Python as legacy/reference code until parity is no longer needed.
+3. Add Tauri shell.
+4. Package Rust backend/workers as sidecars or integrate into `src-tauri`.
+5. Remove legacy/reference code only after tests and runtime validation.
 
 ## 6. What stays reference
 
@@ -79,7 +74,7 @@ Current stage keeps existing `start.sh` development mode.
 
 ## 7. What not to do
 
-- Do not require PostgreSQL in packaged app.
+- Do not require an external database server in packaged app.
 - Do not delete Python until Rust parity is proven.
 - Do not rewrite scanner from scratch without matching Python behavior.
 - Do not expose DB directly to frontend as the primary architecture unless explicitly decided.
@@ -90,14 +85,14 @@ Current stage keeps existing `start.sh` development mode.
 Mode A: current dev mode
 
 - `start.sh`
-- native local PostgreSQL
-- Python API
+- SQLite file DB
+- Rust API
 - Rust workers
 
 Mode B: Rust migration dev mode
 
-- Python API
-- native local PostgreSQL
+- Python legacy/reference API
+- SQLite file DB
 - Rust thumb/metadata workers
 
 Mode C: future Tauri mode
@@ -109,11 +104,9 @@ Mode C: future Tauri mode
 
 ## 9. Immediate next steps
 
-1. Finish metadata-worker runtime validation when DB is stable.
-2. Add metadata parity comparison against Python scanner output.
-3. Plan SQLite schema compatibility.
-4. Add DB backend abstraction decision doc.
-5. Only then start Tauri shell implementation.
+1. Keep runtime smoke tests green on SQLite.
+2. Finish cleanup of obsolete external DB code paths.
+3. Add Tauri shell implementation.
 
 ## 10. Contract priority
 
@@ -121,4 +114,4 @@ If a migration shortcut conflicts with behavior parity, parity wins:
 
 - Keep current API behavior stable.
 - Keep Python reference path available until Rust parity is verified.
-- Keep native local PostgreSQL as temporary development runtime until SQLite is wired.
+- Keep SQLite as the only normal runtime DB.

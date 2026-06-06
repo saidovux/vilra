@@ -4,9 +4,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tagimage_core::{parse_u64_env, MetadataJobPayload};
-use tagimage_db::{claim_next_metadata_job, mark_metadata_failed, mark_metadata_succeeded};
+use tagimage_db::sqlite::{
+    claim_next_sqlite_metadata_job, mark_sqlite_metadata_failed, mark_sqlite_metadata_succeeded,
+    open_sqlite_runtime_db, resolve_sqlite_runtime_path,
+};
 use tokio::time::sleep;
-use tokio_postgres::NoTls;
 
 const METADATA_POLL_MS_DEFAULT: u64 = 750;
 const METADATA_MAX_BACKOFF_SEC: i64 = 120;
@@ -168,31 +170,20 @@ fn extract_metadata(payload: Value) -> Result<MetadataExtracted, String> {
 }
 
 async fn run_worker_loop(
-    db_url: String,
+    db_path: PathBuf,
     worker_id: String,
     poll_ms: u64,
     metrics_interval_sec: u64,
     slow_ms: u128,
     authoritative: bool,
 ) -> Result<(), String> {
-    let (mut client, connection) = tokio_postgres::connect(&db_url, NoTls)
-        .await
-        .map_err(|e| format!("connect postgres: {e}"))?;
-
-    let connection_worker_id = worker_id.clone();
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!(
-                "[rust-metadata-worker] postgres connection error worker={}: {e}",
-                connection_worker_id
-            );
-        }
-    });
+    let conn = open_sqlite_runtime_db(&db_path)
+        .map_err(|e| format!("open sqlite db {}: {e}", db_path.display()))?;
 
     let mut metrics = WorkerMetrics::new();
 
     loop {
-        let claimed = claim_next_metadata_job(&mut client, &worker_id).await?;
+        let claimed = claim_next_sqlite_metadata_job(&conn, &worker_id)?;
         let Some(job) = claimed else {
             metrics.maybe_log_summary(metrics_interval_sec, &worker_id);
             sleep(Duration::from_millis(poll_ms)).await;
@@ -216,7 +207,7 @@ async fn run_worker_loop(
                 });
 
                 if let Err(e) =
-                    mark_metadata_succeeded(&mut client, &job, metadata_json, authoritative).await
+                    mark_sqlite_metadata_succeeded(&conn, &job, metadata_json, authoritative)
                 {
                     eprintln!(
                         "[rust-metadata-worker] mark success failed worker={} job={} error={}",
@@ -258,15 +249,13 @@ async fn run_worker_loop(
                     worker_id, job.id, total_ms, err
                 );
 
-                if let Err(e) = mark_metadata_failed(
-                    &mut client,
+                if let Err(e) = mark_sqlite_metadata_failed(
+                    &conn,
                     &job,
                     &err,
                     Some(total_ms),
                     METADATA_MAX_BACKOFF_SEC,
-                )
-                .await
-                {
+                ) {
                     eprintln!(
                         "[rust-metadata-worker] mark fail failed worker={} job={} error={}",
                         worker_id, job.id, e
@@ -281,9 +270,14 @@ async fn run_worker_loop(
 }
 
 async fn run() -> Result<(), String> {
-    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer".to_string()
-    });
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .ok_or_else(|| "cannot resolve repo root".to_string())?
+        .to_path_buf();
+    let _ = dotenvy::from_path(repo_root.join(".env"));
+    let db_path = resolve_sqlite_runtime_path(&repo_root);
     let worker_id = format!("rust-metadata-{}", now_unix());
     let poll_ms = parse_poll_ms();
     let slow_ms = parse_u64_env("IMGVIEWER_METADATA_SLOW_MS", 1000) as u128;
@@ -291,17 +285,18 @@ async fn run() -> Result<(), String> {
     let authoritative = env_bool("IMGVIEWER_METADATA_AUTHORITATIVE", false);
 
     eprintln!(
-        "[rust-metadata-worker] started as {} mode={}",
+        "[rust-metadata-worker] started as {} mode={} sqlite={}",
         worker_id,
         if authoritative {
             "authoritative"
         } else {
             "shadow"
-        }
+        },
+        db_path.display()
     );
 
     run_worker_loop(
-        db_url,
+        db_path,
         worker_id,
         poll_ms,
         metrics_interval_sec,

@@ -13,7 +13,7 @@ def db_available():
     try:
         ensure_db_ready()
     except Exception as exc:
-        pytest.skip(f"PostgreSQL is required for job recovery tests: {exc}")
+        pytest.skip(f"SQLite runtime DB is required for job recovery tests: {exc}")
     return True
 
 
@@ -45,48 +45,53 @@ def _mark_running(
     from app.repo.db import db_connect
 
     with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE jobs
-                SET state = 'running',
-                    attempt = %s,
-                    max_attempts = %s,
-                    worker_id = %s,
-                    started_at = now() - (%s * INTERVAL '1 second'),
-                    updated_at = now() - (%s * INTERVAL '1 second'),
-                    error = NULL
-                WHERE id = %s
-                """,
-                (attempt, max_attempts, worker_id, age_sec, age_sec, job_id),
-            )
-            cur.execute(
-                """
-                INSERT INTO job_attempts (job_id, attempt, worker_id, state)
-                VALUES (%s, %s, %s, 'running')
-                """,
-                (job_id, attempt, worker_id),
-            )
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE jobs
+            SET state = 'running',
+                attempt = ?,
+                max_attempts = ?,
+                worker_id = ?,
+                started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', printf('-%d seconds', ?)),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', printf('-%d seconds', ?)),
+                error = NULL
+            WHERE id = ?
+            """,
+            (attempt, max_attempts, worker_id, age_sec, age_sec, job_id),
+        )
+        cur.execute(
+            """
+            INSERT INTO job_attempts (job_id, attempt, worker_id, state)
+            VALUES (?, ?, ?, 'running')
+            """,
+            (job_id, attempt, worker_id),
+        )
 
 
 def _latest_event(job_id: str) -> tuple[str, dict]:
     from app.repo.db import db_connect
 
     with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT event, data
-                FROM job_events
-                WHERE job_id = %s
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (job_id,),
-            )
-            row = cur.fetchone()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT event, data
+            FROM job_events
+            WHERE job_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (job_id,),
+        )
+        row = cur.fetchone()
     assert row is not None
-    return row[0], row[1]
+    import json
+
+    data = row[1]
+    if isinstance(data, str):
+        data = json.loads(data)
+    return row[0], data
 
 
 def test_recover_stale_running_job_requeues_and_records_event(db_available, tmp_path):

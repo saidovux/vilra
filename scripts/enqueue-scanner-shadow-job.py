@@ -3,7 +3,6 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
 
 
 def detect_repo_root() -> Path:
@@ -40,17 +39,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def format_database_target(database_url: str) -> str:
-    try:
-        parsed = urlparse(database_url)
-        host = parsed.hostname or "unknown"
-        port = parsed.port or "default"
-        db_name = parsed.path.lstrip("/") or "default"
-        return f"host={host} port={port} db={db_name}"
-    except Exception:
-        return "host=unknown port=unknown db=unknown"
-
-
 def resolve_root(explicit_root: str | None) -> str:
     if explicit_root:
         return str(Path(explicit_root).expanduser().resolve())
@@ -71,9 +59,9 @@ def main() -> int:
     repo_root = bootstrap_sys_path()
     maybe_reexec_venv(repo_root)
 
-    from tagimage_env import ensure_database_url
+    from tagimage_env import ensure_sqlite_path
 
-    database_url = ensure_database_url()
+    sqlite_path = ensure_sqlite_path(repo_root)
     args = parse_args()
     root_path = resolve_root(args.root)
     if not Path(root_path).is_dir():
@@ -83,7 +71,7 @@ def main() -> int:
 
     job = enqueue_scanner_shadow_job(root_path, priority=args.priority)
     print(f"repo_root={repo_root}")
-    print(f"database={format_database_target(database_url)}")
+    print(f"sqlite={sqlite_path}")
     print(f"job_id={job.get('id')}")
     print(f"job_type={job.get('job_type')}")
     print(f"root_path={root_path}")

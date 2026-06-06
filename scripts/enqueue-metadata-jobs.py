@@ -2,7 +2,6 @@
 import argparse
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
 
 
 def detect_repo_root() -> Path:
@@ -27,17 +26,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def format_database_target(database_url: str) -> str:
-    try:
-        parsed = urlparse(database_url)
-        host = parsed.hostname or "unknown"
-        port = parsed.port or "default"
-        db_name = parsed.path.lstrip("/") or "default"
-        return f"host={host} port={port} db={db_name}"
-    except Exception:
-        return "host=unknown port=unknown db=unknown"
-
-
 def main() -> None:
     repo_root = bootstrap_sys_path()
     from tagimage_env import load_env_file
@@ -45,12 +33,12 @@ def main() -> None:
     load_env_file(repo_root)
     args = parse_args()
 
-    from app.config import DATABASE_URL
+    from app.config import SQLITE_PATH
     from app.services.metadata_jobs_service import enqueue_metadata_jobs_for_existing_images
 
     result = enqueue_metadata_jobs_for_existing_images(limit=args.limit)
     print(f"repo_root={repo_root}")
-    print(f"database={format_database_target(DATABASE_URL)}")
+    print(f"sqlite={SQLITE_PATH}")
     print(
         f"enqueued={result['enqueued']} "
         f"queued_existing={result['queued_existing']} "

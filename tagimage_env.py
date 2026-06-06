@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 
-DEFAULT_DATABASE_URL = "postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer"
+DEFAULT_SQLITE_PATH = ".run/tagimage.sqlite"
 
 
 def detect_repo_root(start: Path | None = None) -> Path:
@@ -47,13 +47,18 @@ def load_env_file(repo_root: Path | None = None, *, override: bool = False) -> b
     return True
 
 
-def effective_database_url(*, fallback: str = DEFAULT_DATABASE_URL) -> str:
+def effective_sqlite_path(repo_root: Path | None = None) -> Path:
     load_env_file()
-    value = os.getenv("DATABASE_URL", "").strip()
-    return value or fallback
+    root = repo_root or detect_repo_root()
+    raw = os.getenv("TAGIMAGE_SQLITE_PATH", "").strip() or DEFAULT_SQLITE_PATH
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve()
 
 
-def ensure_database_url(*, fallback: str = DEFAULT_DATABASE_URL) -> str:
-    database_url = effective_database_url(fallback=fallback)
-    os.environ["DATABASE_URL"] = database_url
-    return database_url
+def ensure_sqlite_path(repo_root: Path | None = None) -> Path:
+    path = effective_sqlite_path(repo_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.environ["TAGIMAGE_SQLITE_PATH"] = str(path)
+    return path

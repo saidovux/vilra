@@ -37,9 +37,3 @@ impl IntoResponse for ApiError {
         (self.status, Json(json!({ "detail": self.detail }))).into_response()
     }
 }
-
-impl From<tokio_postgres::Error> for ApiError {
-    fn from(value: tokio_postgres::Error) -> Self {
-        Self::internal(format!("Database error: {value}"))
-    }
-}

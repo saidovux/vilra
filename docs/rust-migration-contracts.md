@@ -1,10 +1,10 @@
 # Rust Migration Contracts (Python Backend ↔ Workers)
 
 ## 1) Python Role
-Python backend remains the API and orchestration layer. The Python implementation is the reference implementation for behavior while Rust workers are introduced gradually.
+Python backend remains a legacy/reference implementation for behavior while Rust runtime is validated.
 
 ## 2) Integration Boundary
-PostgreSQL jobs queue is the boundary between Python and Rust workers.
+SQLite jobs queue is the boundary between API and workers.
 
 ## 3) Public HTTP API Invariant
 Rust workers must not change public HTTP API behavior or endpoints.
@@ -29,9 +29,9 @@ The existing `rust/thumb-worker/Cargo.toml` path remains supported for direct th
 - shared job enums
 - shared env helpers
 
-`tagimage-core` must not contain DB access, job queue mutation, HTTP API code, worker loops, or PostgreSQL queries.
+`tagimage-core` must not contain DB access, job queue mutation, HTTP API code, worker loops, or DB queries.
 
-`tagimage-db` is thumb-first in this stage and contains only the SQL/job state machine already used by `thumb-worker`:
+`tagimage-db` contains SQLite schema/runtime helpers and the SQL/job state machine used by workers:
 
 - thumb job claim helpers
 - thumb job state transition helpers
@@ -39,16 +39,13 @@ The existing `rust/thumb-worker/Cargo.toml` path remains supported for direct th
 
 `tagimage-db` must not contain thumbnail rendering, scanner behavior, HTTP API code, or frontend logic.
 
-Connection lifecycle remains worker-owned in this stage:
+Connection lifecycle remains worker-owned:
 
-- `thumb-worker` opens PostgreSQL connections per worker slot
+- workers open SQLite connections per worker slot
 - `thumb-worker` owns connection task logging
-- `tagimage-db` receives an existing `tokio_postgres::Client` borrow
+- `tagimage-db` receives an existing SQLite connection borrow
 - `tagimage-db` does not spawn connection tasks
 
-Connection helpers may be added in a future stage, but not in this extraction step.
-
-Do not add generic `claim_next_job` APIs or metadata/scanner/hash abstractions in this extraction step.
 Future Rust workers should reuse `tagimage-db` helpers instead of copying SQL/job state machine logic.
 
 ## 6) ThumbJobPayload Contract

@@ -52,16 +52,21 @@ pick_python() {
   return 1
 }
 
-python_db_check() {
+sqlite_repair_check() {
   "$PYTHON_BIN" - <<'PY'
-import psycopg
-from app.config import DATABASE_URL
+from app.config import SQLITE_PATH
+from app.repo.db import ensure_db_ready, verify_core_tables, verify_job_tables, db_connect
 
-print(f"[python] app.config.DATABASE_URL={DATABASE_URL}")
-with psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
-    with conn.cursor() as cur:
-        cur.execute("select 1")
-        print(f"[python] select_1={cur.fetchone()}")
+print(f"[python] TAGIMAGE_SQLITE_PATH={SQLITE_PATH}")
+SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
+ensure_db_ready()
+core = verify_core_tables()
+jobs = verify_job_tables()
+with db_connect() as conn:
+    row = conn.execute("select 1").fetchone()
+print(f"[python] select_1={row[0] if row else None}")
+print(f"[python] core_tables={','.join(core)}")
+print(f"[python] job_tables={','.join(jobs)}")
 PY
 }
 
@@ -73,24 +78,17 @@ main() {
   fi
   info "python: $PYTHON_BIN"
 
-  info "normal repair path: native local PostgreSQL"
-  "$REPO_ROOT/scripts/local-postgres.sh" init || exit 1
-  "$REPO_ROOT/scripts/local-postgres.sh" start || exit 1
-  "$REPO_ROOT/scripts/local-postgres.sh" status || true
-
-  echo
-  info "Python psycopg check via app.config.DATABASE_URL"
-  if python_db_check; then
+  info "SQLite repair/init check"
+  if sqlite_repair_check; then
     info "DB repair/check passed."
     exit 0
   fi
 
-  warn "DB check still failed after local PostgreSQL start."
-  warn "Expected DATABASE_URL:"
-  warn "  postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer"
+  warn "SQLite DB repair/check failed."
   warn "Run:"
-  warn "  ./scripts/local-postgres.sh status"
   warn "  ./scripts/check-db.sh"
+  warn "Default path:"
+  warn "  TAGIMAGE_SQLITE_PATH=.run/tagimage.sqlite"
   exit 1
 }
 

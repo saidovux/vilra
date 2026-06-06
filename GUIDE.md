@@ -1,6 +1,6 @@
 # ImgViewer — Руководство
 
-ImgViewer — локальная галерея для просмотра изображений, тегирования и быстрого отбора по папочным и ручным тегам. Приложение хранит индекс, теги и состояние сессии в PostgreSQL; рядом с фотографиями создаются только миниатюры.
+ImgViewer — локальная галерея для просмотра изображений, тегирования и быстрого отбора по папочным и ручным тегам. Приложение хранит индекс, теги и состояние сессии в локальном SQLite-файле; рядом с фотографиями создаются только миниатюры.
 
 ## 1. Установка
 
@@ -9,15 +9,13 @@ ImgViewer — локальная галерея для просмотра изо
 | Компонент | Версия |
 |---|---|
 | Python | 3.9+ |
-| PostgreSQL | 14+ |
+| SQLite | встроен через runtime |
 
 Быстрый локальный вариант:
 
 ```bash
 cp .env.example .env
-./scripts/local-postgres.sh init
-./scripts/local-postgres.sh start
-./scripts/local-postgres.sh status
+./scripts/repair-db.sh
 ./scripts/check-db.sh
 ./start.sh
 ```
@@ -26,7 +24,7 @@ cp .env.example .env
 
 ```bash
 pip install -r requirements.txt
-export DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer
+export TAGIMAGE_SQLITE_PATH=.run/tagimage.sqlite
 python run.py /home/user/Pictures
 ```
 
@@ -68,7 +66,7 @@ python run.py /home/user/Pictures
 
 Во время сканирования:
 
-- изображения upsert-ятся в PostgreSQL по паре `root_path + relative_path`;
+- изображения upsert-ятся в SQLite по паре `root_path + relative_path`;
 - все родительские папки становятся автоматическими тегами;
 - ручные теги сохраняются;
 - отсутствующие на диске файлы скрываются из выдачи;
@@ -152,7 +150,7 @@ python run.py /home/user/Pictures
 
 Вкладки работают как вкладки браузера: `+` создает новую вкладку в дефолтном состоянии, то есть без фильтров и с показом всех изображений.
 
-Сессия сохраняется в PostgreSQL:
+Сессия сохраняется в SQLite:
 
 - последняя открытая папка;
 - все вкладки;
@@ -163,7 +161,7 @@ python run.py /home/user/Pictures
 
 ## 8. Структура Данных
 
-PostgreSQL содержит таблицы:
+SQLite содержит таблицы:
 
 - `images` — путь, размер, mtime, ширина, высота, путь миниатюры, статус скрытия;
 - `tags` — уникальный пул тегов;
@@ -183,18 +181,17 @@ PostgreSQL содержит таблицы:
 
 ## 9. Неполадки
 
-PostgreSQL недоступен:
+SQLite DB недоступна или не инициализирована:
 
 ```bash
-./scripts/local-postgres.sh init
-./scripts/local-postgres.sh start
+./scripts/repair-db.sh
 ./scripts/check-db.sh
 ```
 
-Проверить строку подключения:
+Проверить путь к БД:
 
 ```bash
-echo "$DATABASE_URL"
+echo "$TAGIMAGE_SQLITE_PATH"
 ```
 
 Пересоздать миниатюры:
@@ -204,17 +201,16 @@ rm -rf /путь/к/фото/.imgindex/thumbs
 ./start.sh /путь/к/фото
 ```
 
-SQLite schema/init и jobs queue уже есть в `rust/crates/tagimage-db`, но runtime пока остается PostgreSQL. Будущий SQLite runtime должен быть file-based.
+Runtime использует file-based SQLite через `TAGIMAGE_SQLITE_PATH`, по умолчанию `.run/tagimage.sqlite`.
 
 ImgViewer остается локальным приложением: без аккаунтов, загрузок файлов на серверы и публичного веб-деплоя.
 
 ## 10. Безопасный запуск тестов
 
-Рекомендуется запускать интеграционные тесты на отдельной тестовой БД:
+Рекомендуется запускать интеграционные тесты обычной командой:
 
 ```bash
-TEST_DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:55432/tagimage_test pytest
+.venv/bin/python -m pytest
 ```
 
-В тестовом контексте `TEST_DATABASE_URL` имеет приоритет.  
-Если `TEST_DATABASE_URL` не задан, fallback-изоляция восстанавливает `app_session` и очищает только тестовые данные (`/tmp/pytest-*`, `pytest-*`), чтобы не загрязнять рабочую сессию приложения.
+Тестовый контекст использует временный SQLite-файл, восстанавливает `app_session` и очищает только тестовые данные (`/tmp/pytest-*`, `pytest-*`), чтобы не загрязнять рабочую сессию приложения.

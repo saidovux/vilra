@@ -164,24 +164,24 @@ def run_rescan_job(*, root: Path, job_id: Optional[str] = None) -> dict[str, Any
     root_str = str(root)
     done = 0
     with db_connect() as conn:
-        with conn.cursor() as cur:
-            mark_images_hidden_for_root(cur, root_str)
-            existing_by_rel = fetch_existing_images_map(cur, root_str)
+        cur = conn.cursor()
+        mark_images_hidden_for_root(cur, root_str)
+        existing_by_rel = fetch_existing_images_map(cur, root_str)
 
-            for img_path in images_found:
-                process_scanned_image(
-                    cur=cur,
-                    root=root,
-                    root_str=root_str,
-                    img_path=img_path,
-                    existing_by_rel=existing_by_rel,
-                )
+        for img_path in images_found:
+            process_scanned_image(
+                cur=cur,
+                root=root,
+                root_str=root_str,
+                img_path=img_path,
+                existing_by_rel=existing_by_rel,
+            )
 
-                done += 1
-                if job_id and (done % 20 == 0 or done == total):
-                    touch_job_progress(job_id, done=done, total=total)
+            done += 1
+            if job_id and (done % 20 == 0 or done == total):
+                touch_job_progress(job_id, done=done, total=total)
 
-            finalize_scan(cleanup_cursor=cur)
+        finalize_scan(cleanup_cursor=cur)
 
     finalize_scan(job_id=job_id, total=total)
     return {"root": root_str, "total": total}

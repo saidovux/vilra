@@ -54,7 +54,7 @@ def main():
             sys.exit(1)
         except Exception as e:
             print(f"Database error: {e}")
-            print("Start local PostgreSQL with: ./scripts/local-postgres.sh init && ./scripts/local-postgres.sh start")
+            print("Repair SQLite with: ./scripts/repair-db.sh && ./scripts/check-db.sh")
             sys.exit(1)
 
     url = f"http://localhost:{port}"

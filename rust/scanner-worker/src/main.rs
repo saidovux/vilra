@@ -1,17 +1,21 @@
 use image::image_dimensions;
+use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tagimage_core::{parse_u64_env, RescanJobPayload, ScannerShadowJobPayload};
-use tagimage_db::{
-    claim_next_rescan_job, claim_next_scanner_shadow_job, mark_rescan_failed,
-    mark_rescan_succeeded, mark_scanner_shadow_failed, mark_scanner_shadow_succeeded,
-    touch_job_progress,
+use tagimage_db::sqlite::{
+    claim_next_sqlite_rescan_job, claim_next_sqlite_scanner_shadow_job,
+    cleanup_sqlite_hidden_image_tag_data, clear_sqlite_auto_tags_for_image,
+    enqueue_sqlite_thumb_job, list_sqlite_existing_image_ids_for_root,
+    list_sqlite_existing_images_for_root, mark_sqlite_images_hidden_for_root,
+    mark_sqlite_rescan_failed, mark_sqlite_rescan_succeeded, mark_sqlite_scanner_shadow_failed,
+    mark_sqlite_scanner_shadow_succeeded, open_sqlite_runtime_db, resolve_sqlite_runtime_path,
+    touch_sqlite_job_progress, upsert_sqlite_image, SqliteImageUpsert,
 };
 use tokio::time::sleep;
-use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
 const INDEX_DIR_NAME: &str = ".imgindex";
@@ -19,7 +23,6 @@ const THUMBS_DIR_NAME: &str = "thumbs";
 const SCANNER_POLL_MS_DEFAULT: u64 = 750;
 const SCANNER_MAX_BACKOFF_SEC: i64 = 120;
 const THUMB_PRIORITY: i32 = 20;
-const THUMB_MAX_SIZE: [u32; 2] = [640, 640];
 
 #[derive(Debug, Clone)]
 struct ExistingImage {
@@ -289,243 +292,93 @@ fn build_scanned_image(root: &Path, image_path: &Path) -> Result<ScannedImage, S
     })
 }
 
-async fn load_existing_images(
-    client: &Client,
+fn load_existing_images(
+    conn: &Connection,
     root_path: &str,
 ) -> Result<HashMap<String, ExistingImage>, String> {
-    let rows = client
-        .query(
-            "SELECT id, path, hidden FROM images WHERE root_path = $1",
-            &[&root_path],
-        )
-        .await
-        .map_err(|e| format!("query existing images: {e}"))?;
-
+    let rows = list_sqlite_existing_images_for_root(conn, root_path)?;
     let mut out = HashMap::new();
     for row in rows {
-        let path: String = row.get("path");
+        let path = row.path;
         out.insert(
             path.clone(),
             ExistingImage {
-                id: row.get("id"),
+                id: row.id,
                 path,
-                hidden: row.get("hidden"),
+                hidden: row.hidden,
             },
         );
     }
     Ok(out)
 }
 
-async fn load_existing_image_ids(
-    client: &Client,
+fn load_existing_image_ids(
+    conn: &Connection,
     root_path: &str,
 ) -> Result<HashMap<String, String>, String> {
-    let rows = client
-        .query(
-            "SELECT path, id FROM images WHERE root_path = $1",
-            &[&root_path],
-        )
-        .await
-        .map_err(|e| format!("query existing image ids: {e}"))?;
-
-    let mut out = HashMap::new();
-    for row in rows {
-        let path: String = row.get("path");
-        let id: String = row.get("id");
-        out.insert(path, id);
-    }
-    Ok(out)
+    list_sqlite_existing_image_ids_for_root(conn, root_path)
 }
 
-async fn mark_images_hidden_for_root(client: &Client, root_path: &str) -> Result<(), String> {
-    client
-        .execute(
-            "UPDATE images SET hidden = true, updated_at = now() WHERE root_path = $1",
-            &[&root_path],
-        )
-        .await
-        .map_err(|e| format!("mark images hidden: {e}"))?;
+fn mark_images_hidden_for_root(conn: &Connection, root_path: &str) -> Result<(), String> {
+    mark_sqlite_images_hidden_for_root(conn, root_path)?;
     Ok(())
 }
 
-async fn upsert_image_row(
-    client: &Client,
+fn upsert_image_row(
+    conn: &Connection,
     root_path: &str,
     image: &ScannedImage,
     image_id: &str,
     thumb_rel: &str,
 ) -> Result<String, String> {
-    let row = client
-        .query_one(
-            r#"
-            INSERT INTO images (
-                id, root_path, path, thumb, size, mtime, width, height, hidden
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)
-            ON CONFLICT (root_path, path) DO UPDATE SET
-                thumb = EXCLUDED.thumb,
-                size = EXCLUDED.size,
-                mtime = EXCLUDED.mtime,
-                width = EXCLUDED.width,
-                height = EXCLUDED.height,
-                hidden = false,
-                updated_at = now()
-            RETURNING id
-            "#,
-            &[
-                &image_id,
-                &root_path,
-                &image.rel,
-                &thumb_rel,
-                &image.source_bytes,
-                &image.mtime,
-                &image.width,
-                &image.height,
-            ],
-        )
-        .await
-        .map_err(|e| format!("upsert image {}: {e}", image.rel))?;
-    Ok(row.get("id"))
+    upsert_sqlite_image(
+        conn,
+        &SqliteImageUpsert {
+            id: Some(image_id.to_string()),
+            root_path: root_path.to_string(),
+            path: image.rel.clone(),
+            thumb: thumb_rel.to_string(),
+            size: image.source_bytes,
+            mtime: image.mtime,
+            width: image.width,
+            height: image.height,
+            ext: image.ext.clone(),
+        },
+    )
 }
 
-async fn clear_auto_tags_for_image(client: &Client, image_id: &str) -> Result<(), String> {
-    client
-        .execute(
-            "DELETE FROM image_tags WHERE image_id = $1 AND kind = 'auto'",
-            &[&image_id],
-        )
-        .await
-        .map_err(|e| format!("clear auto tags for image {image_id}: {e}"))?;
+fn clear_auto_tags_for_image(conn: &Connection, image_id: &str) -> Result<(), String> {
+    clear_sqlite_auto_tags_for_image(conn, image_id)?;
     Ok(())
 }
 
-async fn cleanup_hidden_image_tag_data(client: &Client) -> Result<(), String> {
-    client
-        .execute(
-            r#"
-            DELETE FROM image_tags it
-            USING images i
-            WHERE it.image_id = i.id
-              AND i.hidden = true
-            "#,
-            &[],
-        )
-        .await
-        .map_err(|e| format!("cleanup hidden image tags: {e}"))?;
-    client
-        .execute(
-            r#"
-            DELETE FROM tags t
-            WHERE t.user_defined = false
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM image_tags it
-                  WHERE it.tag_id = t.id
-              )
-            "#,
-            &[],
-        )
-        .await
-        .map_err(|e| format!("cleanup orphan auto tags: {e}"))?;
-    Ok(())
+fn cleanup_hidden_image_tag_data(conn: &Connection) -> Result<(), String> {
+    cleanup_sqlite_hidden_image_tag_data(conn)
 }
 
-async fn enqueue_thumb_job(
-    client: &mut Client,
+fn enqueue_thumb_job(
+    conn: &Connection,
     image_id: &str,
     root_path: &str,
     image: &ScannedImage,
     thumb_rel: &str,
 ) -> Result<bool, String> {
-    let dedupe_key = format!("thumb:{}:{}", image_id, image.mtime);
     let max_attempts = parse_i32_env("IMGVIEWER_THUMB_MAX_ATTEMPTS", 5, 1);
-    let job_id = uuid_hex();
-    let payload = json!({
-        "image_id": image_id,
-        "root_path": root_path,
-        "path": image.rel,
-        "thumb": thumb_rel,
-        "mtime": image.mtime,
-        "max_size": THUMB_MAX_SIZE,
-    });
-
-    let tx = client
-        .transaction()
-        .await
-        .map_err(|e| format!("begin thumb enqueue tx: {e}"))?;
-
-    let existing = tx
-        .query_opt(
-            r#"
-            SELECT id
-            FROM jobs
-            WHERE job_type = 'thumb'
-              AND dedupe_key = $1
-              AND state IN ('queued', 'running')
-            ORDER BY created_at DESC
-            LIMIT 1
-            "#,
-            &[&dedupe_key],
-        )
-        .await
-        .map_err(|e| format!("check thumb dedupe: {e}"))?;
-    if existing.is_some() {
-        tx.commit()
-            .await
-            .map_err(|e| format!("commit deduped thumb enqueue: {e}"))?;
-        return Ok(false);
-    }
-
-    let inserted = tx
-        .execute(
-            r#"
-            INSERT INTO jobs (id, job_type, payload, state, priority, max_attempts, scheduled_at, dedupe_key)
-            VALUES ($1, 'thumb', $2, 'queued', $3, $4, now(), $5)
-            "#,
-            &[&job_id, &payload, &THUMB_PRIORITY, &max_attempts, &dedupe_key],
-        )
-        .await;
-
-    if let Err(err) = inserted {
-        tx.rollback()
-            .await
-            .map_err(|e| format!("rollback failed thumb enqueue: {e}; insert error: {err}"))?;
-        let existing_after_race = client
-            .query_opt(
-                r#"
-                SELECT id
-                FROM jobs
-                WHERE job_type = 'thumb'
-                  AND dedupe_key = $1
-                  AND state IN ('queued', 'running')
-                ORDER BY created_at DESC
-                LIMIT 1
-                "#,
-                &[&dedupe_key],
-            )
-            .await
-            .map_err(|e| format!("check thumb dedupe after race: {e}"))?;
-        if existing_after_race.is_some() {
-            return Ok(false);
-        }
-        return Err(format!("insert thumb job: {err}"));
-    }
-
-    let event_data = json!({"job_type": "thumb"});
-    tx.execute(
-        "INSERT INTO job_events (job_id, event, data) VALUES ($1, 'enqueued', $2)",
-        &[&job_id, &event_data],
-    )
-    .await
-    .map_err(|e| format!("insert thumb enqueued event: {e}"))?;
-    tx.commit()
-        .await
-        .map_err(|e| format!("commit thumb enqueue: {e}"))?;
-    Ok(true)
+    let (_, deduped) = enqueue_sqlite_thumb_job(
+        conn,
+        image_id,
+        root_path,
+        &image.rel,
+        thumb_rel,
+        image.mtime,
+        THUMB_PRIORITY,
+        max_attempts,
+    )?;
+    Ok(!deduped)
 }
 
-async fn process_authoritative_image(
-    client: &mut Client,
+fn process_authoritative_image(
+    conn: &Connection,
     root: &Path,
     root_path: &str,
     image: &ScannedImage,
@@ -537,22 +390,22 @@ async fn process_authoritative_image(
         .cloned()
         .unwrap_or_else(new_image_id);
     let thumb_rel = thumb_rel_for(&image_id);
-    let db_image_id = upsert_image_row(client, root_path, image, &image_id, &thumb_rel).await?;
-    clear_auto_tags_for_image(client, &db_image_id).await?;
+    let db_image_id = upsert_image_row(conn, root_path, image, &image_id, &thumb_rel)?;
+    clear_auto_tags_for_image(conn, &db_image_id)?;
 
     if queue_thumbs && should_regenerate_thumb(image.mtime, &root.join(&thumb_rel)) {
-        enqueue_thumb_job(client, &db_image_id, root_path, image, &thumb_rel).await?;
+        enqueue_thumb_job(conn, &db_image_id, root_path, image, &thumb_rel)?;
     }
 
     Ok(())
 }
 
-async fn build_shadow_scan(client: &Client, payload: Value) -> Result<(Value, i32), String> {
+fn build_shadow_scan(conn: &Connection, payload: Value) -> Result<(Value, i32), String> {
     let parsed: ScannerShadowJobPayload =
         serde_json::from_value(payload).map_err(|e| format!("invalid scanner payload: {e}"))?;
     let root = PathBuf::from(&parsed.root_path);
     let started = Instant::now();
-    let existing_by_path = load_existing_images(client, &parsed.root_path).await?;
+    let existing_by_path = load_existing_images(conn, &parsed.root_path)?;
     let image_paths = scan_image_paths(&root)?;
 
     let mut scanned_paths = HashSet::new();
@@ -621,11 +474,7 @@ async fn build_shadow_scan(client: &Client, payload: Value) -> Result<(Value, i3
     Ok((scan_json, total))
 }
 
-async fn run_authoritative_scan(
-    client: &mut Client,
-    payload: Value,
-    job_id: &str,
-) -> Result<i32, String> {
+fn run_authoritative_scan(conn: &Connection, payload: Value, job_id: &str) -> Result<i32, String> {
     let parsed: RescanJobPayload =
         serde_json::from_value(payload).map_err(|e| format!("invalid rescan payload: {e}"))?;
     let root = PathBuf::from(&parsed.root_path);
@@ -633,58 +482,46 @@ async fn run_authoritative_scan(
     let total = image_paths.len().min(i32::MAX as usize) as i32;
     let queue_thumbs = thumb_queue_enabled();
 
-    touch_job_progress(client, job_id, 0, Some(total)).await?;
-    mark_images_hidden_for_root(client, &parsed.root_path).await?;
-    let existing_by_rel = load_existing_image_ids(client, &parsed.root_path).await?;
+    touch_sqlite_job_progress(conn, job_id, 0, Some(total))?;
+    mark_images_hidden_for_root(conn, &parsed.root_path)?;
+    let existing_by_rel = load_existing_image_ids(conn, &parsed.root_path)?;
 
     let mut done = 0_i32;
     for image_path in image_paths {
         let image = build_scanned_image(&root, &image_path)?;
         process_authoritative_image(
-            client,
+            conn,
             &root,
             &parsed.root_path,
             &image,
             &existing_by_rel,
             queue_thumbs,
-        )
-        .await?;
+        )?;
 
         done = done.saturating_add(1);
         if done % 20 == 0 || done == total {
-            touch_job_progress(client, job_id, done, Some(total)).await?;
+            touch_sqlite_job_progress(conn, job_id, done, Some(total))?;
         }
     }
 
-    cleanup_hidden_image_tag_data(client).await?;
+    cleanup_hidden_image_tag_data(conn)?;
     Ok(total)
 }
 
 async fn run_worker_loop(
-    db_url: String,
+    db_path: PathBuf,
     worker_id: String,
     mode: WorkerMode,
     poll_ms: u64,
     slow_ms: u128,
 ) -> Result<(), String> {
-    let (mut client, connection) = tokio_postgres::connect(&db_url, NoTls)
-        .await
-        .map_err(|e| format!("connect postgres: {e}"))?;
-
-    let connection_worker_id = worker_id.clone();
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!(
-                "[rust-scanner-worker] postgres connection error worker={}: {e}",
-                connection_worker_id
-            );
-        }
-    });
+    let conn = open_sqlite_runtime_db(&db_path)
+        .map_err(|e| format!("open sqlite db {}: {e}", db_path.display()))?;
 
     loop {
         let claimed = match mode {
-            WorkerMode::Shadow => claim_next_scanner_shadow_job(&mut client, &worker_id).await?,
-            WorkerMode::Authoritative => claim_next_rescan_job(&mut client, &worker_id).await?,
+            WorkerMode::Shadow => claim_next_sqlite_scanner_shadow_job(&conn, &worker_id)?,
+            WorkerMode::Authoritative => claim_next_sqlite_rescan_job(&conn, &worker_id)?,
         };
         let Some(job) = claimed else {
             sleep(Duration::from_millis(poll_ms)).await;
@@ -693,7 +530,7 @@ async fn run_worker_loop(
 
         let started_at = Instant::now();
         match mode {
-            WorkerMode::Shadow => match build_shadow_scan(&client, job.payload.clone()).await {
+            WorkerMode::Shadow => match build_shadow_scan(&conn, job.payload.clone()) {
                 Ok((scan_json, total)) => {
                     let total_ms = started_at.elapsed().as_millis();
                     let root = scan_json
@@ -702,7 +539,7 @@ async fn run_worker_loop(
                         .unwrap_or("unknown")
                         .to_string();
                     if let Err(e) =
-                        mark_scanner_shadow_succeeded(&mut client, &job, scan_json, total).await
+                        mark_sqlite_scanner_shadow_succeeded(&conn, &job, scan_json, total)
                     {
                         eprintln!(
                             "[rust-scanner-worker] mark success failed worker={} job={} error={}",
@@ -726,15 +563,13 @@ async fn run_worker_loop(
                         "[rust-scanner-worker] job_failed worker={} job={} total_ms={} error={}",
                         worker_id, job.id, total_ms, err
                     );
-                    if let Err(e) = mark_scanner_shadow_failed(
-                        &mut client,
+                    if let Err(e) = mark_sqlite_scanner_shadow_failed(
+                        &conn,
                         &job,
                         &err,
                         Some(total_ms),
                         SCANNER_MAX_BACKOFF_SEC,
-                    )
-                    .await
-                    {
+                    ) {
                         eprintln!(
                             "[rust-scanner-worker] mark fail failed worker={} job={} error={}",
                             worker_id, job.id, e
@@ -743,10 +578,10 @@ async fn run_worker_loop(
                 }
             },
             WorkerMode::Authoritative => {
-                match run_authoritative_scan(&mut client, job.payload.clone(), &job.id).await {
+                match run_authoritative_scan(&conn, job.payload.clone(), &job.id) {
                     Ok(total) => {
                         let total_ms = started_at.elapsed().as_millis();
-                        if let Err(e) = mark_rescan_succeeded(&mut client, &job, total).await {
+                        if let Err(e) = mark_sqlite_rescan_succeeded(&conn, &job, total) {
                             eprintln!(
                             "[rust-scanner-worker] mark rescan success failed worker={} job={} error={}",
                             worker_id, job.id, e
@@ -770,8 +605,7 @@ async fn run_worker_loop(
                         worker_id, job.id, total_ms, err
                     );
                         if let Err(e) =
-                            mark_rescan_failed(&mut client, &job, &err, SCANNER_MAX_BACKOFF_SEC)
-                                .await
+                            mark_sqlite_rescan_failed(&conn, &job, &err, SCANNER_MAX_BACKOFF_SEC)
                         {
                             eprintln!(
                             "[rust-scanner-worker] mark rescan fail failed worker={} job={} error={}",
@@ -786,9 +620,14 @@ async fn run_worker_loop(
 }
 
 async fn run() -> Result<(), String> {
-    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer".to_string()
-    });
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .ok_or_else(|| "cannot resolve repo root".to_string())?
+        .to_path_buf();
+    let _ = dotenvy::from_path(repo_root.join(".env"));
+    let db_path = resolve_sqlite_runtime_path(&repo_root);
     let mode = worker_mode();
     let worker_id = match mode {
         WorkerMode::Shadow => format!("rust-scanner-shadow-{}", now_unix()),
@@ -798,10 +637,12 @@ async fn run() -> Result<(), String> {
     let slow_ms = parse_u64_env("IMGVIEWER_SCANNER_SLOW_MS", 2000) as u128;
 
     eprintln!(
-        "[rust-scanner-worker] started as {} mode={:?}",
-        worker_id, mode
+        "[rust-scanner-worker] started as {} mode={:?} sqlite={}",
+        worker_id,
+        mode,
+        db_path.display()
     );
-    run_worker_loop(db_url, worker_id, mode, poll_ms, slow_ms).await
+    run_worker_loop(db_path, worker_id, mode, poll_ms, slow_ms).await
 }
 
 #[tokio::main]

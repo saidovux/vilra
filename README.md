@@ -1,15 +1,13 @@
 # ImgViewer
 
-Локальная галерея для просмотра и тегирования изображений. Проект работает как локальное приложение: файлы не загружаются наружу, а данные временно хранятся в native local PostgreSQL. SQLite schema/jobs DB-layer уже подготовлены в Rust, но runtime пока не переключен на SQLite.
+Локальная галерея для просмотра и тегирования изображений. Проект работает как локальное приложение: файлы не загружаются наружу, а индекс, теги, сессия и очередь задач хранятся в локальном SQLite-файле.
 
 ## Быстрый Старт
 
-1. Поднять native local PostgreSQL:
+1. Подготовить локальную БД:
 
 ```bash
-./scripts/local-postgres.sh init
-./scripts/local-postgres.sh start
-./scripts/local-postgres.sh status
+./scripts/repair-db.sh
 ./scripts/check-db.sh
 ```
 
@@ -33,26 +31,23 @@ npm install
 По умолчанию используется:
 
 ```bash
-DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer
+TAGIMAGE_SQLITE_PATH=.run/tagimage.sqlite
 ```
 
 Можно скопировать `.env.example` в `.env`; `start.sh` подхватит его автоматически.
 
-### Development DB options
+### Development DB
 
-Native local PostgreSQL is the normal temporary runtime until SQLite is wired in:
+SQLite is the normal runtime DB. Relative paths are resolved from the repository root:
 
 ```bash
-./scripts/local-postgres.sh init
-./scripts/local-postgres.sh start
-./scripts/local-postgres.sh status
-./scripts/check-db.sh
+TAGIMAGE_SQLITE_PATH=.run/tagimage.sqlite
 ```
 
-Use `DATABASE_URL` in `.env` if you need an explicit override:
+Use `TAGIMAGE_SQLITE_PATH` in `.env` if you need an explicit file location:
 
 ```bash
-DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer
+TAGIMAGE_SQLITE_PATH=/absolute/path/to/tagimage.sqlite
 ```
 
 `.env` must not be committed.
@@ -65,7 +60,7 @@ DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer
 ./scripts/check-db.sh
 ```
 
-Native local PostgreSQL repair/status helper:
+SQLite init/repair helper:
 
 ```bash
 ./scripts/repair-db.sh
@@ -74,18 +69,15 @@ Native local PostgreSQL repair/status helper:
 Полезные команды:
 
 ```bash
-./scripts/local-postgres.sh init
-./scripts/local-postgres.sh start
-./scripts/local-postgres.sh status
+./scripts/repair-db.sh
 ./scripts/check-db.sh
 ```
 
-`repair-db.sh` does not delete database data. It uses `.run/local-postgres` and `.logs/local-postgres.log`.
+`repair-db.sh` creates or validates the SQLite schema without deleting database data.
 
 ### Tauri direction note
 
-Current runtime still uses PostgreSQL, with native local PostgreSQL as the temporary path. SQLite schema/init and jobs queue support exist inside `rust/crates/tagimage-db`; they are file-based and not wired into runtime yet.
-Целевой packaged runtime для Tauri не должен зависеть от PostgreSQL.
+Current runtime uses file-based SQLite at `TAGIMAGE_SQLITE_PATH`. Legacy database code can remain in the repository until the next cleanup stage, but normal startup uses SQLite only.
 План и ограничения: `docs/tauri-migration-plan.md`.
 
 ## Возможности
@@ -93,7 +85,7 @@ Current runtime still uses PostgreSQL, with native local PostgreSQL as the tempo
 | Функция | Описание |
 |---|---|
 | Галерея | Masonry-сетка с миниатюрами в исходных пропорциях |
-| PostgreSQL | Изображения, теги и сессия хранятся в БД |
+| SQLite | Изображения, теги, сессия и очередь задач хранятся в локальном файле БД |
 | Авто-теги папок | Все родительские папки изображения становятся тегами |
 | Ручные теги | Добавляются в canvas-preview и сохраняются между перезапусками |
 | Поиск | Одно поле: `tag` добавляет обычный тег, `!tag` или `-tag` добавляет анти-тег |
@@ -112,7 +104,7 @@ Current runtime still uses PostgreSQL, with native local PostgreSQL as the tempo
 └── ваши фото...
 ```
 
-`index.json` больше не создается и не обновляется. Источник истины теперь PostgreSQL.
+`index.json` больше не создается и не обновляется. Источник истины теперь SQLite index DB.
 
 ## API
 
@@ -140,7 +132,7 @@ Current runtime still uses PostgreSQL, with native local PostgreSQL as the tempo
 
 ## Worker
 
-Очередь задач хранится в PostgreSQL (`jobs`, `job_attempts`, `job_events`).
+Очередь задач хранится в SQLite (`jobs`, `job_attempts`, `job_events`).
 
 Запуск отдельного воркера:
 
@@ -208,7 +200,7 @@ IMGVIEWER_THUMB_JOB_MODE=queue ./start.sh start
 IMGVIEWER_METADATA_AUTHORITATIVE=0 ./scripts/run-metadata-worker.sh --timeout 30
 ```
 
-`run-metadata-worker.sh` и `enqueue-metadata-jobs.py` загружают `.env`, поэтому используют тот же `DATABASE_URL`, что и `start.sh`.
+`run-metadata-worker.sh` и `enqueue-metadata-jobs.py` загружают `.env`, поэтому используют тот же `TAGIMAGE_SQLITE_PATH`, что и `start.sh`.
 
 ## Unified Launcher
 
@@ -339,8 +331,7 @@ npm run build:frontend
 Рекомендуемый запуск интеграционных тестов:
 
 ```bash
-TEST_DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:55432/tagimage_test pytest
+.venv/bin/python -m pytest
 ```
 
-Тесты поддерживают `TEST_DATABASE_URL` и в тестовом контексте используют его вместо обычного `DATABASE_URL`.
-Без `TEST_DATABASE_URL` включен безопасный fallback: интеграционные тесты восстанавливают `app_session` и чистят только test-данные (`/tmp/pytest-*`, `pytest-*`), чтобы не оставлять временные пути в рабочем состоянии приложения.
+Тесты используют временный SQLite-файл и чистят только test-данные (`/tmp/pytest-*`, `pytest-*`), чтобы не оставлять временные пути в рабочем состоянии приложения.

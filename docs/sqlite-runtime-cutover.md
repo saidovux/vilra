@@ -1,21 +1,21 @@
 # SQLite Runtime Cutover Notes
 
-SQLite schema, isolated init, jobs queue helpers, and runtime-parity DB helpers now live in `rust/crates/tagimage-db`.
+Normal TagImage runtime now uses file-based SQLite through `TAGIMAGE_SQLITE_PATH`, defaulting to `.run/tagimage.sqlite`.
 
-Current runtime is still PostgreSQL through native local PostgreSQL at `127.0.0.1:55432`. This is temporary legacy runtime state while SQLite parity is prepared.
+What is active:
 
-Implemented in this stage:
+- `start.sh`, `check-db.sh`, and `repair-db.sh` initialize and validate SQLite.
+- Rust API, scanner-worker, thumb-worker, and metadata-worker open SQLite directly.
+- Python legacy/reference modules use `sqlite3` and preserve the existing service/API shapes.
+- SQLite stores index metadata, tags, session state, jobs, attempts, events, and relative cache paths.
 
-- SQLite health/init/table verification helpers.
-- SQLite image, tag, folder tree, session, and pagination helpers.
-- SQLite runtime-facing jobs wrappers on top of the existing queue semantics.
-- SQLite metadata/thumb/rescan source and enqueue helpers.
+What is intentionally not included:
 
-Not done in this stage:
-
-- No runtime cutover.
 - No runtime backend switch.
-- No Docker fallback.
-- No frontend, Tauri, API, or worker wiring changes.
+- No automatic migration from older external DB data.
+- No storage of original images, thumbnails, previews, or media bytes in SQLite.
 
-Next stage: directly cut over API, workers, and start scripts to file-based SQLite as the only runtime DB.
+Next cleanup stage:
+
+- Remove obsolete external DB code paths that are no longer used by normal runtime.
+- Keep public API and worker behavior stable while deleting dead compatibility code.

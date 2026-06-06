@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
-    pub database_url: String,
+    pub sqlite_path: PathBuf,
     pub host: String,
     pub port: u16,
     pub repo_root: PathBuf,
@@ -79,11 +79,10 @@ impl AppConfig {
         let metadata_worker = env_bool("IMGVIEWER_METADATA_WORKER", !legacy_python);
         let metadata_authoritative =
             metadata_worker && env_bool("IMGVIEWER_METADATA_AUTHORITATIVE", !legacy_python);
+        let sqlite_path = tagimage_db::sqlite::resolve_sqlite_runtime_path(&repo_root);
 
         Ok(Self {
-            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-                "postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer".to_string()
-            }),
+            sqlite_path,
             host,
             port,
             repo_root,

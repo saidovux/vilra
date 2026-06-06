@@ -89,8 +89,8 @@ pub async fn serve_index(State(state): State<Arc<AppState>>) -> Result<Response,
 }
 
 pub async fn get_status(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
-    let client = state.connect().await?;
-    Ok(json_response(db::status_payload(&state, &client).await?))
+    let client = state.connect()?;
+    Ok(json_response(db::status_payload(&state, &client)?))
 }
 
 pub async fn list_images(
@@ -98,8 +98,8 @@ pub async fn list_images(
     Query(query): Query<ImagesRequest>,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
-    let client = state.connect().await?;
-    let session = db::load_session(&client).await?;
+    let client = state.connect()?;
+    let session = db::load_session(&client)?;
     let roots = require_roots(&session)?;
     let page = db::query_images_page(
         &client,
@@ -115,8 +115,7 @@ pub async fn list_images(
             sort: query.sort,
             include_total: query.include_total,
         },
-    )
-    .await?;
+    )?;
     let elapsed_ms = elapsed_ms(started);
     let items = page.get("items").cloned().unwrap_or_else(|| json!([]));
     let page_value = page.get("page").cloned().unwrap_or_else(|| json!({}));
@@ -141,9 +140,9 @@ pub async fn list_images(
 }
 
 pub async fn list_tags(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
-    let client = state.connect().await?;
+    let client = state.connect()?;
     Ok(json_response(
-        json!({"tags": db::tag_summary_rows(&client).await?}),
+        json!({"tags": db::tag_summary_rows(&client)?}),
     ))
 }
 
@@ -155,11 +154,11 @@ pub async fn create_tag(
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::bad_request("Tag name is empty"))?;
-    let client = state.connect().await?;
-    let tag = db::create_user_tag_entry(&client, name).await?;
+    let client = state.connect()?;
+    let tag = db::create_user_tag_entry(&client, name)?;
     Ok(json_response(json!({
         "tag": tag,
-        "tags": db::tag_summary_rows(&client).await?,
+        "tags": db::tag_summary_rows(&client)?,
     })))
 }
 
@@ -168,11 +167,11 @@ pub async fn update_tag(
     Path(tag): Path<String>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let client = state.connect().await?;
-    let tag_summary = db::update_tag_definition(&client, &tag, &payload).await?;
+    let client = state.connect()?;
+    let tag_summary = db::update_tag_definition(&client, &tag, &payload)?;
     Ok(json_response(json!({
         "tag": tag_summary,
-        "tags": db::tag_summary_rows(&client).await?,
+        "tags": db::tag_summary_rows(&client)?,
     })))
 }
 
@@ -180,10 +179,10 @@ pub async fn delete_tag(
     State(state): State<Arc<AppState>>,
     Path(tag): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let client = state.connect().await?;
-    db::delete_tag_definition(&client, &tag).await?;
+    let client = state.connect()?;
+    db::delete_tag_definition(&client, &tag)?;
     Ok(json_response(
-        json!({"ok": true, "tags": db::tag_summary_rows(&client).await?}),
+        json!({"ok": true, "tags": db::tag_summary_rows(&client)?}),
     ))
 }
 
@@ -202,12 +201,11 @@ pub async fn set_image_tags(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let client = state.connect().await?;
-    let image = get_image_record(&client, &img_id)
-        .await?
+    let client = state.connect()?;
+    let image = get_image_record(&client, &img_id)?
         .ok_or_else(|| ApiError::not_found("Image not found"))?;
     let user_tags = clean_tag_list(&tags);
-    db::replace_image_user_tags(&client, &img_id, &user_tags).await?;
+    db::replace_image_user_tags(&client, &img_id, &user_tags)?;
     let rows = vec![ImageRow {
         id: image.id.clone(),
         path: image.path,
@@ -216,9 +214,8 @@ pub async fn set_image_tags(
         mtime: image.mtime,
         width: image.width,
         height: image.height,
-        lower_path: String::new(),
     }];
-    let refreshed = db::rows_to_images(&client, rows).await?;
+    let refreshed = db::rows_to_images(&client, rows)?;
     let image = refreshed.into_iter().next().unwrap_or_else(|| json!({}));
     Ok(json_response(json!({
         "id": img_id,
@@ -230,8 +227,8 @@ pub async fn set_image_tags(
 }
 
 pub async fn get_session(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
-    let client = state.connect().await?;
-    let session = db::load_session(&client).await?;
+    let client = state.connect()?;
+    let session = db::load_session(&client)?;
     Ok(json_response(
         serde_json::to_value(session).unwrap_or_else(|_| json!({})),
     ))
@@ -244,17 +241,17 @@ pub async fn patch_session(
     let Some(object) = payload.as_object() else {
         return Err(ApiError::bad_request("Request body must be an object"));
     };
-    let client = state.connect().await?;
+    let client = state.connect()?;
     let mut payload = Value::Object(object.clone());
     if let Some(root_path) = payload.get("root_path").and_then(Value::as_str) {
         if !root_path.is_empty() {
-            let session = set_root(&client, root_path, true).await?;
+            let session = set_root(&client, root_path, true)?;
             payload["root_path"] = json!(session.root_path);
             payload["root_paths"] = json!(session.root_paths);
         }
     }
     Ok(json_response(
-        serde_json::to_value(db::save_session_value(&client, &payload).await?)
+        serde_json::to_value(db::save_session_value(&client, &payload)?)
             .unwrap_or_else(|_| json!({})),
     ))
 }
@@ -267,10 +264,10 @@ pub async fn set_folder(
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::bad_request("Not a directory: "))?;
-    let client = state.connect().await?;
-    let session = set_root(&client, path, true).await?;
+    let client = state.connect()?;
+    let session = set_root(&client, path, true)?;
     let root = active_root(&session).ok_or_else(|| ApiError::bad_request("No folder set"))?;
-    let job = db::enqueue_rescan_job(&client, &root, state.config.rescan_max_attempts).await?;
+    let job = db::enqueue_rescan_job(&client, &root, state.config.rescan_max_attempts)?;
     Ok(json_response(json!({
         "ok": true,
         "root": root,
@@ -280,24 +277,28 @@ pub async fn set_folder(
 }
 
 pub async fn list_folders(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
-    let client = state.connect().await?;
-    let session = db::load_session(&client).await?;
+    let client = state.connect()?;
+    let session = db::load_session(&client)?;
     let roots = roots_from_session(&session);
-    let items = db::folder_tree_rows(&client, &roots).await?;
+    let items = db::folder_tree_rows(&client, &roots)?;
     Ok(json_response(json!({"roots": roots, "items": items})))
 }
 
 pub async fn rescan(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
-    let client = state.connect().await?;
-    let session = db::load_session(&client).await?;
+    let client = state.connect()?;
+    let session = db::load_session(&client)?;
     let roots = require_roots(&session)?;
-    let running = db::running_rescan_job(&client).await?;
+    let running = db::running_rescan_job(&client)?;
     if running.is_some() {
         return Ok(json_response(build_rescan_response(running, Vec::new())));
     }
     let mut jobs = Vec::new();
     for root in roots {
-        jobs.push(db::enqueue_rescan_job(&client, &root, state.config.rescan_max_attempts).await?);
+        jobs.push(db::enqueue_rescan_job(
+            &client,
+            &root,
+            state.config.rescan_max_attempts,
+        )?);
     }
     Ok(json_response(build_rescan_response(None, jobs)))
 }
@@ -306,10 +307,8 @@ pub async fn get_job_handler(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let client = state.connect().await?;
-    let job = db::get_job(&client, &job_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("Job not found"))?;
+    let client = state.connect()?;
+    let job = db::get_job(&client, &job_id)?.ok_or_else(|| ApiError::not_found("Job not found"))?;
     Ok(json_response(json!({"job": job})))
 }
 
@@ -317,14 +316,13 @@ pub async fn list_jobs_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<JobsRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let client = state.connect().await?;
+    let client = state.connect()?;
     let jobs = db::list_jobs(
         &client,
         query.job_type.as_deref(),
         query.state.as_deref(),
         query.limit.unwrap_or(50),
-    )
-    .await?;
+    )?;
     Ok(json_response(json!({"jobs": jobs})))
 }
 
@@ -332,8 +330,8 @@ pub async fn rebuild_thumbs(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let client = state.connect().await?;
-    let session = db::load_session(&client).await?;
+    let client = state.connect()?;
+    let session = db::load_session(&client)?;
     let roots = require_roots(&session)?;
     let input = ThumbRebuildInput {
         stale_only: payload
@@ -343,8 +341,7 @@ pub async fn rebuild_thumbs(
         limit: payload.get("limit").and_then(Value::as_i64),
     };
     let result =
-        db::enqueue_thumb_rebuild_jobs(&client, &roots, input, state.config.thumb_max_attempts)
-            .await?;
+        db::enqueue_thumb_rebuild_jobs(&client, &roots, input, state.config.thumb_max_attempts)?;
     Ok(json_response(json!({
         "ok": true,
         "enqueued": result.enqueued,
@@ -364,13 +361,14 @@ pub async fn get_thumb_file(
     if !validate_image_id(img_id) {
         return Err(ApiError::not_found("Not found"));
     }
-    let client = state.connect().await?;
-    let session = db::load_session(&client).await?;
+    let client = state.connect()?;
+    let session = db::load_session(&client)?;
     let root = active_root(&session).ok_or_else(|| ApiError::bad_request("No folder set"))?;
     let path = thumb_path_for_id(&root, img_id);
     if !path.exists() {
         return Err(ApiError::not_found("Not found"));
     }
+    drop(client);
     file_response(
         path,
         Some("image/jpeg"),
@@ -384,13 +382,13 @@ pub async fn get_thumb(
     Path(img_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
-    let client = state.connect().await?;
-    let image = get_image_record(&client, &img_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("Not found"))?;
+    let client = state.connect()?;
+    let image =
+        get_image_record(&client, &img_id)?.ok_or_else(|| ApiError::not_found("Not found"))?;
     let db_elapsed_ms = elapsed_ms(started);
     let thumb_path = image_thumb_path(&image);
     if thumb_path.exists() {
+        drop(client);
         return file_response_with_timings(
             thumb_path,
             "image/jpeg",
@@ -414,8 +412,8 @@ pub async fn get_thumb(
             image.mtime,
             30,
             state.config.thumb_max_attempts,
-        )
-        .await?;
+        )?;
+        drop(client);
         if state.config.thumb_wait_ms > 0 {
             let deadline = Instant::now() + Duration::from_millis(state.config.thumb_wait_ms);
             while Instant::now() < deadline {
@@ -460,14 +458,14 @@ pub async fn get_file(
     State(state): State<Arc<AppState>>,
     Path(img_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let client = state.connect().await?;
-    let image = get_image_record(&client, &img_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("Not found"))?;
+    let client = state.connect()?;
+    let image =
+        get_image_record(&client, &img_id)?.ok_or_else(|| ApiError::not_found("Not found"))?;
     let path = image_file_path(&image);
     if !path.exists() {
         return Err(ApiError::not_found("File not found on disk"));
     }
+    drop(client);
     let mime = mime_guess::from_path(&path)
         .first()
         .map(|mime| mime.to_string())

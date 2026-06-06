@@ -6,7 +6,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 PYTHON_BIN=""
-DATABASE_URL_EFFECTIVE=""
 
 info() {
   echo "[check-db] $*"
@@ -53,53 +52,30 @@ pick_python() {
   return 1
 }
 
-read_effective_database_url() {
+sqlite_db_check() {
   "$PYTHON_BIN" - <<'PY'
-from app.config import DATABASE_URL
-print(DATABASE_URL)
-PY
-}
+from app.config import SQLITE_PATH
+from app.repo.db import ensure_db_ready, verify_core_tables, verify_job_tables, db_connect
 
-check_configured_socket() {
-  "$PYTHON_BIN" - <<'PY'
-import socket
-from urllib.parse import urlparse
-
-from app.config import DATABASE_URL
-
-parsed = urlparse(DATABASE_URL)
-host = parsed.hostname or "127.0.0.1"
-port = parsed.port or 55432
-print(f"[socket] target={host}:{port}")
-with socket.create_connection((host, port), timeout=2):
-    pass
-print("[socket] reachable")
-PY
-}
-
-python_db_check() {
-  "$PYTHON_BIN" - <<'PY'
-import psycopg
-from app.config import DATABASE_URL
-
-print(f"[python] app.config.DATABASE_URL={DATABASE_URL}")
-with psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
-    with conn.cursor() as cur:
-        cur.execute("select 1")
-        print(f"[python] select_1={cur.fetchone()}")
+print(f"[python] TAGIMAGE_SQLITE_PATH={SQLITE_PATH}")
+ensure_db_ready()
+core = verify_core_tables()
+jobs = verify_job_tables()
+with db_connect() as conn:
+    row = conn.execute("select 1").fetchone()
+print(f"[python] select_1={row[0] if row else None}")
+print(f"[python] core_tables={','.join(core)}")
+print(f"[python] job_tables={','.join(jobs)}")
 PY
 }
 
 failure_hints() {
-  warn "DB check failed."
-  warn "Normal TagImage runtime uses native local PostgreSQL."
+  warn "SQLite DB check failed."
   warn "Try:"
-  warn "  ./scripts/local-postgres.sh init"
-  warn "  ./scripts/local-postgres.sh start"
-  warn "  ./scripts/local-postgres.sh status"
+  warn "  ./scripts/repair-db.sh"
   warn "  ./scripts/check-db.sh"
-  warn "Expected DATABASE_URL:"
-  warn "  postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer"
+  warn "Default path:"
+  warn "  TAGIMAGE_SQLITE_PATH=.run/tagimage.sqlite"
 }
 
 main() {
@@ -112,24 +88,8 @@ main() {
   info "python: $PYTHON_BIN"
 
   echo
-  info "effective DATABASE_URL from app.config"
-  if ! DATABASE_URL_EFFECTIVE="$(read_effective_database_url)"; then
-    warn "failed to read app.config.DATABASE_URL"
-    failure_hints
-    exit 1
-  fi
-  echo "$DATABASE_URL_EFFECTIVE"
-
-  echo
-  info "configured host/port reachability"
-  if ! check_configured_socket; then
-    failure_hints
-    exit 1
-  fi
-
-  echo
-  info "Python psycopg check via app.config.DATABASE_URL"
-  if python_db_check; then
+  info "SQLite runtime DB check"
+  if sqlite_db_check; then
     info "DB check passed."
     exit 0
   fi

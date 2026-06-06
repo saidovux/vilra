@@ -1,14 +1,16 @@
 use crate::sqlite::{
-    claim_next_sqlite_job, enqueue_sqlite_job, get_sqlite_job, init_sqlite_db,
-    mark_sqlite_job_failed, mark_sqlite_job_succeeded, SqliteJob,
+    claim_next_sqlite_job, enqueue_sqlite_job, get_sqlite_job, mark_sqlite_job_failed,
+    mark_sqlite_job_succeeded, SqliteJob,
 };
+use crate::sqlite_schema::SQLITE_SCHEMA_VERSION;
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
 
 const DEFAULT_PAGE_LIMIT: i64 = 120;
@@ -159,7 +161,59 @@ struct StaleJob {
 }
 
 pub fn open_sqlite_runtime_db(path: &Path) -> Result<Connection, String> {
-    init_sqlite_db(path)
+    let conn =
+        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(|e| {
+            format!(
+                "open sqlite runtime db {}: {e}; run ./scripts/repair-db.sh first",
+                path.display()
+            )
+        })?;
+    conn.busy_timeout(Duration::from_millis(5_000))
+        .map_err(|e| format!("set sqlite runtime busy_timeout: {e}"))?;
+    conn.execute_batch(
+        r#"
+        PRAGMA foreign_keys = ON;
+        PRAGMA busy_timeout = 5000;
+        "#,
+    )
+    .map_err(|e| format!("set sqlite runtime pragmas: {e}"))?;
+
+    let version = conn
+        .query_row(
+            "SELECT version FROM tagimage_schema_version WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| {
+            format!(
+                "read sqlite schema version from {}: {e}; run ./scripts/repair-db.sh first",
+                path.display()
+            )
+        })?;
+    if version != SQLITE_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported sqlite schema version {version}; expected {SQLITE_SCHEMA_VERSION}"
+        ));
+    }
+    Ok(conn)
+}
+
+pub fn resolve_sqlite_runtime_path(repo_root: &Path) -> PathBuf {
+    let raw = std::env::var("TAGIMAGE_SQLITE_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ".run/tagimage.sqlite".to_string());
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    }
+}
+
+pub fn open_sqlite_runtime_db_for_repo(repo_root: &Path) -> Result<Connection, String> {
+    open_sqlite_runtime_db(&resolve_sqlite_runtime_path(repo_root))
 }
 
 pub fn check_sqlite_db_health(path: &Path) -> JsonValue {
@@ -1618,6 +1672,81 @@ pub fn claim_next_sqlite_metadata_job(
     claim_next_sqlite_job(conn, Some("metadata"), worker_id)
 }
 
+pub fn claim_next_sqlite_scanner_shadow_job(
+    conn: &Connection,
+    worker_id: &str,
+) -> Result<Option<crate::ClaimedJob>, String> {
+    claim_next_sqlite_job(conn, Some("scanner_shadow"), worker_id)
+}
+
+pub fn mark_sqlite_rescan_succeeded(
+    conn: &Connection,
+    job: &crate::ClaimedJob,
+    total: i32,
+) -> Result<(), String> {
+    mark_sqlite_job_succeeded(conn, &job.id, Some(total), Some(json!({"total": total})))
+}
+
+pub fn mark_sqlite_rescan_failed(
+    conn: &Connection,
+    job: &crate::ClaimedJob,
+    error: &str,
+    max_backoff_sec: i64,
+) -> Result<(), String> {
+    mark_sqlite_job_failed(conn, &job.id, error, max_backoff_sec, None)
+}
+
+pub fn mark_sqlite_metadata_succeeded(
+    conn: &Connection,
+    job: &crate::ClaimedJob,
+    metadata_json: JsonValue,
+    authoritative: bool,
+) -> Result<(), String> {
+    let event_data = json!({
+        "attempt": job.attempt,
+        "completed_at": now_unix(),
+        "metadata": metadata_json,
+        "authoritative": authoritative,
+        "shadow": !authoritative,
+    });
+    mark_sqlite_job_succeeded(conn, &job.id, Some(1), Some(event_data))
+}
+
+pub fn mark_sqlite_metadata_failed(
+    conn: &Connection,
+    job: &crate::ClaimedJob,
+    error: &str,
+    total_ms: Option<u128>,
+    max_backoff_sec: i64,
+) -> Result<(), String> {
+    mark_sqlite_job_failed(conn, &job.id, error, max_backoff_sec, total_ms)
+}
+
+pub fn mark_sqlite_scanner_shadow_succeeded(
+    conn: &Connection,
+    job: &crate::ClaimedJob,
+    scan_json: JsonValue,
+    total: i32,
+) -> Result<(), String> {
+    let event_data = json!({
+        "attempt": job.attempt,
+        "completed_at": now_unix(),
+        "scanner_shadow": scan_json,
+        "shadow": true,
+    });
+    mark_sqlite_job_succeeded(conn, &job.id, Some(total), Some(event_data))
+}
+
+pub fn mark_sqlite_scanner_shadow_failed(
+    conn: &Connection,
+    job: &crate::ClaimedJob,
+    error: &str,
+    total_ms: Option<u128>,
+    max_backoff_sec: i64,
+) -> Result<(), String> {
+    mark_sqlite_job_failed(conn, &job.id, error, max_backoff_sec, total_ms)
+}
+
 pub fn mark_sqlite_thumb_succeeded(
     conn: &Connection,
     job_id: &str,
@@ -2193,7 +2322,7 @@ fn collect_rows<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sqlite::{list_sqlite_job_events, mark_sqlite_job_succeeded};
+    use crate::sqlite::{init_sqlite_db, list_sqlite_job_events, mark_sqlite_job_succeeded};
 
     fn temp_db_path() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2231,13 +2360,94 @@ mod tests {
         let (_dir, db_path) = temp_db_path();
         assert!(!db_path.ends_with(".run/tagimage.sqlite"));
 
+        drop(init_sqlite_db(&db_path).expect("explicit init"));
         let conn = open_sqlite_runtime_db(&db_path).expect("open runtime db");
         verify_sqlite_core_tables(&conn).expect("core tables");
         verify_sqlite_job_tables(&conn).expect("job tables");
 
+        let enabled: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign_keys pragma");
+        assert_eq!(enabled, 1);
+
+        let timeout_ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("busy_timeout pragma");
+        assert_eq!(timeout_ms, 5_000);
+
         let health = check_sqlite_db_health(&db_path);
         assert_eq!(health["db_ready"], true);
         assert_eq!(health["db_error"], JsonValue::Null);
+    }
+
+    #[test]
+    fn runtime_open_requires_explicit_init_and_does_not_create_db() {
+        let (_dir, db_path) = temp_db_path();
+
+        let missing = open_sqlite_runtime_db(&db_path).expect_err("missing db should fail");
+        assert!(missing.contains("open sqlite runtime db"));
+        assert!(
+            !db_path.exists(),
+            "runtime open must not create sqlite file"
+        );
+
+        std::fs::File::create(&db_path).expect("create empty sqlite path");
+        let uninitialized =
+            open_sqlite_runtime_db(&db_path).expect_err("uninitialized db should fail");
+        assert!(uninitialized.contains("read sqlite schema version"));
+    }
+
+    #[test]
+    fn concurrent_runtime_opens_do_not_run_schema_init_or_lock() {
+        let (_dir, db_path) = temp_db_path();
+        drop(init_sqlite_db(&db_path).expect("explicit init"));
+
+        let db_path = std::sync::Arc::new(db_path);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|_| {
+                let db_path = std::sync::Arc::clone(&db_path);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let conn = open_sqlite_runtime_db(&db_path).expect("runtime open");
+                    conn.query_row(
+                        "SELECT version FROM tagimage_schema_version WHERE id = 1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("schema version")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            assert_eq!(handle.join().expect("thread join"), SQLITE_SCHEMA_VERSION);
+        }
+    }
+
+    #[test]
+    fn runtime_path_resolution_uses_repo_relative_default_and_env_override() {
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        std::env::remove_var("TAGIMAGE_SQLITE_PATH");
+        assert_eq!(
+            resolve_sqlite_runtime_path(repo.path()),
+            repo.path().join(".run/tagimage.sqlite")
+        );
+
+        std::env::set_var("TAGIMAGE_SQLITE_PATH", "custom/tagimage.sqlite");
+        assert_eq!(
+            resolve_sqlite_runtime_path(repo.path()),
+            repo.path().join("custom/tagimage.sqlite")
+        );
+
+        let absolute = repo.path().join("absolute.sqlite");
+        std::env::set_var(
+            "TAGIMAGE_SQLITE_PATH",
+            absolute.to_string_lossy().to_string(),
+        );
+        assert_eq!(resolve_sqlite_runtime_path(repo.path()), absolute);
+        std::env::remove_var("TAGIMAGE_SQLITE_PATH");
     }
 
     #[test]
@@ -2488,6 +2698,83 @@ mod tests {
 
         let jobs = list_sqlite_jobs(&conn, None, None, 10).expect("list jobs");
         assert!(jobs.iter().any(|job| job["type"] == "rescan"));
+    }
+
+    #[test]
+    fn scanner_shadow_metadata_and_rescan_wrappers_write_expected_events() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+
+        enqueue_sqlite_job(
+            &conn,
+            "scanner_shadow",
+            json!({"root_path": "/photos"}),
+            10,
+            1,
+            None,
+        )
+        .expect("scanner enqueue");
+        let scanner = claim_next_sqlite_scanner_shadow_job(&conn, "scanner-worker")
+            .expect("scanner claim")
+            .expect("scanner job");
+        mark_sqlite_scanner_shadow_succeeded(
+            &conn,
+            &scanner,
+            json!({"root_path": "/photos", "total": 2}),
+            2,
+        )
+        .expect("scanner success");
+        let scanner_events = list_sqlite_job_events(&conn, &scanner.id).expect("scanner events");
+        let success = scanner_events
+            .iter()
+            .find(|event| event.event == "succeeded")
+            .expect("scanner success event");
+        assert_eq!(success.data["scanner_shadow"]["total"], 2);
+        assert_eq!(success.data["shadow"], true);
+
+        enqueue_sqlite_metadata_job(&conn, "img-1", "/photos", "a.jpg", Some(5), 0, 1)
+            .expect("metadata enqueue");
+        let metadata = claim_next_sqlite_metadata_job(&conn, "metadata-worker")
+            .expect("metadata claim")
+            .expect("metadata job");
+        mark_sqlite_metadata_succeeded(
+            &conn,
+            &metadata,
+            json!({"image_id": "img-1", "width": 10}),
+            true,
+        )
+        .expect("metadata success");
+        let metadata_events = list_sqlite_job_events(&conn, &metadata.id).expect("metadata events");
+        let success = metadata_events
+            .iter()
+            .find(|event| event.event == "succeeded")
+            .expect("metadata success event");
+        assert_eq!(success.data["metadata"]["image_id"], "img-1");
+        assert_eq!(success.data["authoritative"], true);
+        assert_eq!(success.data["shadow"], false);
+
+        let rescan_job = enqueue_sqlite_rescan_job(&conn, "/photos", 1).expect("rescan enqueue");
+        let rescan = claim_next_sqlite_rescan_job(&conn, "rescan-worker")
+            .expect("rescan claim")
+            .expect("rescan job");
+        mark_sqlite_rescan_succeeded(&conn, &rescan, 7).expect("rescan success");
+        let rescan_value = get_sqlite_job_api_value(&conn, rescan_job["id"].as_str().unwrap())
+            .expect("rescan value")
+            .expect("rescan value");
+        assert_eq!(rescan_value["state"], "succeeded");
+        assert_eq!(rescan_value["progress"]["total"], 7);
+
+        enqueue_sqlite_job(&conn, "metadata", json!({"image_id": "img-2"}), 0, 1, None)
+            .expect("metadata failure enqueue");
+        let failed = claim_next_sqlite_metadata_job(&conn, "metadata-worker")
+            .expect("metadata fail claim")
+            .expect("metadata fail job");
+        mark_sqlite_metadata_failed(&conn, &failed, "boom", Some(12), 120).expect("metadata fail");
+        let failed_value = get_sqlite_job_api_value(&conn, &failed.id)
+            .expect("failed job")
+            .expect("failed job");
+        assert_eq!(failed_value["state"], "failed");
+        assert_eq!(failed_value["error"], "boom");
     }
 
     #[test]

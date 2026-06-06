@@ -18,11 +18,6 @@ die() {
   exit 1
 }
 
-mask_database_url() {
-  local url="$1"
-  echo "$url" | sed -E 's#(://[^:]+:)[^@]*@#\1***@#'
-}
-
 pick_python() {
   if [[ -n "${PYTHON:-}" ]]; then
     if [[ -x "$PYTHON" ]]; then
@@ -53,12 +48,12 @@ pick_python() {
   return 1
 }
 
-read_effective_database_url() {
+read_effective_sqlite_path() {
   local python_bin
-  python_bin="$(pick_python)" || die "Python not found; cannot read app.config.DATABASE_URL"
+  python_bin="$(pick_python)" || die "Python not found; cannot read app.config.SQLITE_PATH"
   "$python_bin" - <<'PY'
-from app.config import DATABASE_URL
-print(DATABASE_URL)
+from app.config import SQLITE_PATH
+print(SQLITE_PATH)
 PY
 }
 
@@ -95,12 +90,7 @@ main() {
     echo "[run-scanner-worker] loaded .env"
   fi
 
-  if [[ -z "${DATABASE_URL:-}" ]]; then
-    DATABASE_URL="$(read_effective_database_url)"
-    export DATABASE_URL
-  fi
-
-  echo "[run-scanner-worker] DATABASE_URL=$(mask_database_url "$DATABASE_URL")"
+  echo "[run-scanner-worker] TAGIMAGE_SQLITE_PATH=$(read_effective_sqlite_path)"
 
   local cmd=(
     cargo run --release --manifest-path "$REPO_ROOT/rust/scanner-worker/Cargo.toml"

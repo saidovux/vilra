@@ -40,7 +40,7 @@ def _list_metadata_source_rows(*, limit: int | None) -> list[dict[str, Any]]:
             """
             params: list[Any] = []
             if max_rows > 0:
-                sql += " LIMIT %s"
+                sql += " LIMIT ?"
                 params.append(max_rows)
             cur.execute(sql, params)
             return list(cur.fetchall())

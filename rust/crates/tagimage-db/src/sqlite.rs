@@ -1,6 +1,6 @@
 use crate::sqlite_schema::{INDEX_STATEMENTS, SQLITE_SCHEMA_VERSION, TABLE_STATEMENTS};
 use crate::ClaimedJob;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;
@@ -67,7 +67,7 @@ pub fn init_sqlite_db(path: &Path) -> Result<Connection, String> {
     .map_err(|e| format!("set sqlite pragmas: {e}"))?;
 
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| format!("begin sqlite schema tx: {e}"))?;
     for statement in TABLE_STATEMENTS {
         tx.execute_batch(statement)

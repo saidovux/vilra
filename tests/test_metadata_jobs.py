@@ -31,7 +31,7 @@ def db_available():
     try:
         ensure_db_ready()
     except Exception as exc:
-        pytest.skip(f"PostgreSQL is required for metadata job tests: {exc}")
+        pytest.skip(f"SQLite runtime DB is required for metadata job tests: {exc}")
     return True
 
 

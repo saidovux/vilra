@@ -1,8 +1,8 @@
 import os
 
-from tagimage_env import ensure_database_url
+from tagimage_env import ensure_sqlite_path
 
-DATABASE_URL = ensure_database_url()
+SQLITE_PATH = ensure_sqlite_path()
 
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 INDEX_DIR_NAME = ".imgindex"

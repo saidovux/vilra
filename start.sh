@@ -341,13 +341,11 @@ scanner_backend() {
 
 db_ready_once() {
   "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
-import psycopg
-from app.config import DATABASE_URL
+from app.repo.db import ensure_db_ready, verify_core_tables, verify_job_tables
 
-with psycopg.connect(DATABASE_URL, connect_timeout=2) as conn:
-    with conn.cursor() as cur:
-        cur.execute("select 1")
-        cur.fetchone()
+ensure_db_ready()
+verify_core_tables()
+verify_job_tables()
 PY
 }
 
@@ -366,8 +364,7 @@ wait_for_db_ready() {
 
   echo "[db] not ready (timeout: ${timeout_sec}s)"
   echo "Try:"
-  echo "  ./scripts/local-postgres.sh init"
-  echo "  ./scripts/local-postgres.sh start"
+  echo "  ./scripts/repair-db.sh"
   echo "  ./scripts/check-db.sh"
   return 1
 }
@@ -1107,13 +1104,11 @@ status_db_line() {
   fi
 
   if "$py" - <<'PY' >/dev/null 2>&1
-import psycopg
-from app.config import DATABASE_URL
+from app.repo.db import ensure_db_ready, verify_core_tables, verify_job_tables
 
-with psycopg.connect(DATABASE_URL, connect_timeout=2) as conn:
-    with conn.cursor() as cur:
-        cur.execute("select 1")
-        cur.fetchone()
+ensure_db_ready()
+verify_core_tables()
+verify_job_tables()
 PY
   then
     echo "[db] ready"

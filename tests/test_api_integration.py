@@ -19,7 +19,7 @@ def db_available():
     try:
         ensure_db_ready()
     except Exception as exc:
-        pytest.skip(f"PostgreSQL is required for integration tests: {exc}")
+        pytest.skip(f"SQLite runtime DB is required for integration tests: {exc}")
     return True
 
 
@@ -51,9 +51,9 @@ def _cleanup_root_data(root_path: str) -> None:
     from app.repo.db import db_connect
 
     with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM jobs WHERE payload->>'root_path' = %s", (root_path,))
-            cur.execute("DELETE FROM images WHERE root_path = %s", (root_path,))
+        cur = conn.cursor()
+        cur.execute("DELETE FROM jobs WHERE json_extract(payload, '$.root_path') = ?", (root_path,))
+        cur.execute("DELETE FROM images WHERE root_path = ?", (root_path,))
 
 
 def _scan_root(client, root: Path) -> None:

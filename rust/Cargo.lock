@@ -858,14 +858,14 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64",
- "bytes",
  "chrono",
  "dotenvy",
  "mime_guess",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tagimage-db",
  "tokio",
- "tokio-postgres",
  "tower-http",
  "uuid",
 ]
@@ -874,24 +874,25 @@ dependencies = [
 name = "imgviewer-metadata-worker"
 version = "0.1.0"
 dependencies = [
+ "dotenvy",
  "image",
  "serde_json",
  "tagimage-core",
  "tagimage-db",
  "tokio",
- "tokio-postgres",
 ]
 
 [[package]]
 name = "imgviewer-scanner-worker"
 version = "0.1.0"
 dependencies = [
+ "dotenvy",
  "image",
+ "rusqlite",
  "serde_json",
  "tagimage-core",
  "tagimage-db",
  "tokio",
- "tokio-postgres",
  "uuid",
 ]
 
@@ -899,13 +900,13 @@ dependencies = [
 name = "imgviewer-thumb-worker"
 version = "0.1.0"
 dependencies = [
+ "dotenvy",
  "image",
  "serde",
  "serde_json",
  "tagimage-core",
  "tagimage-db",
  "tokio",
- "tokio-postgres",
 ]
 
 [[package]]
@@ -1339,7 +1340,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8dc729a129e682e8d24170cd30ae1aa01b336b096cbb56df6d534ffec133d186"
 dependencies = [
  "bytes",
- "chrono",
  "fallible-iterator 0.2.0",
  "postgres-protocol",
  "serde_core",
