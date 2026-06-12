@@ -514,7 +514,7 @@ ensure_requirements() {
     need_install=1
   fi
 
-  if ! "$PYTHON_BIN" -c 'import fastapi, uvicorn, PIL, psycopg' >/dev/null 2>&1; then
+  if ! "$PYTHON_BIN" -c 'import fastapi, uvicorn, PIL' >/dev/null 2>&1; then
     need_install=1
   fi
 

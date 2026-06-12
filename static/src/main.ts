@@ -876,8 +876,8 @@ async function pollStatus(): Promise<void> {
 }
 
 function renderDbStatus(status: StatusResponse): void {
-  if (status.db_ready) setDbStatus(true, 'PostgreSQL подключен');
-  else setDbStatus(false, status.db_error || 'PostgreSQL недоступен');
+  if (status.db_ready) setDbStatus(true, 'SQLite готов');
+  else setDbStatus(false, status.db_error || 'SQLite недоступен');
 }
 
 function setDbStatus(ok: boolean, text: string): void {
