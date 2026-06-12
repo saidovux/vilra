@@ -908,6 +908,18 @@ function setServerTotalFromPage(page: ImagePage | null | undefined, fallbackCoun
   if (!serverTotalKnown) serverTotal = Number(fallbackCount || 0);
 }
 
+function mergeRefreshedPageIntoLoadedImages(existing: ImageItem[], refreshedPage: ImageItem[]): ImageItem[] {
+  if (!existing.length) return refreshedPage.slice();
+  if (!refreshedPage.length) return existing.slice();
+
+  const refreshedById = new Map(refreshedPage.map(img => [img.id, img]));
+  const retained = existing
+    .map(img => refreshedById.get(img.id) || img)
+    .filter(img => !refreshedById.has(img.id));
+
+  return [...refreshedPage, ...retained];
+}
+
 function updateImageCounter(): void {
   const count = serverTotalKnown ? serverTotal : visibleImages.length;
   const suffix = !serverTotalKnown && hasMorePages ? '+' : '';
@@ -929,7 +941,10 @@ async function refreshImages(clear = true): Promise<void> {
     if (!r.ok) throw new Error(await readError(r));
     const d = await readJsonRecord(r);
     if (requestId !== activeImagesRequest) return;
-    allImages = imagesFromRecord(d);
+    const refreshedPage = imagesFromRecord(d);
+    allImages = clear
+      ? refreshedPage
+      : mergeRefreshedPageIntoLoadedImages(allImages, refreshedPage);
     visibleImages = allImages.slice();
     const page = imagePage(d.page);
     setServerTotalFromPage(page, visibleImages.length, true);
@@ -1006,17 +1021,16 @@ function renderBatch(): void {
     const img = visibleImages[i];
     if (loadedIds.has(img.id)) continue;
     loadedIds.add(img.id);
-    placeMasonryCard(makeCard(img, i), img);
+    placeMasonryCard(makeCard(img), img);
   }
   renderedCount = end;
   setupLazyLoad();
 }
 
-function makeCard(img: ImageItem, idx: number): HTMLElement {
+function makeCard(img: ImageItem): HTMLElement {
   const card = document.createElement('article');
   card.className = 'card';
   card.dataset.id = img.id;
-  card.dataset.idx = String(idx);
   const name = fileName(img.path);
   const ph = document.createElement('img');
   ph.className = 'lazy';
@@ -1040,7 +1054,7 @@ function makeCard(img: ImageItem, idx: number): HTMLElement {
   `;
   card.appendChild(ph);
   card.appendChild(overlay);
-  card.addEventListener('click', () => openLightbox(idx));
+  card.addEventListener('click', () => openLightboxById(img.id));
   return card;
 }
 
@@ -2233,9 +2247,31 @@ function updateFishGhosts(): void {
   fishControllers.forEach(controller => controller.update && controller.update());
 }
 
+function openLightboxById(imageId: string, persist = true): void {
+  const sourceList = visibleImages.find(img => img.id === imageId) ? visibleImages : allImages;
+  const idx = sourceList.findIndex(img => img.id === imageId);
+  if (idx < 0) {
+    console.warn('openLightboxById: image not found in current gallery state', {
+      imageId,
+      visibleCount: visibleImages.length,
+      allCount: allImages.length,
+      renderedCardCount: document.querySelectorAll('.card[data-id]').length
+    });
+    return;
+  }
+  void openLightbox(idx, persist, sourceList);
+}
+
 async function openLightbox(idx: number, persist = true, sourceList: ImageItem[] = visibleImages): Promise<void> {
-  lightboxImages = Array.isArray(sourceList) && sourceList.length ? sourceList : visibleImages;
-  if (!lightboxImages[idx]) return;
+  const nextSource = Array.isArray(sourceList) && sourceList.length ? sourceList : visibleImages;
+  if (!Number.isInteger(idx) || idx < 0 || idx >= nextSource.length) {
+    console.warn('openLightbox: invalid image index', {
+      idx,
+      sourceLength: nextSource.length
+    });
+    return;
+  }
+  lightboxImages = nextSource;
   togglePreviewTagDropdown(false);
   lbIndex = idx;
   const img = lightboxImages[lbIndex];
@@ -2395,26 +2431,45 @@ function updateImageTags(id: string, updated: JsonRecord): void {
 function getOriginalCanvas(img: ImageItem): Promise<HTMLCanvasElement> {
   const cached = canvasCache.get(img.id);
   if (cached) return cached;
-  const promise = new Promise<HTMLCanvasElement>((resolve, reject) => {
-    const image = new Image();
-    image.decoding = 'async';
-    image.onload = () => {
-      const canvas = document.createElement('canvas');
-      canvas.width = image.naturalWidth || img.width || 1;
-      canvas.height = image.naturalHeight || img.height || 1;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        reject(new Error(img.path));
-        return;
+  const originalUrl = `/file/${img.id}`;
+  const promise = (async () => {
+    const response = await fetch(originalUrl);
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw new Error(`Оригинал недоступен: ${img.path} (${originalUrl})`);
       }
-      ctx.drawImage(image, 0, 0);
-      resolve(canvas);
-      trimCanvasCache();
-    };
-    image.onerror = () => reject(new Error(img.path));
-    image.src = `/file/${img.id}`;
-  });
+      throw new Error(`Не удалось загрузить оригинал (${response.status}): ${img.path} (${originalUrl})`);
+    }
+    const blob = await response.blob();
+    return await new Promise<HTMLCanvasElement>((resolve, reject) => {
+      const image = new Image();
+      const objectUrl = URL.createObjectURL(blob);
+      image.decoding = 'async';
+      image.onload = () => {
+        URL.revokeObjectURL(objectUrl);
+        const canvas = document.createElement('canvas');
+        canvas.width = image.naturalWidth || img.width || 1;
+        canvas.height = image.naturalHeight || img.height || 1;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          reject(new Error(`Не удалось открыть canvas для ${img.path}`));
+          return;
+        }
+        ctx.drawImage(image, 0, 0);
+        resolve(canvas);
+        trimCanvasCache();
+      };
+      image.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        reject(new Error(`Не удалось декодировать оригинал: ${img.path} (${originalUrl})`));
+      };
+      image.src = objectUrl;
+    });
+  })();
   canvasCache.set(img.id, promise);
+  promise.catch(() => {
+    if (canvasCache.get(img.id) === promise) canvasCache.delete(img.id);
+  });
   trimCanvasCache();
   return promise;
 }
@@ -2427,8 +2482,9 @@ function trimCanvasCache() {
 }
 
 function preloadPreviewNeighbors(idx: number): void {
+  const source = lightboxImages.length ? lightboxImages : visibleImages;
   [-2, -1, 1, 2].forEach(offset => {
-    const img = visibleImages[idx + offset];
+    const img = source[idx + offset];
     if (img) getOriginalCanvas(img).catch(() => {});
   });
 }
@@ -2436,8 +2492,7 @@ function preloadPreviewNeighbors(idx: number): void {
 function restorePreviewIfNeeded(): void {
   const tab = activeTab();
   if (!tab.lastImageId) return;
-  const idx = visibleImages.findIndex(img => img.id === tab.lastImageId);
-  if (idx >= 0 && previewModal && !previewModal.isOpen) openLightbox(idx, false);
+  if (previewModal && !previewModal.isOpen) openLightboxById(tab.lastImageId, false);
 }
 
 document.addEventListener('keydown', e => {
@@ -2640,10 +2695,10 @@ function layoutGallery(): void {
   renderedCount = 0;
   resetMasonryLayout();
   ensureMasonryLayout(true);
-  renderedImages.forEach((img, idx) => {
+  renderedImages.forEach(img => {
     if (loadedIds.has(img.id)) return;
     loadedIds.add(img.id);
-    placeMasonryCard(makeCard(img, idx), img);
+    placeMasonryCard(makeCard(img), img);
     renderedCount += 1;
   });
   setupLazyLoad();
