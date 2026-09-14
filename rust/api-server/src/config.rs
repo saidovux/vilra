@@ -61,24 +61,9 @@ impl AppConfig {
             i += 1;
         }
 
-        let legacy_python = env_bool("IMGVIEWER_LEGACY_PYTHON", false);
-        let thumb_job_mode = std::env::var("IMGVIEWER_THUMB_JOB_MODE")
-            .unwrap_or_else(|_| {
-                if legacy_python {
-                    "sync".to_string()
-                } else {
-                    "queue".to_string()
-                }
-            })
-            .trim()
-            .to_ascii_lowercase();
-        let thumb_worker_expected =
-            env_bool("IMGVIEWER_THUMB_WORKER_EXPECTED", thumb_job_mode == "queue");
-        let metadata_worker = env_bool("IMGVIEWER_METADATA_WORKER", !legacy_python);
-        let metadata_authoritative =
-            metadata_worker && env_bool("IMGVIEWER_METADATA_AUTHORITATIVE", !legacy_python);
         let sqlite_path = tagimage_db::sqlite::resolve_sqlite_runtime_path(&repo_root);
         let static_dir = resolve_static_dir(&repo_root);
+        let metadata_worker = env_bool("IMGVIEWER_METADATA_WORKER", true);
 
         Ok(Self {
             sqlite_path,
@@ -86,16 +71,17 @@ impl AppConfig {
             port,
             repo_root,
             static_dir,
-            thumb_job_mode,
+            thumb_job_mode: "queue".to_string(),
             thumb_wait_ms: env_u64("IMGVIEWER_THUMB_WAIT_MS", 1200),
             thumb_poll_ms: env_u64("IMGVIEWER_THUMB_POLL_MS", 120).max(10),
-            thumb_sync_fallback: env_bool("IMGVIEWER_THUMB_SYNC_FALLBACK", false),
-            thumb_worker_expected,
+            thumb_sync_fallback: false,
+            thumb_worker_expected: env_bool("IMGVIEWER_THUMB_WORKER_EXPECTED", true),
             rescan_worker_expected: env_bool("IMGVIEWER_RESCAN_WORKER_EXPECTED", true),
-            inline_worker: env_bool("IMGVIEWER_INLINE_WORKER", legacy_python),
-            rust_scanner: env_bool("IMGVIEWER_RUST_SCANNER", !legacy_python),
+            inline_worker: false,
+            rust_scanner: true,
             metadata_worker,
-            metadata_authoritative,
+            metadata_authoritative: metadata_worker
+                && env_bool("IMGVIEWER_METADATA_AUTHORITATIVE", true),
             thumb_max_attempts: env_i32("IMGVIEWER_THUMB_MAX_ATTEMPTS", 5).max(1),
             rescan_max_attempts: env_i32("IMGVIEWER_RESCAN_MAX_ATTEMPTS", 3).max(1),
             job_stale_running_sec: env_i64("IMGVIEWER_JOB_STALE_RUNNING_SEC", 300).max(0),

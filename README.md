@@ -1,351 +1,108 @@
 # Vilra
 
-**V**isual **I**ndexing, **L**inking, **R**etrieval **A**pplication
+**V**isual **I**ndexing, **L**inking, **R**etrieval **A**pplication.
 
-Локальная галерея для просмотра и тегирования изображений. Проект работает как локальное приложение: файлы не загружаются наружу, а индекс, теги, сессия и очередь задач хранятся в локальном SQLite-файле.
+Vilra is a local desktop image gallery and tagging application. Images stay on disk; the application stores its index, tags, session state and background-job queue in SQLite.
 
-## Desktop Start
+## Run
 
-Требуются Node.js, Rust и системные зависимости Tauri 2 для вашей ОС.
+Requirements: Node.js/npm, Rust/Cargo and the system dependencies required by Tauri 2.
 
 ```bash
 npm install
 npm run tauri:dev
 ```
 
-Tauri сам:
-
-- создает SQLite в каталоге данных приложения;
-- запускает Rust API, scanner, thumb и metadata workers как sidecar-процессы;
-- завершает sidecar-процессы при закрытии приложения;
-- открывает системный диалог выбора папки.
-
-Сборка установочного пакета:
+Build a desktop package:
 
 ```bash
 npm run tauri:build
 ```
 
-Команда сначала собирает frontend и четыре Rust sidecar binary для текущего target triple, затем запускает Tauri bundler. Python, внешний сервер БД и `start.sh` в desktop-пакет не входят.
-При текущем Cargo `target-dir` готовые пакеты появятся в `rust/thumb-worker/target/release/bundle/`.
+Tauri builds the frontend and four Rust sidecars, initializes the local SQLite database, starts the API/scanner/thumbnail/metadata processes and stops them when the application exits.
 
-### Browser Development
+Python is not part of the project runtime.
 
-Браузерный Rust runtime сохранен для разработки, тестов и диагностики:
+## Architecture
 
-```bash
-./scripts/repair-db.sh
-./scripts/check-db.sh
-./start.sh /путь/к/фото
-```
+- `static/src/main.ts` — frontend logic.
+- `static/src/styles.css` — frontend styles.
+- `rust/api-server` — local HTTP API and static frontend server.
+- `rust/scanner-worker` — recursive image discovery and index updates.
+- `rust/thumb-worker` — thumbnail generation.
+- `rust/metadata-worker` — metadata jobs.
+- `rust/crates/tagimage-db` — SQLite schema and data access.
+- `rust/crates/tagimage-core` — shared Rust types/helpers.
+- `src-tauri` — desktop shell and sidecar lifecycle.
 
-`start.sh` использует `TAGIMAGE_SQLITE_PATH=.run/tagimage.sqlite`. Tauri по умолчанию использует `tagimage.sqlite` в системном app-data каталоге `app.tagimage.desktop`; абсолютный `TAGIMAGE_SQLITE_PATH` можно передать как явный override.
+The desktop application uses `tagimage.sqlite` in the OS application-data directory unless `TAGIMAGE_SQLITE_PATH` overrides it.
 
-### Browser Development DB
+## Browser development runtime
 
-SQLite is the normal runtime DB. Relative paths are resolved from the repository root:
-
-```bash
-TAGIMAGE_SQLITE_PATH=.run/tagimage.sqlite
-```
-
-Use `TAGIMAGE_SQLITE_PATH` in `.env` if you need an explicit file location:
+`start.sh` is a Rust-only development launcher used for browser debugging and Playwright tests:
 
 ```bash
-TAGIMAGE_SQLITE_PATH=/absolute/path/to/tagimage.sqlite
+./start.sh /path/to/images
+./start.sh status
+./start.sh logs
+./start.sh stop
 ```
 
-`.env` must not be committed.
-
-### Database troubleshooting
-
-Быстрая диагностика:
+Force a fresh Rust build:
 
 ```bash
-./scripts/check-db.sh
+./start.sh start --build-rust --no-open /path/to/images
 ```
 
-SQLite init/repair helper:
+The browser runtime uses `.run/tagimage.sqlite` by default.
+
+## Frontend
 
 ```bash
-./scripts/repair-db.sh
+npm run typecheck:frontend
+npm run build:frontend
 ```
 
-Полезные команды:
+Generated frontend output (`static/dist/` and `static/app.css`) is not committed.
+
+## Tests
+
+Rust workspace tests:
 
 ```bash
-./scripts/repair-db.sh
-./scripts/check-db.sh
+cargo test --manifest-path rust/Cargo.toml --workspace
 ```
 
-`repair-db.sh` creates or validates the SQLite schema without deleting database data.
-
-### Browser/E2E tests
-
-Gallery and original-file regressions are covered by Playwright tests:
+Browser regression tests:
 
 ```bash
 npm run test:e2e
 ```
 
-The tests start `./start.sh` against generated fixture images under `.run/e2e-images` and an isolated SQLite DB under `.run/e2e/`. They stop app processes at teardown even when a test fails.
+## Main API
 
-### Tauri Runtime
+- `POST /api/folder` — add/select a folder and enqueue a rescan.
+- `GET /api/images` — paginated image list and filters.
+- `GET /api/tags` / `POST /api/tags` — tag list and creation.
+- `POST /api/tag/{id}` — update user tags for an image.
+- `GET /api/session` / `PATCH /api/session` — local UI session.
+- `GET /api/folders` — indexed folder tree.
+- `POST /api/rescan` — enqueue a rescan.
+- `POST /api/thumbs/rebuild` — enqueue thumbnail rebuild jobs.
+- `GET /api/status` — database/worker/queue status.
+- `GET /thumb-file/{id}.jpg` — ready thumbnail fast path.
+- `GET /thumb/{id}` — thumbnail fallback/queue endpoint.
+- `GET /file/{id}` — original image.
 
-Tauri является основным desktop entrypoint. UI продолжает использовать существующий локальный HTTP API, поэтому публичные API-контракты не изменены. Архитектура и lifecycle описаны в `docs/tauri-migration-plan.md`.
+## Image data
 
-## Возможности
+For each indexed root Vilra creates only its thumbnail cache next to the images:
 
-| Функция | Описание |
-|---|---|
-| Галерея | Masonry-сетка с миниатюрами в исходных пропорциях |
-| SQLite | Изображения, теги, сессия и очередь задач хранятся в локальном файле БД |
-| Авто-теги папок | Все родительские папки изображения становятся тегами |
-| Ручные теги | Добавляются в canvas-preview и сохраняются между перезапусками |
-| Поиск | Одно поле: `tag` добавляет обычный тег, `!tag` или `-tag` добавляет анти-тег |
-| Режимы | `Любой` показывает фото хотя бы с одним тегом, `Все` требует все выбранные теги |
-| Вкладки | Каждая вкладка хранит include/exclude теги, режим совпадения и последнее фото |
-| Сессия | Запоминаются папка, вкладки, фильтры и открытое изображение |
-| PreviewModal | Canvas-просмотрщик с нижним dock, zoom/pan, навигацией и тегами |
-| Пересканирование | Новые файлы добавляются, пропавшие скрываются, ручные теги сохраняются |
-
-## Файлы
-
-```
-выбранная_папка/
+```text
+photos/
 ├── .imgindex/
-│   └── thumbs/         # сгенерированные миниатюры
-└── ваши фото...
+│   └── thumbs/
+└── ... original images
 ```
 
-`index.json` больше не создается и не обновляется. Источник истины теперь SQLite index DB.
-
-## API
-
-| Метод | Путь | Описание |
-|---|---|---|
-| `POST` | `/api/folder` | Установить рабочую папку и запустить сканирование |
-| `GET` | `/api/images` | Список изображений; поддерживает `include_tags`, `exclude_tags`, `match_mode` |
-| `GET` | `/api/tags` | Весь созданный пул тегов |
-| `POST` | `/api/tags` | Создать тег без привязки к фото |
-| `POST` | `/api/tag/{id}` | Сохранить ручные теги изображения |
-| `GET` | `/api/session` | Получить локальную сессию |
-| `PATCH` | `/api/session` | Обновить вкладки, фильтры, папку или последнее изображение |
-| `GET` | `/thumb-file/{id}.jpg` | Быстрый путь готовой миниатюры без DB lookup |
-| `GET` | `/thumb/{id}` | Миниатюра (`200` если готова, `202` если в очереди) |
-| `GET` | `/file/{id}` | Оригинальный файл |
-| `POST` | `/api/rescan` | Поставить пересканирование в очередь, вернуть `job_id` |
-| `POST` | `/api/thumbs/rebuild` | Поставить генерацию миниатюр в очередь (`thumb` jobs) |
-| `GET` | `/api/status` | Статус сканирования, подключения и блоки `workers/queues` |
-| `GET` | `/api/jobs/{job_id}` | Статус задачи очереди |
-| `GET` | `/api/jobs?type=rescan&state=running` | Список задач по фильтрам |
-
-## Локальная Модель
-
-Приложение не содержит регистрации и не рассчитано на публикацию как сайт. Desktop runtime состоит из Tauri shell, Rust API, Rust workers и локального SQLite-файла. Python остается только legacy/reference и тестовым инструментарием репозитория.
-
-## Worker
-
-Очередь задач хранится в SQLite (`jobs`, `job_attempts`, `job_events`).
-
-Запуск отдельного воркера:
-
-```bash
-python worker.py
-```
-
-Для вынесения тяжелой генерации миниатюр в очередь включите режим:
-
-```bash
-export IMGVIEWER_THUMB_JOB_MODE=queue
-```
-
-После этого `rescan` будет enqueue-ить `thumb` задачи вместо синхронной генерации.
-
-`GET /thumb/{id}` в queue-режиме:
-
-- `200 image/jpeg`, если файл уже готов;
-- `202 application/json`, если миниатюра еще обрабатывается:
-
-```json
-{
-  "ok": false,
-  "pending": true,
-  "job_id": "....",
-  "retry_after_ms": 120,
-  "thumb_url": "/thumb/<id>"
-}
-```
-
-`POST /api/thumbs/rebuild` теперь дополнительно возвращает `queued_existing` (сколько задач не создали новый job из-за dedupe).
-
-Галерея использует `/thumb-file/{id}.jpg` для готовых миниатюр и обращается к `/thumb/{id}` только как fallback, если файл еще не создан.
-
-В Rust-first runtime inline fallback-воркер выключен (`IMGVIEWER_INLINE_WORKER=0`), а production thumbnail jobs обрабатывает Rust thumb-worker. В legacy Python runtime inline fallback можно вернуть через `IMGVIEWER_INLINE_WORKER=1`.
-
-Для ручного Python legacy режима:
-
-```bash
-IMGVIEWER_LEGACY_PYTHON=1 python run.py
-# или с отдельным Python worker:
-IMGVIEWER_LEGACY_PYTHON=1 IMGVIEWER_INLINE_WORKER=0 python run.py
-```
-
-### Rust thumb worker
-
-Отдельный Rust-воркер для `thumb` задач находится в `rust/thumb-worker`.
-
-Обычный запуск теперь через основной launcher:
-
-```bash
-./start.sh start --build-rust --strict-rust
-# или
-IMGVIEWER_THUMB_JOB_MODE=queue ./start.sh start
-```
-
-`worker-rust-thumb.sh` оставлен как ручной debug helper для запуска только Rust thumb worker.
-
-### Rust metadata worker (manual shadow check)
-
-Для ручной проверки metadata jobs используйте:
-
-```bash
-.venv/bin/python scripts/enqueue-metadata-jobs.py --limit 20
-IMGVIEWER_METADATA_AUTHORITATIVE=0 ./scripts/run-metadata-worker.sh --timeout 30
-```
-
-`run-metadata-worker.sh` и `enqueue-metadata-jobs.py` загружают `.env`, поэтому используют тот же `TAGIMAGE_SQLITE_PATH`, что и `start.sh`.
-
-## Unified Launcher
-
-Основной launcher проекта:
-
-```bash
-./start.sh
-./start.sh /path/to/images
-./start.sh start
-./start.sh stop
-./start.sh restart
-./start.sh status
-./start.sh logs
-./start.sh logs api
-./start.sh logs rescan
-./start.sh logs thumb
-./start.sh foreground
-```
-
-Проверка Rust thumbnails в строгом режиме:
-
-```bash
-./start.sh start --build-rust --strict-rust
-```
-
-Скрипт поднимает:
-
-- Rust API backend по умолчанию
-- Rust scanner-worker для production `rescan` jobs по умолчанию
-- Rust thumb worker в режиме `IMGVIEWER_THUMB_JOB_MODE=queue`
-- Rust metadata worker в authoritative mode по умолчанию
-
-Логи: `.logs/`, pid-файлы: `.run/`.
-
-`start-webapp.sh` теперь deprecated compatibility wrapper, который просто прокидывает аргументы в `./start.sh`.
-
-### Runtime profiles
-
-Подробное описание профилей находится в [docs/rust-first-runtime.md](docs/rust-first-runtime.md).
-
-Default runtime теперь Rust-first. Python API и Python scanner остаются в репозитории как legacy/reference fallback, но обычный `./start.sh` их не запускает:
-
-```bash
-./start.sh start --build-rust --strict-rust --no-open
-```
-
-Rust-first defaults:
-
-```bash
-IMGVIEWER_RUST_API=1
-IMGVIEWER_RUST_SCANNER=1
-IMGVIEWER_METADATA_WORKER=1
-IMGVIEWER_METADATA_AUTHORITATIVE=1
-IMGVIEWER_THUMB_JOB_MODE=queue
-IMGVIEWER_INLINE_WORKER=0
-IMGVIEWER_THUMB_SYNC_FALLBACK=0
-IMGVIEWER_THUMB_WORKERS=4
-```
-
-Env precedence для runtime flags:
-
-1. explicit shell env;
-2. `IMGVIEWER_LEGACY_PYTHON=1` legacy defaults;
-3. `.env`;
-4. built-in Rust defaults.
-
-Для явного возврата к Python fallback:
-
-```bash
-IMGVIEWER_LEGACY_PYTHON=1 ./start.sh start --build-rust --no-open
-# или точечно:
-IMGVIEWER_RUST_API=0 IMGVIEWER_RUST_SCANNER=0 IMGVIEWER_METADATA_WORKER=0 IMGVIEWER_THUMB_JOB_MODE=sync ./start.sh start --build-rust --no-open
-```
-
-Metadata authoritative означает, что metadata jobs больше не являются shadow-validation jobs и пишут `job_events` с `authoritative=true`, `shadow=false`. Production image row metadata уже обновляется Rust scanner authoritative path, поэтому metadata worker не дублирует запись в `images`.
-
-Для ручной shadow-проверки metadata:
-
-```bash
-IMGVIEWER_METADATA_AUTHORITATIVE=0 ./scripts/run-metadata-worker.sh --timeout 30
-```
-
-`./start.sh status` диагностически показывает `api backend`, `scanner backend`, `thumb mode`, `metadata mode`, `metadata authoritative`, DB readiness и текущие процессы.
-
-## Runtime env
-
-- `IMGVIEWER_RUST_API` (default `1`)
-- `IMGVIEWER_RUST_SCANNER` (default `1`)
-- `IMGVIEWER_METADATA_WORKER` (default `1`)
-- `IMGVIEWER_METADATA_AUTHORITATIVE` (default `1`)
-- `IMGVIEWER_LEGACY_PYTHON` (default `0`)
-- `IMGVIEWER_THUMB_JOB_MODE` (default `queue`)
-- `IMGVIEWER_INLINE_WORKER` (default `0`)
-- `IMGVIEWER_THUMB_WAIT_MS` (default `1200`)
-- `IMGVIEWER_THUMB_POLL_MS` (default `120`)
-- `IMGVIEWER_THUMB_SYNC_FALLBACK` (default `0`)
-- `IMGVIEWER_JOB_TTL_HOURS` (default `168`)
-- `IMGVIEWER_JOB_CLEANUP_INTERVAL_SEC` (default `3600`)
-- `IMGVIEWER_THUMB_MAX_ATTEMPTS` (default `5`)
-- `IMGVIEWER_RESCAN_MAX_ATTEMPTS` (default `3`)
-- `IMGVIEWER_THUMB_MAX_BACKOFF_SEC` (default `300`)
-- `IMGVIEWER_RESCAN_MAX_BACKOFF_SEC` (default `120`)
-
-## Performance Check
-
-Повторяемый замер списка и миниатюр:
-
-```bash
-BASE_URL=http://127.0.0.1:8000 ./scripts/bench-images.sh
-```
-
-`/api/images` возвращает `elapsed_ms` и `Server-Timing`. Совместимый `/thumb/{id}` возвращает `X-Elapsed-Ms` и `X-Db-Lookup-Ms`.
-
-## Frontend Build
-
-Фронт собирается из TS/CSS исходников в `static/src/`. JS-бандл создается локально как `static/dist/app.js` и не хранится в git.
-
-```bash
-npm install
-npm run typecheck:frontend
-npm run build:frontend
-```
-
-`./start.sh` перед запуском backend проверяет наличие npm/node_modules и собирает frontend. Скрипт не запускает `npm install` автоматически: для офлайн-запуска зависимости должны быть установлены заранее.
-
-## Safe Tests
-
-Рекомендуемый запуск интеграционных тестов:
-
-```bash
-.venv/bin/python -m pytest
-```
-
-Тесты используют временный SQLite-файл и чистят только test-данные (`/tmp/pytest-*`, `pytest-*`), чтобы не оставлять временные пути в рабочем состоянии приложения.
+The index itself is stored in SQLite, not in an `index.json` file.

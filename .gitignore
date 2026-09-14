@@ -1,12 +1,8 @@
 node_modules/
 static/dist/
 static/app.js
+static/app.css
 
-__pycache__/
-*.py[cod]
-*.log
-
-.venv/
 .env
 .run/
 .logs/

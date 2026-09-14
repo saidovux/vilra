@@ -21,6 +21,11 @@ async fn main() {
 
 async fn run() -> Result<(), String> {
     let config = AppConfig::from_env_and_args()?;
+    drop(
+        tagimage_db::sqlite::init_sqlite_db(&config.sqlite_path)
+            .map_err(|error| format!("initialize sqlite database: {error}"))?,
+    );
+
     let static_dir = config.static_dir.clone();
     let state = Arc::new(db::AppState::new(config.clone()));
 
