@@ -12,3 +12,6 @@ __pycache__/
 .logs/
 target/
 rust/**/target/
+src-tauri/gen/
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep

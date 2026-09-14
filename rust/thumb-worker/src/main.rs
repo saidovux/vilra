@@ -356,13 +356,13 @@ async fn run_worker_loop(
 }
 
 async fn run() -> Result<(), String> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(|path| path.parent())
-        .ok_or_else(|| "cannot resolve repo root".to_string())?
-        .to_path_buf();
-    let _ = dotenvy::from_path(repo_root.join(".env"));
+    let repo_root = resolve_repo_root()?;
+    if !matches!(
+        std::env::var("TAGIMAGE_PACKAGED_RUNTIME").as_deref(),
+        Ok("1" | "true" | "yes")
+    ) {
+        let _ = dotenvy::from_path(repo_root.join(".env"));
+    }
     let db_path = resolve_sqlite_runtime_path(&repo_root);
     let poll_ms = std::env::var("IMGVIEWER_THUMB_WORKER_POLL_MS")
         .ok()
@@ -415,6 +415,21 @@ async fn run() -> Result<(), String> {
     }
 
     Err("all worker loops exited unexpectedly".to_string())
+}
+
+fn resolve_repo_root() -> Result<PathBuf, String> {
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.join("static/index.html").exists() && cwd.join("rust").is_dir() {
+            return Ok(cwd);
+        }
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .map(PathBuf::from)
+        .ok_or_else(|| "cannot resolve repo root".to_string())
 }
 
 #[tokio::main]

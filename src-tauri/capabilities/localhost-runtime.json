@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/remote-schema.json",
+  "identifier": "localhost-runtime",
+  "description": "Allow the packaged Vilra UI to invoke its native folder picker.",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*/*"]
+  },
+  "permissions": ["core:default", "dialog:allow-open"]
+}

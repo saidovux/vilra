@@ -21,7 +21,7 @@ async fn main() {
 
 async fn run() -> Result<(), String> {
     let config = AppConfig::from_env_and_args()?;
-    let static_dir = config.repo_root.join("static");
+    let static_dir = config.static_dir.clone();
     let state = Arc::new(db::AppState::new(config.clone()));
 
     let app = Router::new()

@@ -1,35 +1,31 @@
-# Tauri Migration Plan
+# Tauri Runtime Architecture
 
-This document defines architecture guardrails for moving TagImage toward a Tauri desktop app without breaking current behavior.
+Vilra now has a Tauri 2 desktop entrypoint while preserving the tested browser development runtime.
 
 ## 1. Target architecture
 
-Target shape:
+Packaged runtime:
 
 ```text
 Tauri shell
-  -> frontend UI
-  -> local backend sidecar / Rust backend
-  -> local DB
-  -> Rust workers for thumbnails/metadata/scanner/hash
+  -> local Rust API sidecar -> bundled frontend and public HTTP API
+  -> scanner-worker sidecar
+  -> thumb-worker sidecar (four queue slots by default)
+  -> metadata-worker sidecar (authoritative)
+  -> SQLite in the OS app-data directory
 ```
 
-The migration is incremental. Current development mode uses Rust-first runtime with a local SQLite DB.
+The shell initializes SQLite once before spawning any sidecars, waits for `/api/status` to report `db_ready=true`, then opens the local API URL in the webview. Closing the application terminates all managed sidecars.
 
 ## 2. Runtime rule
 
-- Normal development/tests should use the local SQLite DB.
-- Packaged desktop runtime should not require a user-installed database server.
+- Tauri is the normal desktop entrypoint.
+- `start.sh` remains the browser development and E2E entrypoint.
+- The package has no Python or external database-server runtime dependency.
 
 ## 3. Database direction
 
-Current DB:
-
-- SQLite
-
-Target desktop DB:
-
-- SQLite
+Desktop DB: SQLite at `<app-data>/tagimage.sqlite` by default.
 
 Rationale:
 
@@ -42,28 +38,24 @@ Rationale:
 Important constraint:
 
 - Do not change public API behavior while packaging work proceeds.
-- Keep the DB file local and explicit through `TAGIMAGE_SQLITE_PATH`.
+- An explicit `TAGIMAGE_SQLITE_PATH` can override the desktop location. Relative overrides are resolved inside app-data.
 
 ## 4. Sidecar strategy
 
-Tauri can run packaged sidecar binaries. Candidate sidecars:
+Tauri packages and starts these existing binaries:
 
-- `tagimage-backend`
-- `tagimage-thumb-worker`
-- `tagimage-metadata-worker`
-- `tagimage-scanner-worker`
+- `imgviewer-api-server`
+- `imgviewer-scanner-worker`
+- `imgviewer-thumb-worker`
+- `imgviewer-metadata-worker`
 
-Current stage keeps existing `start.sh` development mode.
+`scripts/prepare-tauri-sidecars.mjs` builds them for the selected target triple and copies them to Tauri's required suffixed filenames under `src-tauri/binaries/`.
 
-## 5. Migration order
+## 5. Frontend And Native APIs
 
-1. Keep current Rust-first SQLite dev mode stable.
-2. Preserve Python as legacy/reference code until parity is no longer needed.
-3. Add Tauri shell.
-4. Package Rust backend/workers as sidecars or integrate into `src-tauri`.
-5. Remove legacy/reference code only after tests and runtime validation.
+The Rust API serves the same frontend and endpoints in browser and packaged modes. Tauri exposes only the native folder picker to the localhost UI. Gallery, thumbnails, originals, sessions and queue operations continue through the existing API.
 
-## 6. What stays reference
+## 6. What Stays Reference
 
 `app/services/scanner.py` remains reference implementation until Rust scanner has:
 
@@ -80,33 +72,18 @@ Current stage keeps existing `start.sh` development mode.
 - Do not expose DB directly to frontend as the primary architecture unless explicitly decided.
 - Do not change public API endpoints during migration.
 
-## 8. Development modes
+## 8. Commands
 
-Mode A: current dev mode
+```bash
+npm run tauri:dev
+npm run tauri:build
+```
 
-- `start.sh`
-- SQLite file DB
-- Rust API
-- Rust workers
+Browser regression mode remains available through `./start.sh` and `npm run test:e2e`.
 
-Mode B: Rust migration dev mode
+## 9. Build Boundary
 
-- Python legacy/reference API
-- SQLite file DB
-- Rust thumb/metadata workers
-
-Mode C: future Tauri mode
-
-- Tauri shell
-- Rust backend/sidecar
-- SQLite
-- Rust workers
-
-## 9. Immediate next steps
-
-1. Keep runtime smoke tests green on SQLite.
-2. Finish cleanup of obsolete external DB code paths.
-3. Add Tauri shell implementation.
+`npm run tauri:build` performs the frontend and sidecar preparation automatically. Tauri's `TAURI_ENV_TARGET_TRIPLE` hook value is used for target builds; it can be overridden with `TAURI_TARGET_TRIPLE`. The matching Rust target/toolchain must already be installed.
 
 ## 10. Contract priority
 

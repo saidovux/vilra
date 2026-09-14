@@ -644,6 +644,36 @@ async function openFolder(pathOverride = '') {
 
 async function pickFolder() {
   try {
+    const tauriWindow = window as Window & {
+      __TAURI_INTERNALS__?: unknown;
+      __TAURI__?: {
+        dialog?: {
+          open?: (options: {
+            directory: boolean;
+            multiple: boolean;
+            title: string;
+            defaultPath?: string;
+          }) => Promise<string | string[] | null>;
+        };
+      };
+    };
+    if (tauriWindow.__TAURI_INTERNALS__) {
+      const openDialog = tauriWindow.__TAURI__?.dialog?.open;
+      if (!openDialog) throw new Error('Нативный диалог выбора папки недоступен');
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        title: 'Выберите папку с изображениями',
+        ...(getFolderInputValue() ? {defaultPath: getFolderInputValue()} : {})
+      });
+      const path = Array.isArray(selected) ? selected[0] : selected;
+      if (path) {
+        setFolderInputValues(path);
+        await openFolder(path);
+      }
+      return;
+    }
+
     const r = await fetch('/api/folder/pick', {method: 'POST'});
     if (!r.ok) {
       const manualPath = promptFolderPath(await readError(r));
@@ -661,6 +691,10 @@ async function pickFolder() {
     setFolderInputValues(path);
     await openFolder(path);
   } catch (e) {
+    if ((window as Window & {__TAURI_INTERNALS__?: unknown}).__TAURI_INTERNALS__) {
+      alert('Не удалось открыть проводник: ' + errorMessage(e));
+      return;
+    }
     const manualPath = promptFolderPath('Не удалось открыть выбор папки: ' + errorMessage(e));
     if (manualPath) await openFolder(manualPath);
   }
@@ -1135,7 +1169,7 @@ function setupLazyLoad(): void {
 }
 
 async function loadThumbWithRetry(img: HTMLImageElement, url: string, attempt = 0): Promise<void> {
-  const maxAttempts = 20;
+  const maxAttempts = 120;
   try {
     const r = await fetch(url, {cache: 'no-store'});
     if (r.status === 200) {
@@ -1151,12 +1185,17 @@ async function loadThumbWithRetry(img: HTMLImageElement, url: string, attempt = 
       let retryAfter = 180;
       try {
         const p = await readJsonRecord(r);
-        retryAfter = Math.max(80, Number(p.retry_after_ms || retryAfter));
+        retryAfter = Math.min(1500, Math.max(80, Number(p.retry_after_ms || retryAfter)));
       } catch {}
-      setTimeout(() => loadThumbWithRetry(img, url, attempt + 1), retryAfter);
+      setTimeout(() => {
+        if (img.isConnected) loadThumbWithRetry(img, url, attempt + 1);
+      }, retryAfter);
       return;
     }
-  } catch {}
+    console.warn('Thumbnail request failed', {url, status: r.status, attempt});
+  } catch (error) {
+    console.warn('Thumbnail request failed', {url, attempt, error});
+  }
   img.classList.add('loaded');
   img.alt = 'Ошибка загрузки';
 }

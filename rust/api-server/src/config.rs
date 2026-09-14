@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -6,6 +6,7 @@ pub struct AppConfig {
     pub host: String,
     pub port: u16,
     pub repo_root: PathBuf,
+    pub static_dir: PathBuf,
     pub thumb_job_mode: String,
     pub thumb_wait_ms: u64,
     pub thumb_poll_ms: u64,
@@ -23,13 +24,10 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn from_env_and_args() -> Result<Self, String> {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let repo_root = manifest_dir
-            .parent()
-            .and_then(|path| path.parent())
-            .ok_or_else(|| "cannot resolve repo root".to_string())?
-            .to_path_buf();
-        let _ = dotenvy::from_path(repo_root.join(".env"));
+        let repo_root = resolve_repo_root()?;
+        if !env_bool("TAGIMAGE_PACKAGED_RUNTIME", false) {
+            let _ = dotenvy::from_path(repo_root.join(".env"));
+        }
 
         let mut host =
             std::env::var("IMGVIEWER_RUST_API_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -80,12 +78,14 @@ impl AppConfig {
         let metadata_authoritative =
             metadata_worker && env_bool("IMGVIEWER_METADATA_AUTHORITATIVE", !legacy_python);
         let sqlite_path = tagimage_db::sqlite::resolve_sqlite_runtime_path(&repo_root);
+        let static_dir = resolve_static_dir(&repo_root);
 
         Ok(Self {
             sqlite_path,
             host,
             port,
             repo_root,
+            static_dir,
             thumb_job_mode,
             thumb_wait_ms: env_u64("IMGVIEWER_THUMB_WAIT_MS", 1200),
             thumb_poll_ms: env_u64("IMGVIEWER_THUMB_POLL_MS", 120).max(10),
@@ -101,6 +101,33 @@ impl AppConfig {
             job_stale_running_sec: env_i64("IMGVIEWER_JOB_STALE_RUNNING_SEC", 300).max(0),
         })
     }
+}
+
+fn resolve_static_dir(repo_root: &Path) -> PathBuf {
+    let path = std::env::var_os("TAGIMAGE_STATIC_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("static"));
+    if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    }
+}
+
+fn resolve_repo_root() -> Result<PathBuf, String> {
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.join("static/index.html").exists() && cwd.join("rust").is_dir() {
+            return Ok(cwd);
+        }
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .map(PathBuf::from)
+        .ok_or_else(|| "cannot resolve repo root".to_string())
 }
 
 pub fn env_bool(name: &str, default: bool) -> bool {

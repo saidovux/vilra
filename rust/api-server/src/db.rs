@@ -119,25 +119,34 @@ impl AppState {
     }
 
     pub fn thumb_rust_supported(&self) -> bool {
-        self.repo_path("rust/thumb-worker/Cargo.toml").exists()
+        packaged_runtime()
+            || self.repo_path("rust/thumb-worker/Cargo.toml").exists()
             || self
                 .repo_path("rust/thumb-worker/target/release/imgviewer-thumb-worker")
                 .exists()
     }
 
     pub fn scanner_rust_supported(&self) -> bool {
-        self.repo_path("rust/scanner-worker/Cargo.toml").exists()
+        packaged_runtime()
+            || self.repo_path("rust/scanner-worker/Cargo.toml").exists()
             || self
                 .repo_path("rust/thumb-worker/target/release/imgviewer-scanner-worker")
                 .exists()
     }
 
     pub fn metadata_rust_supported(&self) -> bool {
-        self.repo_path("rust/metadata-worker/Cargo.toml").exists()
+        packaged_runtime()
+            || self.repo_path("rust/metadata-worker/Cargo.toml").exists()
             || self
                 .repo_path("rust/thumb-worker/target/release/imgviewer-metadata-worker")
                 .exists()
     }
+}
+
+fn packaged_runtime() -> bool {
+    std::env::var("TAGIMAGE_PACKAGED_RUNTIME")
+        .map(|value| matches!(value.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false)
 }
 
 #[allow(dead_code)]

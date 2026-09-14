@@ -1,13 +1,21 @@
 {
-  "name": "tagimage-frontend",
+  "name": "vilra-frontend",
   "private": true,
   "version": "0.1.0",
   "scripts": {
     "build:frontend": "tsc --noEmit && mkdir -p static/dist && esbuild static/src/main.ts --bundle --platform=browser --format=iife --target=es2020 --outfile=static/dist/app.js && cp static/src/styles.css static/app.css",
-    "typecheck:frontend": "tsc --noEmit"
+    "typecheck:frontend": "tsc --noEmit",
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed",
+    "tauri": "tauri",
+    "tauri:prepare": "npm run build:frontend && node scripts/prepare-tauri-sidecars.mjs",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.11.0",
     "esbuild": "^0.23.1",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "@playwright/test": "^1.55.0"
   }
 }

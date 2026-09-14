@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TagImage launcher.
+Vilra launcher.
 
 Usage:
     python run.py                    # open browser, enter path manually
@@ -34,7 +34,7 @@ def _launch_browser(url: str):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="TagImage")
+    parser = argparse.ArgumentParser(description="Vilra")
     parser.add_argument("folder", nargs="?", default=None, help="Path to image folder")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--no-browser", action="store_true", help="Do not open a browser window")

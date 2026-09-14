@@ -1,0 +1,13 @@
+[package]
+name = "vilra-desktop"
+version = "0.1.0"
+description = "Vilra local image gallery"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2.5", features = [] }
+
+[dependencies]
+tagimage-db = { path = "../rust/crates/tagimage-db" }
+tauri = { version = "2.11", features = [] }
+tauri-plugin-dialog = "2.7"

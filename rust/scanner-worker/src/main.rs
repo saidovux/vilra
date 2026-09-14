@@ -620,13 +620,10 @@ async fn run_worker_loop(
 }
 
 async fn run() -> Result<(), String> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(|path| path.parent())
-        .ok_or_else(|| "cannot resolve repo root".to_string())?
-        .to_path_buf();
-    let _ = dotenvy::from_path(repo_root.join(".env"));
+    let repo_root = resolve_repo_root()?;
+    if !env_bool("TAGIMAGE_PACKAGED_RUNTIME", false) {
+        let _ = dotenvy::from_path(repo_root.join(".env"));
+    }
     let db_path = resolve_sqlite_runtime_path(&repo_root);
     let mode = worker_mode();
     let worker_id = match mode {
@@ -643,6 +640,21 @@ async fn run() -> Result<(), String> {
         db_path.display()
     );
     run_worker_loop(db_path, worker_id, mode, poll_ms, slow_ms).await
+}
+
+fn resolve_repo_root() -> Result<PathBuf, String> {
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.join("static/index.html").exists() && cwd.join("rust").is_dir() {
+            return Ok(cwd);
+        }
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .map(PathBuf::from)
+        .ok_or_else(|| "cannot resolve repo root".to_string())
 }
 
 #[tokio::main]

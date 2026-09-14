@@ -1,34 +1,33 @@
-# ImgViewer — Руководство
+# Vilra — Руководство
 
-ImgViewer — локальная галерея для просмотра изображений, тегирования и быстрого отбора по папочным и ручным тегам. Приложение хранит индекс, теги и состояние сессии в локальном SQLite-файле; рядом с фотографиями создаются только миниатюры.
+Vilra — локальная галерея для просмотра изображений, тегирования и быстрого отбора по папочным и ручным тегам. Приложение хранит индекс, теги и состояние сессии в локальном SQLite-файле; рядом с фотографиями создаются только миниатюры.
 
 ## 1. Установка
 
-Требования:
+Требования для desktop-сборки:
 
 | Компонент | Версия |
 |---|---|
-| Python | 3.9+ |
-| SQLite | встроен через runtime |
+| Rust | совместимый с Tauri 2 (не ниже 1.77.2) |
+| Node.js | актуальный LTS |
+| Tauri system dependencies | для вашей ОС |
 
-Быстрый локальный вариант:
-
-```bash
-cp .env.example .env
-./scripts/repair-db.sh
-./scripts/check-db.sh
-./start.sh
-```
-
-Ручной вариант:
+Основной desktop-запуск:
 
 ```bash
-pip install -r requirements.txt
-export TAGIMAGE_SQLITE_PATH=.run/tagimage.sqlite
-python run.py /home/user/Pictures
+npm install
+npm run tauri:dev
 ```
 
-## 2. Запуск
+Сборка desktop-пакета:
+
+```bash
+npm run tauri:build
+```
+
+Tauri хранит `tagimage.sqlite` в системном каталоге данных приложения, запускает четыре Rust sidecar-процесса и останавливает их вместе с окном. Python в desktop runtime не используется.
+
+## 2. Browser Dev Runtime
 
 ```bash
 ./start.sh
@@ -42,6 +41,8 @@ python run.py /home/user/Pictures
 
 При запуске с аргументом папка открывается сразу. Без аргумента путь можно указать в интерфейсе.
 
+Этот режим предназначен для разработки, E2E и диагностики. Основной пользовательский runtime запускается через Tauri.
+
 Режим foreground (совместимость со старым простым запуском):
 
 ```bash
@@ -54,6 +55,14 @@ python run.py /home/user/Pictures
 ```bash
 ./start.sh start --build-rust --strict-rust
 ```
+
+Browser/E2E regression tests:
+
+```bash
+npm run test:e2e
+```
+
+E2E tests use generated fixture images in `.run/e2e-images`, an isolated SQLite file in `.run/e2e/`, and stop `start.sh` processes during teardown.
 
 `start-webapp.sh` оставлен как deprecated compatibility wrapper на `./start.sh`.
 `worker-rust-thumb.sh` оставлен как ручной debug helper для отдельного запуска Rust thumb worker.
@@ -201,9 +210,9 @@ rm -rf /путь/к/фото/.imgindex/thumbs
 ./start.sh /путь/к/фото
 ```
 
-Runtime использует file-based SQLite через `TAGIMAGE_SQLITE_PATH`, по умолчанию `.run/tagimage.sqlite`.
+Browser runtime использует file-based SQLite через `TAGIMAGE_SQLITE_PATH`, по умолчанию `.run/tagimage.sqlite`. Tauri использует app-data `tagimage.sqlite`, если override не задан.
 
-ImgViewer остается локальным приложением: без аккаунтов, загрузок файлов на серверы и публичного веб-деплоя.
+Vilra остается локальным приложением: без аккаунтов, загрузок файлов на серверы и публичного веб-деплоя.
 
 ## 10. Безопасный запуск тестов
 

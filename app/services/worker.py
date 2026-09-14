@@ -42,7 +42,7 @@ def worker_loop(*, poll_interval: float = 1.0, once: bool = False, worker_id: st
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="TagImage background worker")
+    parser = argparse.ArgumentParser(description="Vilra background worker")
     parser.add_argument("--poll", type=float, default=1.0, help="queue poll interval in seconds")
     parser.add_argument("--once", action="store_true", help="process one job and exit")
     parser.add_argument("--worker-id", default=None, help="optional custom worker id")

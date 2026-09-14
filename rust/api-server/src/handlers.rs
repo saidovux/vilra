@@ -64,19 +64,11 @@ fn json_response(value: Value) -> Json<Value> {
 }
 
 pub async fn serve_index(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
-    let static_index = state.repo_path("static/index.html");
-    let root_index = state.repo_path("index.html");
-    let path = if static_index.exists() {
-        static_index
-    } else {
-        root_index
-    };
+    let path = state.config.static_dir.join("index.html");
     if !path.exists() {
         return Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                json!({"error": "index.html not found. Place it inside static/ next to main.py."}),
-            ),
+            Json(json!({"error": "Vilra frontend resources are missing"})),
         )
             .into_response());
     }

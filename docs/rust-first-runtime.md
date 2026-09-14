@@ -1,6 +1,6 @@
 # Rust-First Runtime Profile
 
-TagImage now uses a Rust-first default runtime through `./start.sh`.
+Vilra now uses a Rust-first default runtime through `./start.sh`.
 Python remains in the repository as a legacy/reference fallback, but it is not started by default.
 
 ## Default Runtime

@@ -37,7 +37,7 @@ async def _job_cleanup_loop() -> None:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="TagImage")
+    app = FastAPI(title="Vilra")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Vilra",
+  "version": "0.1.0",
+  "identifier": "app.tagimage.desktop",
+  "build": {
+    "beforeDevCommand": "npm run tauri:prepare",
+    "beforeBuildCommand": "npm run tauri:prepare",
+    "frontendDist": "../static"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "capabilities": [
+        "localhost-runtime"
+      ],
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "category": "Photography",
+    "shortDescription": "Local image gallery and tagging application",
+    "longDescription": "Vilra indexes local image folders and provides a private gallery, tags and background thumbnail processing.",
+    "targets": "all",
+    "externalBin": [
+      "binaries/imgviewer-api-server",
+      "binaries/imgviewer-scanner-worker",
+      "binaries/imgviewer-thumb-worker",
+      "binaries/imgviewer-metadata-worker"
+    ],
+    "resources": {
+      "../static/index.html": "static/index.html",
+      "../static/app.css": "static/app.css",
+      "../static/dist/app.js": "static/dist/app.js"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

@@ -1530,7 +1530,7 @@ pub fn enqueue_sqlite_thumb_job(
     priority: i32,
     max_attempts: i32,
 ) -> Result<(JsonValue, bool), String> {
-    let result = enqueue_sqlite_job(
+    let mut result = enqueue_sqlite_job(
         conn,
         "thumb",
         json!({
@@ -1545,6 +1545,21 @@ pub fn enqueue_sqlite_thumb_job(
         max_attempts,
         Some(&format!("thumb:{image_id}:{mtime}")),
     )?;
+    if result.deduped && result.job.state == "queued" && result.job.priority < priority {
+        conn.execute(
+            r#"
+            UPDATE jobs
+            SET priority = max(priority, ?2),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1 AND state = 'queued'
+            "#,
+            params![result.job.id, priority],
+        )
+        .map_err(|e| format!("promote queued sqlite thumbnail job: {e}"))?;
+        if let Some(job) = get_sqlite_job(conn, &result.job.id)? {
+            result.job = job;
+        }
+    }
     Ok((serialize_sqlite_job(&result.job), result.deduped))
 }
 
@@ -2681,11 +2696,24 @@ mod tests {
             "cat.jpg",
             ".imgindex/thumbs/img-1.jpg",
             123,
-            20,
+            30,
             5,
         )
         .expect("thumb dedupe");
         assert!(deduped);
+        let promoted = get_sqlite_job(
+            &conn,
+            thumb["id"].as_str().expect("promoted thumbnail job id"),
+        )
+        .expect("read promoted thumbnail job")
+        .expect("promoted thumbnail job");
+        assert_eq!(promoted.priority, 30);
+        let enqueued_events = list_sqlite_job_events(&conn, &promoted.id)
+            .expect("thumbnail events")
+            .into_iter()
+            .filter(|event| event.event == "enqueued")
+            .count();
+        assert_eq!(enqueued_events, 1);
         assert!(cancel_sqlite_job(&conn, thumb["id"].as_str().expect("thumb id")).expect("cancel"));
 
         conn.execute(

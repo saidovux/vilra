@@ -1,42 +1,47 @@
-# ImgViewer
+# Vilra
+
+**V**isual **I**ndexing, **L**inking, **R**etrieval **A**pplication
 
 Локальная галерея для просмотра и тегирования изображений. Проект работает как локальное приложение: файлы не загружаются наружу, а индекс, теги, сессия и очередь задач хранятся в локальном SQLite-файле.
 
-## Быстрый Старт
+## Desktop Start
 
-1. Подготовить локальную БД:
+Требуются Node.js, Rust и системные зависимости Tauri 2 для вашей ОС.
+
+```bash
+npm install
+npm run tauri:dev
+```
+
+Tauri сам:
+
+- создает SQLite в каталоге данных приложения;
+- запускает Rust API, scanner, thumb и metadata workers как sidecar-процессы;
+- завершает sidecar-процессы при закрытии приложения;
+- открывает системный диалог выбора папки.
+
+Сборка установочного пакета:
+
+```bash
+npm run tauri:build
+```
+
+Команда сначала собирает frontend и четыре Rust sidecar binary для текущего target triple, затем запускает Tauri bundler. Python, внешний сервер БД и `start.sh` в desktop-пакет не входят.
+При текущем Cargo `target-dir` готовые пакеты появятся в `rust/thumb-worker/target/release/bundle/`.
+
+### Browser Development
+
+Браузерный Rust runtime сохранен для разработки, тестов и диагностики:
 
 ```bash
 ./scripts/repair-db.sh
 ./scripts/check-db.sh
-```
-
-2. Установить зависимости:
-
-```bash
-pip install -r requirements.txt
-npm install
-```
-
-3. Запустить:
-
-```bash
 ./start.sh /путь/к/фото
-# или
-./start.sh
 ```
 
-`./start.sh` проверит frontend-зависимости и соберет TS bundle перед запуском. Если запускаешь backend напрямую через `python run.py`, сначала выполни `npm run build:frontend`.
+`start.sh` использует `TAGIMAGE_SQLITE_PATH=.run/tagimage.sqlite`. Tauri по умолчанию использует `tagimage.sqlite` в системном app-data каталоге `app.tagimage.desktop`; абсолютный `TAGIMAGE_SQLITE_PATH` можно передать как явный override.
 
-По умолчанию используется:
-
-```bash
-TAGIMAGE_SQLITE_PATH=.run/tagimage.sqlite
-```
-
-Можно скопировать `.env.example` в `.env`; `start.sh` подхватит его автоматически.
-
-### Development DB
+### Browser Development DB
 
 SQLite is the normal runtime DB. Relative paths are resolved from the repository root:
 
@@ -75,10 +80,19 @@ SQLite init/repair helper:
 
 `repair-db.sh` creates or validates the SQLite schema without deleting database data.
 
-### Tauri direction note
+### Browser/E2E tests
 
-Current runtime uses file-based SQLite at `TAGIMAGE_SQLITE_PATH`. Legacy database code can remain in the repository until the next cleanup stage, but normal startup uses SQLite only.
-План и ограничения: `docs/tauri-migration-plan.md`.
+Gallery and original-file regressions are covered by Playwright tests:
+
+```bash
+npm run test:e2e
+```
+
+The tests start `./start.sh` against generated fixture images under `.run/e2e-images` and an isolated SQLite DB under `.run/e2e/`. They stop app processes at teardown even when a test fails.
+
+### Tauri Runtime
+
+Tauri является основным desktop entrypoint. UI продолжает использовать существующий локальный HTTP API, поэтому публичные API-контракты не изменены. Архитектура и lifecycle описаны в `docs/tauri-migration-plan.md`.
 
 ## Возможности
 
@@ -128,7 +142,7 @@ Current runtime uses file-based SQLite at `TAGIMAGE_SQLITE_PATH`. Legacy databas
 
 ## Локальная Модель
 
-Приложение не содержит регистрации и не рассчитано на публикацию как сайт. Это локальный Python/FastAPI backend с HTML UI, подготовленный к будущей упаковке в Tauri.
+Приложение не содержит регистрации и не рассчитано на публикацию как сайт. Desktop runtime состоит из Tauri shell, Rust API, Rust workers и локального SQLite-файла. Python остается только legacy/reference и тестовым инструментарием репозитория.
 
 ## Worker
 
