@@ -26,6 +26,12 @@ const EVENT_BUFFER_SIZE: usize = 512;
 const THUMB_PRIORITY: i32 = 20;
 const THUMB_MAX_ATTEMPTS: i32 = 5;
 
+#[derive(Debug)]
+enum ImageIndexError {
+    File(String),
+    Database(String),
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LiveEvent {
     pub sequence: u64,
@@ -380,12 +386,7 @@ impl Processor {
         force: bool,
     ) -> Result<(), String> {
         for path in paths {
-            if let Err(error) = self.handle_create_or_modify(path, force) {
-                eprintln!(
-                    "[live-index] filesystem image failed for {}: {error}",
-                    path.display()
-                );
-            }
+            self.handle_create_or_modify(path, force)?;
         }
         Ok(())
     }
@@ -402,7 +403,17 @@ impl Processor {
         if !supported_image(path) {
             return Ok(());
         }
-        self.index_image(&root, path, force).map(|_| ())
+        match self.index_image(&root, path, force) {
+            Ok(_) => Ok(()),
+            Err(ImageIndexError::File(error)) => {
+                eprintln!(
+                    "[live-index] filesystem image failed for {}: {error}",
+                    path.display()
+                );
+                Ok(())
+            }
+            Err(ImageIndexError::Database(error)) => Err(error),
+        }
     }
 
     fn handle_remove(&mut self, path: &Path) -> Result<(), String> {
@@ -553,12 +564,16 @@ impl Processor {
         let collection = collect_image_paths(directory)?;
         let mut failed = collection.failed;
         for path in collection.paths {
-            if let Err(error) = self.index_image(root, &path, false) {
-                failed += 1;
-                eprintln!(
-                    "[live-index] subtree image failed for {}: {error}",
-                    path.display()
-                );
+            match self.index_image(root, &path, false) {
+                Ok(_) => {}
+                Err(ImageIndexError::File(error)) => {
+                    failed += 1;
+                    eprintln!(
+                        "[live-index] subtree image failed for {}: {error}",
+                        path.display()
+                    );
+                }
+                Err(ImageIndexError::Database(error)) => return Err(error),
             }
         }
         if failed > 0 {
@@ -575,13 +590,14 @@ impl Processor {
         root: &Path,
         path: &Path,
         force: bool,
-    ) -> Result<Option<String>, String> {
-        let rel = relative_path(root, path)?;
+    ) -> Result<Option<String>, ImageIndexError> {
+        let rel = relative_path(root, path).map_err(ImageIndexError::File)?;
         let root_path = root_string(root);
-        let conn = open_sqlite_runtime_db(&self.db_path)?;
-        let existing = get_sqlite_image_by_root_path_including_hidden(&conn, &root_path, &rel)?;
+        let conn = open_sqlite_runtime_db(&self.db_path).map_err(ImageIndexError::Database)?;
+        let existing = get_sqlite_image_by_root_path_including_hidden(&conn, &root_path, &rel)
+            .map_err(ImageIndexError::Database)?;
         let restored = existing.as_ref().is_some_and(|image| image.hidden);
-        let file = read_image_metadata(path)?;
+        let file = read_image_metadata(path).map_err(ImageIndexError::File)?;
         if !force
             && existing.as_ref().is_some_and(|image| {
                 !image.hidden
@@ -615,8 +631,10 @@ impl Processor {
                 height: file.height,
                 ext: file.ext,
             },
-        )?;
-        replace_sqlite_image_tags(&conn, &image_id, &folder_tags(&rel), "auto")?;
+        )
+        .map_err(ImageIndexError::Database)?;
+        replace_sqlite_image_tags(&conn, &image_id, &folder_tags(&rel), "auto")
+            .map_err(ImageIndexError::Database)?;
         enqueue_sqlite_thumb_job(
             &conn,
             &image_id,
@@ -626,8 +644,10 @@ impl Processor {
             file.mtime,
             THUMB_PRIORITY,
             THUMB_MAX_ATTEMPTS,
-        )?;
-        let image = get_sqlite_image_api_value(&conn, &image_id)?;
+        )
+        .map_err(ImageIndexError::Database)?;
+        let image = get_sqlite_image_api_value(&conn, &image_id)
+            .map_err(ImageIndexError::Database)?;
         let event = if existing.is_none() || restored {
             "image_created"
         } else {
@@ -680,31 +700,38 @@ impl Processor {
                 }
             };
             seen.insert(rel.clone());
-            let result = (|| {
-                let cheap = cheap_metadata(path)?;
-                let old = existing_by_path.get(&rel);
-                let unchanged = old.is_some_and(|image| {
-                    !image.hidden
-                        && image.size == cheap.0
-                        && image.mtime == cheap.1
-                        && image.width > 0
-                        && image.height > 0
-                });
-                if unchanged {
-                    return Ok(false);
-                }
-                self.index_image(root, path, false)?;
-                Ok::<bool, String>(true)
-            })();
-            match result {
-                Ok(true) => changed += 1,
-                Ok(false) => {}
+
+            let cheap = match cheap_metadata(path) {
+                Ok(cheap) => cheap,
                 Err(error) => {
                     failed += 1;
                     eprintln!(
                         "[live-index] reconcile image failed for {}: {error}",
                         path.display()
                     );
+                    self.update_status(root, |status| status.done = index + 1);
+                    continue;
+                }
+            };
+            let old = existing_by_path.get(&rel);
+            let unchanged = old.is_some_and(|image| {
+                !image.hidden
+                    && image.size == cheap.0
+                    && image.mtime == cheap.1
+                    && image.width > 0
+                    && image.height > 0
+            });
+            if !unchanged {
+                match self.index_image(root, path, false) {
+                    Ok(_) => changed += 1,
+                    Err(ImageIndexError::File(error)) => {
+                        failed += 1;
+                        eprintln!(
+                            "[live-index] reconcile image failed for {}: {error}",
+                            path.display()
+                        );
+                    }
+                    Err(ImageIndexError::Database(error)) => return Err(error),
                 }
             }
             self.update_status(root, |status| status.done = index + 1);
@@ -1257,6 +1284,34 @@ mod tests {
             .status()
             .iter()
             .any(|status| status.online && !status.syncing));
+        drop(indexer);
+    }
+
+    #[test]
+    fn reconciliation_marks_root_offline_on_database_failure() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("library");
+        write_image(&root.join("good.png"), [10, 20, 30]);
+        let db_path = dir.path().join("vilra.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        conn.execute_batch("DROP TABLE job_events; DROP TABLE job_attempts; DROP TABLE jobs;")
+            .unwrap();
+        drop(conn);
+
+        let hub = EventHub::new();
+        let mut events = hub.subscribe();
+        let indexer = LiveIndexer::start(db_path, hub, vec![root]).unwrap();
+        let terminal = wait_for_event(
+            "database failure reconciliation",
+            &mut events,
+            Duration::from_secs(5),
+            |event| event.kind == "sync_finished" || event.kind == "root_offline",
+        );
+        assert_eq!(terminal.kind, "root_offline");
+        assert!(terminal.data["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("job")));
+        assert!(indexer.status().iter().any(|status| !status.online));
         drop(indexer);
     }
 
