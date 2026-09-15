@@ -194,6 +194,41 @@ test('live filesystem create rename move modify and delete need no refresh', asy
   }
 });
 
+test('delete and recreate at the same path restores the card and total', async ({ page }) => {
+  await waitForGallery(page);
+  const root = fixtureRoot();
+  const source = path.join(root, 'batch-a', 'fixture-001.png');
+  const restoredPath = path.join(root, 'restored-same-path.png');
+  const count = page.locator('#count-text');
+  const initialTotal = Number((await count.textContent())?.match(/\d+/)?.[0] || 0);
+  const card = page.locator('.card[data-id]').filter({hasText: 'restored-same-path.png'});
+
+  fs.rmSync(restoredPath, {force: true});
+  try {
+    fs.copyFileSync(source, restoredPath);
+    await expect(card).toBeVisible({timeout: 15_000});
+    const imageId = await card.getAttribute('data-id');
+    expect(imageId).toBeTruthy();
+    await expect.poll(async () => Number((await count.textContent())?.match(/\d+/)?.[0] || 0))
+      .toBe(initialTotal + 1);
+
+    fs.rmSync(restoredPath, {force: true});
+    await expect(card).toHaveCount(0, {timeout: 15_000});
+    await expect.poll(async () => Number((await count.textContent())?.match(/\d+/)?.[0] || 0))
+      .toBe(initialTotal);
+
+    fs.copyFileSync(source, restoredPath);
+    await expect(card).toBeVisible({timeout: 15_000});
+    await expect(card).toHaveAttribute('data-id', imageId || '');
+    await expect.poll(async () => Number((await count.textContent())?.match(/\d+/)?.[0] || 0))
+      .toBe(initialTotal + 1);
+    const items = await imageItems(page);
+    expect(items.some(item => item.id === imageId && item.path === 'restored-same-path.png')).toBeTruthy();
+  } finally {
+    fs.rmSync(restoredPath, {force: true});
+  }
+});
+
 test('/file id API returns originals and cleanly rejects unknown ids', async ({ page }) => {
   const [image] = await imageItems(page, 10);
   expect(image?.id).toBeTruthy();

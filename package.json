@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "scripts": {
     "build:frontend": "tsc --noEmit && mkdir -p static/dist && esbuild static/src/main.ts --bundle --platform=browser --format=iife --target=es2020 --outfile=static/dist/app.js && cp static/src/styles.css static/app.css",
+    "typecheck": "tsc --noEmit",
     "typecheck:frontend": "tsc --noEmit",
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed",

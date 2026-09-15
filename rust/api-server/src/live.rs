@@ -1,7 +1,7 @@
 use image::image_dimensions;
 use notify::event::{ModifyKind, RenameMode};
-use notify::{Event, EventKind, RecursiveMode};
-use notify_debouncer_full::{new_debouncer, DebounceEventResult};
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, RecommendedCache};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -173,9 +173,15 @@ impl LiveIndexer {
     ) -> Result<Self, String> {
         let (commands, receiver) = mpsc::channel();
         let callback_commands = commands.clone();
-        let debouncer = new_debouncer(DEBOUNCE_DELAY, None, move |result| {
-            let _ = callback_commands.send(LiveCommand::Filesystem(result));
-        })
+        let debouncer = new_debouncer_opt::<_, RecommendedWatcher, RecommendedCache>(
+            DEBOUNCE_DELAY,
+            None,
+            move |result| {
+                let _ = callback_commands.send(LiveCommand::Filesystem(result));
+            },
+            RecommendedCache::new(),
+            Config::default().with_follow_symlinks(false),
+        )
         .map_err(|error| format!("create filesystem watcher: {error}"))?;
         let statuses = Arc::new(Mutex::new(HashMap::new()));
         let thread_statuses = statuses.clone();
@@ -390,7 +396,7 @@ impl Processor {
         if path.is_dir() {
             self.hub
                 .publish("directory_created", path_event_data(&root, path, None));
-            return Ok(());
+            return self.index_subtree(&root, path);
         }
         if !supported_image(path) {
             return Ok(());
@@ -560,6 +566,7 @@ impl Processor {
         let root_path = root_string(root);
         let conn = open_sqlite_runtime_db(&self.db_path)?;
         let existing = get_sqlite_image_by_root_path_including_hidden(&conn, &root_path, &rel)?;
+        let restored = existing.as_ref().is_some_and(|image| image.hidden);
         let file = read_image_metadata(path)?;
         if !force
             && existing.as_ref().is_some_and(|image| {
@@ -607,14 +614,14 @@ impl Processor {
             THUMB_MAX_ATTEMPTS,
         )?;
         let image = get_sqlite_image_api_value(&conn, &image_id)?;
-        let event = if existing.is_some() {
-            "image_updated"
-        } else {
+        let event = if existing.is_none() || restored {
             "image_created"
+        } else {
+            "image_updated"
         };
         self.hub.publish(
             event,
-            json!({"root_path": root_path, "path": rel, "image": image}),
+            json!({"root_path": root_path, "path": rel, "image": image, "restored": restored}),
         );
         Ok(Some(image_id))
     }
@@ -964,6 +971,28 @@ mod tests {
         panic!("{label} did not become true within {timeout:?}");
     }
 
+    fn wait_for_event(
+        label: &str,
+        receiver: &mut broadcast::Receiver<LiveEvent>,
+        timeout: Duration,
+        mut predicate: impl FnMut(&LiveEvent) -> bool,
+    ) -> LiveEvent {
+        let started = std::time::Instant::now();
+        while started.elapsed() < timeout {
+            match receiver.try_recv() {
+                Ok(event) if predicate(&event) => return event,
+                Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    panic!("{label}: event channel closed")
+                }
+            }
+        }
+        panic!("{label} did not arrive within {timeout:?}");
+    }
+
     #[test]
     fn event_hub_replays_recent_sequences_and_reports_old_gaps() {
         let hub = EventHub::new();
@@ -988,6 +1017,7 @@ mod tests {
         let db_path = dir.path().join("vilra.sqlite");
         drop(init_sqlite_db(&db_path).unwrap());
         let hub = EventHub::new();
+        let mut events = hub.subscribe();
         let indexer = LiveIndexer::start(db_path.clone(), hub, vec![root.clone()]).unwrap();
 
         let created = root.join("created.png");
@@ -1042,7 +1072,6 @@ mod tests {
 
         let new_directory_image = root.join("new-dir/inside.png");
         fs::create_dir_all(new_directory_image.parent().unwrap()).unwrap();
-        thread::sleep(Duration::from_millis(300));
         write_image(&new_directory_image, [30, 60, 90]);
         wait_for("new directory image", Duration::from_secs(5), || {
             let conn = open_sqlite_runtime_db(&db_path).unwrap();
@@ -1100,6 +1129,101 @@ mod tests {
             .unwrap()
             .is_some_and(|image| image.hidden)
         });
+        write_image(&moved, [11, 22, 33]);
+        wait_for("recreate", Duration::from_secs(5), || {
+            let conn = open_sqlite_runtime_db(&db_path).unwrap();
+            get_sqlite_image_by_root_path_including_hidden(
+                &conn,
+                &root_string(&root),
+                "destination/moved.png",
+            )
+            .unwrap()
+            .is_some_and(|image| image.id == original_id && !image.hidden)
+        });
+        wait_for_event(
+            "restored image event",
+            &mut events,
+            Duration::from_secs(5),
+            |event| {
+                event.kind == "image_created"
+                    && event.data["image"]["id"] == original_id
+                    && event.data["restored"] == true
+            },
+        );
+        drop(indexer);
+    }
+
+    #[test]
+    fn new_directory_indexes_an_immediately_created_image() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).unwrap();
+        let db_path = dir.path().join("vilra.sqlite");
+        drop(init_sqlite_db(&db_path).unwrap());
+        let hub = EventHub::new();
+        let mut events = hub.subscribe();
+        let indexer = LiveIndexer::start(db_path.clone(), hub, vec![root.clone()]).unwrap();
+        wait_for_event(
+            "initial directory sync",
+            &mut events,
+            Duration::from_secs(5),
+            |event| event.kind == "sync_finished",
+        );
+
+        let image = root.join("instant/inside.png");
+        fs::create_dir(image.parent().unwrap()).unwrap();
+        write_image(&image, [42, 43, 44]);
+
+        wait_for("immediate directory image", Duration::from_secs(5), || {
+            let conn = open_sqlite_runtime_db(&db_path).unwrap();
+            get_sqlite_image_by_root_path_including_hidden(
+                &conn,
+                &root_string(&root),
+                "instant/inside.png",
+            )
+            .unwrap()
+            .is_some_and(|image| !image.hidden)
+        });
+        drop(indexer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_and_reconciliation_do_not_follow_external_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("library");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        write_image(&outside.join("before.png"), [10, 20, 30]);
+        symlink(&outside, root.join("external-link")).unwrap();
+        let db_path = dir.path().join("vilra.sqlite");
+        drop(init_sqlite_db(&db_path).unwrap());
+        let hub = EventHub::new();
+        let mut events = hub.subscribe();
+        let indexer = LiveIndexer::start(db_path.clone(), hub, vec![root.clone()]).unwrap();
+        wait_for_event(
+            "symlink reconciliation",
+            &mut events,
+            Duration::from_secs(5),
+            |event| event.kind == "sync_finished",
+        );
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        assert_eq!(
+            count_sqlite_images(&conn, &[root_string(&root)], false).unwrap(),
+            0
+        );
+        drop(conn);
+
+        write_image(&outside.join("after.png"), [30, 20, 10]);
+        thread::sleep(Duration::from_millis(750));
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        assert_eq!(
+            count_sqlite_images(&conn, &[root_string(&root)], false).unwrap(),
+            0
+        );
         drop(indexer);
     }
 
