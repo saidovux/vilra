@@ -22,7 +22,7 @@
   </section>
 
   <section id="gallery-screen" style="display:none;">
-    <aside id="folder-sidebar" class="collapsed" aria-label="Просканированные папки">
+    <aside id="folder-sidebar" class="collapsed" aria-label="Подключённые папки">
       <div id="folder-sidebar-panel">
         <div class="folder-sidebar-head">
           <div>
@@ -30,7 +30,6 @@
             <small>Можно добавить несколько путей</small>
           </div>
           <div class="folder-sidebar-actions">
-            <button class="btn btn-ghost icon-btn" type="button" data-action="rescan" id="rescan-btn" title="Пересканировать" aria-label="Пересканировать">↻</button>
             <button class="btn btn-primary btn-sm folder-open-btn" type="button" data-action="pick-folder">Открыть папку</button>
           </div>
         </div>
@@ -68,13 +67,12 @@
             <div class="settings-section">
               <div class="settings-section-head">
                 <h3>Директория</h3>
-                <button class="btn btn-ghost icon-btn" data-action="rescan" title="Пересканировать" aria-label="Пересканировать">↻</button>
               </div>
               <div id="current-root" class="settings-value">Папка не выбрана</div>
             </div>
             <div class="settings-section settings-grid">
               <div>
-                <div class="settings-label">Статус сканирования</div>
+                <div class="settings-label">Статус синхронизации</div>
                 <div id="status-text" class="settings-value">Инициализация</div>
                 <div id="scan-progress"><div id="scan-bar"></div></div>
               </div>
@@ -156,7 +154,7 @@
       <div id="empty-state">
         <div>
           <div class="label">Изображения не найдены</div>
-          <div>Измените фильтр, анти-список или пересканируйте папку</div>
+          <div>Измените фильтр или анти-список</div>
         </div>
       </div>
     </main>

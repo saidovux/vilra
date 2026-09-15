@@ -1,14 +1,13 @@
-# Windows Launcher Foundation (Planned)
+# Windows Notes
 
-Текущий production launcher реализован как `start-webapp.sh` (Linux-first).
+Основной пользовательский runtime реализован через Tauri 2.
 
-Для Windows в следующем инкременте нужно добавить `start-webapp.ps1` с эквивалентным поведением:
+Для отдельного browser development launcher на Windows потребуется PowerShell-обёртка с эквивалентным поведением:
 
 - команды: `start`, `stop`, `restart`, `status`;
-- отдельные процессы:
-  - API (`uvicorn main:app`),
-  - Python rescan worker (`python worker.py`),
-  - Rust thumb worker (prebuilt `.exe` или `cargo run --release`);
+- Rust API с live filesystem watcher;
+- Rust thumbnail worker;
+- Rust metadata worker;
 - pid/state файлы (или ProcessId registry в `.run`);
 - отдельные log файлы в `.logs`;
 - поддержка параметров:
@@ -19,10 +18,9 @@
 
 - Контракты API не отличаются между Linux/Windows.
 - `IMGVIEWER_THUMB_JOB_MODE=queue` включает Rust thumb очередь одинаково.
-- Поведение `/thumb/{id}` (`200`/`202`) полностью идентично.
+- Поведение `/thumb/{id}` (`200`/`202`) и `/api/events` идентично.
 
 ## Минимальные зависимости
 
 - PowerShell 7+
-- Python 3.9+
 - Rust toolchain (опционально, если нет prebuilt бинарника)

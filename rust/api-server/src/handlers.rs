@@ -1,8 +1,8 @@
 use crate::{
     db::{
-        self, active_root, build_rescan_response, clean_tag_list, get_image_record,
-        image_file_path, image_thumb_path, require_roots, roots_from_session, set_root,
-        thumb_path_for_id, validate_image_id, AppState, ImageRow, ImagesQuery, ThumbRebuildInput,
+        self, active_root, clean_tag_list, get_image_record, image_file_path, image_thumb_path,
+        require_roots, roots_from_session, set_root, thumb_path_for_id, validate_image_id,
+        AppState, ImageRow, ImagesQuery, ThumbRebuildInput,
     },
     error::ApiError,
 };
@@ -10,12 +10,12 @@ use axum::{
     body::Body,
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    response::{sse::Event as SseEvent, sse::KeepAlive, IntoResponse, Response, Sse},
     Json,
 };
 use serde::{de, Deserialize, Deserializer};
 use serde_json::{json, Value};
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{convert::Infallible, path::PathBuf, sync::Arc, time::Instant};
 use tokio::time::{sleep, Duration};
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +59,11 @@ pub struct JobsRequest {
     limit: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EventsRequest {
+    since: Option<u64>,
+}
+
 fn json_response(value: Value) -> Json<Value> {
     Json(value)
 }
@@ -83,6 +88,56 @@ pub async fn serve_index(State(state): State<Arc<AppState>>) -> Result<Response,
 pub async fn get_status(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let client = state.connect()?;
     Ok(json_response(db::status_payload(&state, &client)?))
+}
+
+pub async fn events(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<EventsRequest>,
+    headers: HeaderMap,
+) -> Sse<impl futures_core::Stream<Item = Result<SseEvent, Infallible>>> {
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let mut receiver = state.events.subscribe();
+    let replay = state.events.replay_after(query.since.or(last_event_id));
+    let stream = async_stream::stream! {
+        let mut watermark = replay.watermark;
+        if replay.gap {
+            let data = json!({"type": "resync_required", "data": {"reason": "event_gap"}});
+            yield Ok(SseEvent::default().data(data.to_string()));
+        } else {
+            for event in replay.events {
+                watermark = watermark.max(event.sequence);
+                yield Ok(sse_event(event));
+            }
+        }
+        loop {
+            match receiver.recv().await {
+                Ok(event) if event.sequence > watermark => {
+                    watermark = event.sequence;
+                    yield Ok(sse_event(event));
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let data = json!({"type": "resync_required", "data": {"reason": "subscriber_lag"}});
+                    yield Ok(SseEvent::default().data(data.to_string()));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keep-alive"),
+    )
+}
+
+fn sse_event(event: crate::live::LiveEvent) -> SseEvent {
+    SseEvent::default()
+        .id(event.sequence.to_string())
+        .data(serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string()))
 }
 
 pub async fn list_images(
@@ -238,6 +293,12 @@ pub async fn patch_session(
     if let Some(root_path) = payload.get("root_path").and_then(Value::as_str) {
         if !root_path.is_empty() {
             let session = set_root(&client, root_path, true)?;
+            if let Some(root) = session.root_path.as_deref() {
+                state
+                    .live
+                    .add_root(PathBuf::from(root))
+                    .map_err(ApiError::internal)?;
+            }
             payload["root_path"] = json!(session.root_path);
             payload["root_paths"] = json!(session.root_paths);
         }
@@ -259,12 +320,15 @@ pub async fn set_folder(
     let client = state.connect()?;
     let session = set_root(&client, path, true)?;
     let root = active_root(&session).ok_or_else(|| ApiError::bad_request("No folder set"))?;
-    let job = db::enqueue_rescan_job(&client, &root, state.config.rescan_max_attempts)?;
+    state
+        .live
+        .add_root(PathBuf::from(&root))
+        .map_err(ApiError::internal)?;
     Ok(json_response(json!({
         "ok": true,
         "root": root,
         "root_paths": roots_from_session(&session),
-        "job_id": job["id"],
+        "job_id": null,
     })))
 }
 
@@ -274,25 +338,6 @@ pub async fn list_folders(State(state): State<Arc<AppState>>) -> Result<Json<Val
     let roots = roots_from_session(&session);
     let items = db::folder_tree_rows(&client, &roots)?;
     Ok(json_response(json!({"roots": roots, "items": items})))
-}
-
-pub async fn rescan(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
-    let client = state.connect()?;
-    let session = db::load_session(&client)?;
-    let roots = require_roots(&session)?;
-    let running = db::running_rescan_job(&client)?;
-    if running.is_some() {
-        return Ok(json_response(build_rescan_response(running, Vec::new())));
-    }
-    let mut jobs = Vec::new();
-    for root in roots {
-        jobs.push(db::enqueue_rescan_job(
-            &client,
-            &root,
-            state.config.rescan_max_attempts,
-        )?);
-    }
-    Ok(json_response(build_rescan_response(None, jobs)))
 }
 
 pub async fn get_job_handler(

@@ -30,4 +30,4 @@ cargo run --release
 export IMGVIEWER_THUMB_JOB_MODE=queue
 ```
 
-Тогда `rescan` будет ставить задачи `thumb` в очередь вместо синхронной генерации.
+Live filesystem indexer ставит задачи `thumb` в очередь после create/modify и startup reconciliation.

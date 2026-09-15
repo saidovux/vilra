@@ -1,4 +1,8 @@
-use crate::{config::AppConfig, error::ApiError};
+use crate::{
+    config::AppConfig,
+    error::ApiError,
+    live::{EventHub, LiveIndexer},
+};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -24,6 +28,8 @@ const THUMBS_DIR_NAME: &str = "thumbs";
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
+    pub live: LiveIndexer,
+    pub events: std::sync::Arc<EventHub>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,8 +94,12 @@ pub struct ThumbRebuildResult {
 }
 
 impl AppState {
-    pub fn new(config: AppConfig) -> Self {
-        Self { config }
+    pub fn new(config: AppConfig, live: LiveIndexer, events: std::sync::Arc<EventHub>) -> Self {
+        Self {
+            config,
+            live,
+            events,
+        }
     }
 
     pub fn connect(&self) -> Result<Connection, ApiError> {
@@ -123,14 +133,6 @@ impl AppState {
             || self.repo_path("rust/thumb-worker/Cargo.toml").exists()
             || self
                 .repo_path("rust/thumb-worker/target/release/imgviewer-thumb-worker")
-                .exists()
-    }
-
-    pub fn scanner_rust_supported(&self) -> bool {
-        packaged_runtime()
-            || self.repo_path("rust/scanner-worker/Cargo.toml").exists()
-            || self
-                .repo_path("rust/thumb-worker/target/release/imgviewer-scanner-worker")
                 .exists()
     }
 
@@ -374,38 +376,6 @@ pub fn enqueue_job(
     Ok((sqlite::serialize_sqlite_job(&result.job), result.deduped))
 }
 
-pub fn enqueue_rescan_job(
-    conn: &Connection,
-    root_path: &str,
-    max_attempts: i32,
-) -> Result<Value, ApiError> {
-    sqlite::enqueue_sqlite_rescan_job(conn, root_path, max_attempts).map_err(map_db_error)
-}
-
-pub fn running_rescan_job(conn: &Connection) -> Result<Option<Value>, ApiError> {
-    let jobs = list_jobs(conn, Some("rescan"), Some("running"), 1)?;
-    Ok(jobs.into_iter().next())
-}
-
-pub fn build_rescan_response(running_job: Option<Value>, queued_jobs: Vec<Value>) -> Value {
-    if let Some(job) = running_job {
-        return json!({
-            "ok": false,
-            "message": "Scan already running",
-            "job_id": job.get("id").cloned().unwrap_or(Value::Null),
-        });
-    }
-    let ids = queued_jobs
-        .iter()
-        .filter_map(|job| job.get("id").cloned())
-        .collect::<Vec<_>>();
-    json!({
-        "ok": true,
-        "job_id": ids.first().cloned().unwrap_or(Value::Null),
-        "job_ids": ids,
-    })
-}
-
 pub fn get_job(conn: &Connection, job_id: &str) -> Result<Option<Value>, ApiError> {
     get_sqlite_job_api_value(conn, job_id).map_err(map_db_error)
 }
@@ -528,36 +498,37 @@ pub fn status_payload(state: &AppState, conn: &Connection) -> Result<Value, ApiE
     let session = load_session(conn)?;
     let roots = roots_from_session(&session);
     let root = active_root(&session);
-    let scan = rescan_status(conn)?;
+    let live_roots = state.live.status();
+    let syncing = live_roots.iter().any(|root| root.syncing);
+    let done = live_roots.iter().map(|root| root.done).sum::<usize>();
+    let total = live_roots.iter().map(|root| root.total).sum::<usize>();
+    let sync_error = live_roots.iter().find_map(|root| root.error.clone());
 
     let thumb_running = count_jobs(conn, Some("thumb"), Some("running"))?;
     let thumb_queued = count_jobs(conn, Some("thumb"), Some("queued"))?;
     let thumb_stale_running =
         count_stale_running_jobs(conn, Some("thumb"), state.config.job_stale_running_sec)?;
-    let rescan_running = count_jobs(conn, Some("rescan"), Some("running"))?;
-    let rescan_queued = count_jobs(conn, Some("rescan"), Some("queued"))?;
-    let rescan_stale_running =
-        count_stale_running_jobs(conn, Some("rescan"), state.config.job_stale_running_sec)?;
-    let stale_running = count_stale_running_jobs(conn, None, state.config.job_stale_running_sec)?;
+    let metadata_running = count_jobs(conn, Some("metadata"), Some("running"))?;
+    let stale_running = thumb_stale_running
+        + count_stale_running_jobs(conn, Some("metadata"), state.config.job_stale_running_sec)?;
     let degraded = state.config.thumb_worker_expected
         && state.config.thumb_job_mode == "queue"
         && thumb_running == 0
         && thumb_queued > 0;
 
     Ok(json!({
-        "ready": root.is_some() && !scan.get("running").and_then(Value::as_bool).unwrap_or(false) && !scan.get("queued").and_then(Value::as_bool).unwrap_or(false),
+        "ready": root.is_some() && !syncing && sync_error.is_none(),
         "root": root,
         "root_paths": roots,
-        "running": scan["running"],
-        "queued": scan["queued"],
-        "job_id": scan["job_id"],
-        "total": scan["total"],
-        "done": scan["done"],
-        "error": scan["error"],
+        "running": syncing,
+        "queued": false,
+        "job_id": null,
+        "total": total,
+        "done": done,
+        "error": sync_error,
         "db_ready": health["db_ready"],
         "db_error": health["db_error"],
         "workers": {
-            "rescan_worker_expected": state.config.rescan_worker_expected,
             "thumb_worker_expected": state.config.thumb_worker_expected,
             "capabilities": {
                 "thumb": {
@@ -565,10 +536,10 @@ pub fn status_payload(state: &AppState, conn: &Connection) -> Result<Value, ApiE
                     "rust_supported": state.thumb_rust_supported(),
                     "python_fallback": state.config.thumb_sync_fallback,
                 },
-                "rescan": {
-                    "mode": if state.config.rust_scanner { "rust" } else { "python" },
-                    "rust_supported": state.scanner_rust_supported(),
-                    "inline_worker": state.config.inline_worker,
+                "filesystem": {
+                    "mode": "live_filesystem",
+                    "rust_supported": true,
+                    "inline_worker": true,
                 },
                 "metadata": {
                     "mode": if !state.config.metadata_worker {
@@ -588,63 +559,19 @@ pub fn status_payload(state: &AppState, conn: &Connection) -> Result<Value, ApiE
             }
         },
         "queues": {
-            "rescan_queue_depth": rescan_queued,
-            "rescan_running": rescan_running,
             "thumb_queue_depth": thumb_queued,
             "thumb_running": thumb_running,
             "thumb_stale_running": thumb_stale_running,
             "thumb_mode": state.config.thumb_job_mode,
-            "rescan_stale_running": rescan_stale_running,
+            "metadata_running": metadata_running,
             "stale_running": stale_running,
             "degraded": degraded,
-        }
-    }))
-}
-
-fn rescan_status(conn: &Connection) -> Result<Value, ApiError> {
-    if let Some(current) = list_jobs(conn, Some("rescan"), Some("running"), 1)?
-        .into_iter()
-        .next()
-    {
-        return Ok(json!({
-            "running": true,
-            "queued": false,
-            "job_id": current["id"],
-            "total": current["progress"]["total"],
-            "done": current["progress"]["done"],
-            "error": null,
-        }));
-    }
-    if let Some(current) = list_jobs(conn, Some("rescan"), Some("queued"), 1)?
-        .into_iter()
-        .next()
-    {
-        return Ok(json!({
-            "running": false,
-            "queued": true,
-            "job_id": current["id"],
-            "total": current["progress"]["total"],
-            "done": current["progress"]["done"],
-            "error": null,
-        }));
-    }
-    if let Some(current) = list_jobs(conn, Some("rescan"), None, 1)?.into_iter().next() {
-        return Ok(json!({
-            "running": false,
-            "queued": false,
-            "job_id": current["id"],
-            "total": current["progress"]["total"],
-            "done": current["progress"]["done"],
-            "error": current["error"],
-        }));
-    }
-    Ok(json!({
-        "running": false,
-        "queued": false,
-        "job_id": null,
-        "total": 0,
-        "done": 0,
-        "error": null,
+        },
+        "filesystem": {
+            "mode": "live",
+            "roots": live_roots,
+            "periodic_scan": false,
+        },
     }))
 }
 

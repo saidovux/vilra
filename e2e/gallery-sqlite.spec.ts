@@ -1,9 +1,12 @@
 import { expect, test, type Page } from '@playwright/test';
+import fs from 'node:fs';
+import path from 'node:path';
 
 type ImageItem = {
   id: string;
   path: string;
   thumb_url?: string;
+  width?: number;
 };
 
 const fatalMessages = [
@@ -11,6 +14,13 @@ const fatalMessages = [
   /Unhandled/i,
   /openLightboxById: image not found in current gallery state/i,
 ];
+
+function fixtureRoot(): string {
+  const state = JSON.parse(
+    fs.readFileSync(path.resolve(__dirname, '..', '.run', 'e2e-state.json'), 'utf8'),
+  ) as {fixtureDir: string};
+  return state.fixtureDir;
+}
 
 async function visibleCards(page: Page) {
   const cards = page.locator('.card[data-id]');
@@ -102,7 +112,7 @@ test('gallery card opens original image through stable file id', async ({ page }
   await closePreview(page);
 });
 
-test('lower batch cards stay openable after pagination and background refresh', async ({ page }) => {
+test('lower batch cards stay openable after pagination', async ({ page }) => {
   await waitForGallery(page);
   await expect(page.locator('.card[data-id]')).toHaveCount(48);
 
@@ -113,8 +123,6 @@ test('lower batch cards stay openable after pagination and background refresh', 
   const imageId = await lowerCard.getAttribute('data-id');
   expect(imageId).toBeTruthy();
 
-  await page.locator('#rescan-btn').dispatchEvent('click');
-  await page.waitForTimeout(2_000);
   await expect(page.locator(`.card[data-id="${imageId}"]`)).toBeVisible();
 
   await clickCardAndExpectPreview(page, 55);
@@ -122,6 +130,68 @@ test('lower batch cards stay openable after pagination and background refresh', 
 
   const items = await imageItems(page);
   expect(items.some(item => item.id === imageId)).toBeTruthy();
+});
+
+test('live filesystem create rename move modify and delete need no refresh', async ({ page }) => {
+  await waitForGallery(page);
+  const root = fixtureRoot();
+  const sourceA = path.join(root, 'batch-a', 'fixture-001.png');
+  const sourceB = path.join(root, 'batch-a', 'fixture-003.png');
+  const created = path.join(root, 'live-created.png');
+  const renamed = path.join(root, 'live-renamed.png');
+  const newDir = path.join(root, 'live-directory');
+  const moved = path.join(newDir, 'live-moved.png');
+
+  for (const candidate of [created, renamed, moved]) fs.rmSync(candidate, {force: true});
+  fs.rmSync(newDir, {recursive: true, force: true});
+
+  try {
+    fs.copyFileSync(sourceA, created);
+    const createdCard = page.locator('.card[data-id]').filter({hasText: 'live-created.png'});
+    await expect(createdCard).toBeVisible({timeout: 15_000});
+    const imageId = await createdCard.getAttribute('data-id');
+    expect(imageId).toBeTruthy();
+
+    fs.renameSync(created, renamed);
+    await expect(page.locator('.card[data-id]').filter({hasText: 'live-created.png'})).toHaveCount(0);
+    const renamedCard = page.locator('.card[data-id]').filter({hasText: 'live-renamed.png'});
+    await expect(renamedCard).toBeVisible({timeout: 15_000});
+    await expect(renamedCard).toHaveAttribute('data-id', imageId || '');
+
+    fs.mkdirSync(newDir);
+    await page.waitForTimeout(400);
+    fs.renameSync(renamed, moved);
+    const movedCard = page.locator('.card[data-id]').filter({hasText: 'live-moved.png'});
+    await expect(movedCard).toBeVisible({timeout: 15_000});
+    await expect(movedCard).toHaveAttribute('data-id', imageId || '');
+
+    let previousThumb = '';
+    await expect.poll(async () => {
+      const response = await page.request.get(`/thumb/${imageId}`);
+      if (response.status() !== 200) return '';
+      previousThumb = (await response.body()).toString('base64');
+      return previousThumb;
+    }, {timeout: 15_000}).not.toBe('');
+
+    const before = await imageItems(page);
+    const oldWidth = before.find(item => item.id === imageId)?.width;
+    fs.copyFileSync(sourceB, moved);
+    await expect.poll(async () => {
+      const items = await imageItems(page);
+      return items.find(item => item.id === imageId)?.width;
+    }, {timeout: 15_000}).not.toBe(oldWidth);
+    await expect.poll(async () => {
+      const response = await page.request.get(`/thumb/${imageId}`);
+      if (response.status() !== 200) return false;
+      return (await response.body()).toString('base64') !== previousThumb;
+    }, {timeout: 15_000}).toBe(true);
+
+    fs.rmSync(moved, { force: true });
+    await expect(movedCard).toHaveCount(0, {timeout: 15_000});
+  } finally {
+    for (const candidate of [created, renamed, moved]) fs.rmSync(candidate, {force: true});
+    fs.rmSync(newDir, {recursive: true, force: true});
+  }
 });
 
 test('/file id API returns originals and cleanly rejects unknown ids', async ({ page }) => {

@@ -9,7 +9,6 @@ const targetRoot = join(repoRoot, 'rust', 'thumb-worker', 'target');
 const binariesDir = join(repoRoot, 'src-tauri', 'binaries');
 const binaryNames = [
   'imgviewer-api-server',
-  'imgviewer-scanner-worker',
   'imgviewer-thumb-worker',
   'imgviewer-metadata-worker',
 ];

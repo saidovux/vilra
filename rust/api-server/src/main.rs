@@ -2,6 +2,7 @@ mod config;
 mod db;
 mod error;
 mod handlers;
+mod live;
 
 use axum::{
     routing::{get, patch, post},
@@ -21,18 +22,35 @@ async fn main() {
 
 async fn run() -> Result<(), String> {
     let config = AppConfig::from_env_and_args()?;
-    drop(
-        tagimage_db::sqlite::init_sqlite_db(&config.sqlite_path)
-            .map_err(|error| format!("initialize sqlite database: {error}"))?,
-    );
+    if config.init_db_only {
+        drop(
+            tagimage_db::sqlite::init_sqlite_db(&config.sqlite_path)
+                .map_err(|error| format!("initialize sqlite database: {error}"))?,
+        );
+        println!(
+            "[rust-api] sqlite initialized: {}",
+            config.sqlite_path.display()
+        );
+        return Ok(());
+    }
 
     let static_dir = config.static_dir.clone();
-    let state = Arc::new(db::AppState::new(config.clone()));
+    let conn = tagimage_db::sqlite::open_sqlite_runtime_db(&config.sqlite_path)?;
+    let session = tagimage_db::sqlite::load_sqlite_session(&conn)?;
+    let roots = tagimage_db::sqlite::sqlite_roots_from_session(&session)
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    drop(conn);
+    let events = live::EventHub::new();
+    let live_index = live::LiveIndexer::start(config.sqlite_path.clone(), events.clone(), roots)?;
+    let state = Arc::new(db::AppState::new(config.clone(), live_index, events));
 
     let app = Router::new()
         .route("/", get(handlers::serve_index))
         .nest_service("/static", ServeDir::new(static_dir))
         .route("/api/status", get(handlers::get_status))
+        .route("/api/events", get(handlers::events))
         .route("/api/images", get(handlers::list_images))
         .route(
             "/api/tags",
@@ -49,7 +67,6 @@ async fn run() -> Result<(), String> {
         )
         .route("/api/folder", post(handlers::set_folder))
         .route("/api/folders", get(handlers::list_folders))
-        .route("/api/rescan", post(handlers::rescan))
         .route("/api/jobs", get(handlers::list_jobs_handler))
         .route("/api/jobs/:job_id", get(handlers::get_job_handler))
         .route("/api/thumbs/rebuild", post(handlers::rebuild_thumbs))

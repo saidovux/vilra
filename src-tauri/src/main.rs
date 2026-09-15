@@ -11,7 +11,6 @@ use std::{
 use tauri::{path::BaseDirectory, Manager, WebviewUrl, WebviewWindowBuilder};
 
 const API_SIDECAR: &str = "imgviewer-api-server";
-const SCANNER_SIDECAR: &str = "imgviewer-scanner-worker";
 const THUMB_SIDECAR: &str = "imgviewer-thumb-worker";
 const METADATA_SIDECAR: &str = "imgviewer-metadata-worker";
 
@@ -125,7 +124,6 @@ fn spawn_sidecar(
         .env("IMGVIEWER_RUST_API", "1")
         .env("IMGVIEWER_RUST_API_HOST", "127.0.0.1")
         .env("IMGVIEWER_RUST_API_PORT", api_port.to_string())
-        .env("IMGVIEWER_RUST_SCANNER", "1")
         .env("IMGVIEWER_METADATA_WORKER", "1")
         .env("IMGVIEWER_METADATA_AUTHORITATIVE", "1")
         .env("IMGVIEWER_THUMB_JOB_MODE", "queue")
@@ -133,7 +131,6 @@ fn spawn_sidecar(
         .env("IMGVIEWER_THUMB_SYNC_FALLBACK", "0")
         .env("IMGVIEWER_THUMB_WORKERS", "4")
         .env("IMGVIEWER_THUMB_WORKER_EXPECTED", "1")
-        .env("IMGVIEWER_RESCAN_WORKER_EXPECTED", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -254,7 +251,6 @@ fn main() {
             ];
             let sidecars = [
                 (API_SIDECAR, api_args),
-                (SCANNER_SIDECAR, Vec::new()),
                 (THUMB_SIDECAR, Vec::new()),
                 (METADATA_SIDECAR, Vec::new()),
             ];

@@ -26,7 +26,6 @@
     "targets": "all",
     "externalBin": [
       "binaries/imgviewer-api-server",
-      "binaries/imgviewer-scanner-worker",
       "binaries/imgviewer-thumb-worker",
       "binaries/imgviewer-metadata-worker"
     ],

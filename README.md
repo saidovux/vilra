@@ -19,7 +19,7 @@ Build a desktop package:
 npm run tauri:build
 ```
 
-Tauri builds the frontend and four Rust sidecars, initializes the local SQLite database, starts the API/scanner/thumbnail/metadata processes and stops them when the application exits.
+Tauri builds the frontend and three Rust sidecars, initializes the local SQLite database, starts the API/thumbnail/metadata processes and stops them when the application exits.
 
 Python is not part of the project runtime.
 
@@ -27,8 +27,7 @@ Python is not part of the project runtime.
 
 - `static/src/main.ts` — frontend logic.
 - `static/src/styles.css` — frontend styles.
-- `rust/api-server` — local HTTP API and static frontend server.
-- `rust/scanner-worker` — recursive image discovery and index updates.
+- `rust/api-server` — local HTTP API, filesystem watcher, startup reconciliation and static frontend server.
 - `rust/thumb-worker` — thumbnail generation.
 - `rust/metadata-worker` — metadata jobs.
 - `rust/crates/tagimage-db` — SQLite schema and data access.
@@ -81,13 +80,13 @@ npm run test:e2e
 
 ## Main API
 
-- `POST /api/folder` — add/select a folder and enqueue a rescan.
+- `POST /api/folder` — add/select a folder and start live indexing.
+- `GET /api/events` — live filesystem updates over SSE.
 - `GET /api/images` — paginated image list and filters.
 - `GET /api/tags` / `POST /api/tags` — tag list and creation.
 - `POST /api/tag/{id}` — update user tags for an image.
 - `GET /api/session` / `PATCH /api/session` — local UI session.
 - `GET /api/folders` — indexed folder tree.
-- `POST /api/rescan` — enqueue a rescan.
 - `POST /api/thumbs/rebuild` — enqueue thumbnail rebuild jobs.
 - `GET /api/status` — database/worker/queue status.
 - `GET /thumb-file/{id}.jpg` — ready thumbnail fast path.
@@ -106,3 +105,9 @@ photos/
 ```
 
 The index itself is stored in SQLite, not in an `index.json` file.
+
+## Live filesystem indexing
+
+Vilra watches every connected library recursively through Rust `notify` and `notify-debouncer-full`. Create, delete, rename, move and modify events update only the affected SQLite rows and thumbnail jobs, then reach the gallery through SSE. There is no periodic full scan or manual rescan action.
+
+At startup Vilra watches saved roots first and runs one background reconciliation. Existing files are compared by path, size and mtime; unchanged images are not decoded again. An unavailable root is marked offline and its indexed images are retained.

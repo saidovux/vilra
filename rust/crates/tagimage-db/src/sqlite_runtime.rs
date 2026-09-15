@@ -77,6 +77,12 @@ pub struct SqliteImageMetadataUpdate {
 pub struct SqliteExistingImage {
     pub id: String,
     pub path: String,
+    pub thumb: String,
+    pub size: i64,
+    pub mtime: i64,
+    pub width: i32,
+    pub height: i32,
+    pub ext: String,
     pub hidden: bool,
 }
 
@@ -322,7 +328,7 @@ pub fn list_sqlite_existing_images_for_root(
 ) -> Result<Vec<SqliteExistingImage>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, path, hidden FROM images WHERE root_path = ?1 ORDER BY lower(path), path",
+            "SELECT id, path, thumb, size, mtime, width, height, ext, hidden FROM images WHERE root_path = ?1 ORDER BY lower(path), path",
         )
         .map_err(|e| format!("prepare sqlite existing images: {e}"))?;
     let rows = stmt
@@ -330,6 +336,12 @@ pub fn list_sqlite_existing_images_for_root(
             Ok(SqliteExistingImage {
                 id: row.get("id")?,
                 path: row.get("path")?,
+                thumb: row.get("thumb")?,
+                size: row.get("size")?,
+                mtime: row.get("mtime")?,
+                width: row.get("width")?,
+                height: row.get("height")?,
+                ext: row.get("ext")?,
                 hidden: row.get::<_, i64>("hidden")? != 0,
             })
         })
@@ -355,6 +367,330 @@ pub fn mark_sqlite_images_hidden_for_root(
     )
     .map(|count| count as i64)
     .map_err(|e| format!("mark sqlite images hidden for root {root_path}: {e}"))
+}
+
+pub fn get_sqlite_image_by_root_path_including_hidden(
+    conn: &Connection,
+    root_path: &str,
+    path: &str,
+) -> Result<Option<SqliteImageRecord>, String> {
+    conn.query_row(
+        "SELECT * FROM images WHERE root_path = ?1 AND path = ?2",
+        params![root_path, path],
+        sqlite_image_record_from_row,
+    )
+    .optional()
+    .map_err(|e| format!("get sqlite image by path {root_path}/{path}: {e}"))
+}
+
+pub fn hide_sqlite_image_by_root_path(
+    conn: &Connection,
+    root_path: &str,
+    path: &str,
+) -> Result<Option<SqliteImageRecord>, String> {
+    let image = get_sqlite_image_by_root_path_including_hidden(conn, root_path, path)?;
+    let Some(image) = image else {
+        return Ok(None);
+    };
+    conn.execute(
+        "UPDATE images SET hidden = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+        params![image.id],
+    )
+    .map_err(|e| format!("hide sqlite image {root_path}/{path}: {e}"))?;
+    Ok(Some(image))
+}
+
+pub fn hide_sqlite_images_under_path(
+    conn: &Connection,
+    root_path: &str,
+    path_prefix: &str,
+) -> Result<Vec<SqliteImageRecord>, String> {
+    let prefix = path_prefix.trim_end_matches('/');
+    let mut stmt = conn
+        .prepare(
+            "SELECT * FROM images WHERE root_path = ?1 AND hidden = 0 ORDER BY lower(path), path",
+        )
+        .map_err(|e| format!("prepare sqlite images under path: {e}"))?;
+    let rows = stmt
+        .query_map(params![root_path], sqlite_image_record_from_row)
+        .map_err(|e| format!("query sqlite images under path: {e}"))?;
+    let images = collect_rows(rows, "read sqlite image under path")?
+        .into_iter()
+        .filter(|image| relative_path_is_within(&image.path, prefix))
+        .collect::<Vec<_>>();
+    drop(stmt);
+
+    with_immediate_tx(conn, || {
+        for image in &images {
+            conn.execute(
+                "UPDATE images SET hidden = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+                params![image.id],
+            )
+            .map_err(|e| format!("hide sqlite image {}: {e}", image.path))?;
+        }
+        Ok(())
+    })?;
+    Ok(images)
+}
+
+pub fn rename_sqlite_image_path(
+    conn: &Connection,
+    root_path: &str,
+    old_path: &str,
+    new_path: &str,
+) -> Result<Option<SqliteImageRecord>, String> {
+    let Some(image) = get_sqlite_image_by_root_path_including_hidden(conn, root_path, old_path)?
+    else {
+        return Ok(None);
+    };
+    with_immediate_tx(conn, || {
+        if let Some(collision) =
+            get_sqlite_image_by_root_path_including_hidden(conn, root_path, new_path)?
+        {
+            if collision.id != image.id {
+                cancel_active_image_jobs_in_tx(conn, &collision.id)?;
+                let tombstone = format!(".vilra-hidden/{}/{}", collision.id, collision.path);
+                conn.execute(
+                    r#"
+                    UPDATE images
+                    SET path = ?2,
+                        hidden = 1,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE id = ?1
+                    "#,
+                    params![collision.id, tombstone],
+                )
+                .map_err(|e| format!("hide sqlite rename collision {}: {e}", collision.path))?;
+            }
+        }
+        conn.execute(
+            r#"
+            UPDATE images
+            SET path = ?2,
+                ext = ?3,
+                hidden = 0,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+            "#,
+            params![image.id, new_path, path_extension(new_path)],
+        )
+        .map_err(|e| format!("rename sqlite image {old_path} to {new_path}: {e}"))?;
+        Ok(())
+    })?;
+    get_sqlite_image_by_id(conn, &image.id)
+}
+
+pub fn rename_sqlite_images_under_path(
+    conn: &Connection,
+    root_path: &str,
+    old_prefix: &str,
+    new_prefix: &str,
+) -> Result<Vec<SqliteImageRecord>, String> {
+    let old_prefix = old_prefix.trim_end_matches('/');
+    let new_prefix = new_prefix.trim_end_matches('/');
+    let mut stmt = conn
+        .prepare(
+            "SELECT * FROM images WHERE root_path = ?1 AND hidden = 0 ORDER BY length(path), path",
+        )
+        .map_err(|e| format!("prepare sqlite directory rename: {e}"))?;
+    let rows = stmt
+        .query_map(params![root_path], sqlite_image_record_from_row)
+        .map_err(|e| format!("query sqlite directory rename: {e}"))?;
+    let candidates = collect_rows(rows, "read sqlite directory rename image")?
+        .into_iter()
+        .filter_map(|image| {
+            let suffix = relative_suffix(&image.path, old_prefix).map(str::to_string);
+            suffix.map(|suffix| {
+                let next_path = if suffix.is_empty() {
+                    new_prefix.to_string()
+                } else {
+                    format!("{new_prefix}/{suffix}")
+                };
+                (image, next_path)
+            })
+        })
+        .collect::<Vec<_>>();
+    drop(stmt);
+
+    with_immediate_tx(conn, || {
+        for (image, next_path) in &candidates {
+            if let Some(collision) =
+                get_sqlite_image_by_root_path_including_hidden(conn, root_path, next_path)?
+            {
+                if collision.id != image.id {
+                    cancel_active_image_jobs_in_tx(conn, &collision.id)?;
+                    let tombstone = format!(".vilra-hidden/{}/{}", collision.id, collision.path);
+                    conn.execute(
+                        r#"
+                        UPDATE images
+                        SET path = ?2,
+                            hidden = 1,
+                            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                        WHERE id = ?1
+                        "#,
+                        params![collision.id, tombstone],
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "hide sqlite directory rename collision {}: {e}",
+                            collision.path
+                        )
+                    })?;
+                }
+            }
+            conn.execute(
+                r#"
+                UPDATE images
+                SET path = ?2,
+                    ext = ?3,
+                    hidden = 0,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                "#,
+                params![image.id, next_path, path_extension(next_path)],
+            )
+            .map_err(|e| format!("rename sqlite image {} to {next_path}: {e}", image.path))?;
+        }
+        Ok(())
+    })?;
+
+    candidates
+        .into_iter()
+        .map(|(image, _)| {
+            get_sqlite_image_by_id(conn, &image.id)?
+                .ok_or_else(|| format!("renamed sqlite image {} disappeared", image.id))
+        })
+        .collect()
+}
+
+pub fn retarget_sqlite_active_image_jobs(
+    conn: &Connection,
+    image_id: &str,
+    root_path: &str,
+    path: &str,
+    thumb: &str,
+    mtime: i64,
+) -> Result<i64, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, job_type, payload
+            FROM jobs
+            WHERE state IN ('queued', 'running')
+              AND job_type IN ('thumb', 'metadata')
+            "#,
+        )
+        .map_err(|e| format!("prepare sqlite active image jobs: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| format!("query sqlite active image jobs: {e}"))?;
+    let mut updates = Vec::new();
+    for row in rows {
+        let (job_id, job_type, payload_text) =
+            row.map_err(|e| format!("read sqlite active image job: {e}"))?;
+        let mut payload = parse_json_text(&payload_text, json!({}));
+        if payload.get("image_id").and_then(JsonValue::as_str) != Some(image_id) {
+            continue;
+        }
+        let Some(object) = payload.as_object_mut() else {
+            continue;
+        };
+        object.insert("root_path".to_string(), json!(root_path));
+        object.insert("path".to_string(), json!(path));
+        if job_type == "thumb" {
+            object.insert("thumb".to_string(), json!(thumb));
+            object.insert("mtime".to_string(), json!(mtime));
+        }
+        updates.push((job_id, payload));
+    }
+    drop(stmt);
+
+    with_immediate_tx(conn, || {
+        for (job_id, payload) in &updates {
+            let payload = serde_json::to_string(payload)
+                .map_err(|e| format!("serialize retargeted sqlite image job: {e}"))?;
+            conn.execute(
+                r#"
+                UPDATE jobs
+                SET payload = ?2,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1 AND state IN ('queued', 'running')
+                "#,
+                params![job_id, payload],
+            )
+            .map_err(|e| format!("retarget sqlite image job {job_id}: {e}"))?;
+        }
+        Ok(())
+    })?;
+    Ok(updates.len() as i64)
+}
+
+fn cancel_active_image_jobs_in_tx(conn: &Connection, image_id: &str) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, payload
+            FROM jobs
+            WHERE state IN ('queued', 'running')
+              AND job_type IN ('thumb', 'metadata')
+            "#,
+        )
+        .map_err(|e| format!("prepare sqlite image jobs for cancellation: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| format!("query sqlite image jobs for cancellation: {e}"))?;
+    let mut job_ids = Vec::new();
+    for row in rows {
+        let (job_id, payload_text) =
+            row.map_err(|e| format!("read sqlite image job for cancellation: {e}"))?;
+        let payload = parse_json_text(&payload_text, json!({}));
+        if payload.get("image_id").and_then(JsonValue::as_str) == Some(image_id) {
+            job_ids.push(job_id);
+        }
+    }
+    drop(stmt);
+    for job_id in job_ids {
+        conn.execute(
+            r#"
+            UPDATE jobs
+            SET state = 'canceled',
+                finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1 AND state IN ('queued', 'running')
+            "#,
+            params![job_id],
+        )
+        .map_err(|e| format!("cancel sqlite image job {job_id}: {e}"))?;
+    }
+    Ok(())
+}
+
+pub fn get_sqlite_image_api_value(
+    conn: &Connection,
+    image_id: &str,
+) -> Result<Option<JsonValue>, String> {
+    let Some(image) = get_sqlite_image_by_id(conn, image_id)? else {
+        return Ok(None);
+    };
+    let rows = vec![SqliteImageListRow {
+        id: image.id,
+        path: image.path.clone(),
+        lower_path: image.path.to_lowercase(),
+        thumb: image.thumb,
+        size: image.size,
+        mtime: image.mtime,
+        width: image.width,
+        height: image.height,
+    }];
+    Ok(rows_to_sqlite_images(conn, rows)?.into_iter().next())
 }
 
 pub fn clear_sqlite_auto_tags_for_image(conn: &Connection, image_id: &str) -> Result<i64, String> {
@@ -1504,22 +1840,6 @@ pub fn recover_sqlite_stale_running_jobs(
     })
 }
 
-pub fn enqueue_sqlite_rescan_job(
-    conn: &Connection,
-    root_path: &str,
-    max_attempts: i32,
-) -> Result<JsonValue, String> {
-    let result = enqueue_sqlite_job(
-        conn,
-        "rescan",
-        json!({"root_path": root_path}),
-        0,
-        max_attempts,
-        None,
-    )?;
-    Ok(serialize_sqlite_job(&result.job))
-}
-
 pub fn enqueue_sqlite_thumb_job(
     conn: &Connection,
     image_id: &str,
@@ -1673,42 +1993,11 @@ pub fn claim_next_sqlite_thumb_job(
     claim_next_sqlite_job(conn, Some("thumb"), worker_id)
 }
 
-pub fn claim_next_sqlite_rescan_job(
-    conn: &Connection,
-    worker_id: &str,
-) -> Result<Option<crate::ClaimedJob>, String> {
-    claim_next_sqlite_job(conn, Some("rescan"), worker_id)
-}
-
 pub fn claim_next_sqlite_metadata_job(
     conn: &Connection,
     worker_id: &str,
 ) -> Result<Option<crate::ClaimedJob>, String> {
     claim_next_sqlite_job(conn, Some("metadata"), worker_id)
-}
-
-pub fn claim_next_sqlite_scanner_shadow_job(
-    conn: &Connection,
-    worker_id: &str,
-) -> Result<Option<crate::ClaimedJob>, String> {
-    claim_next_sqlite_job(conn, Some("scanner_shadow"), worker_id)
-}
-
-pub fn mark_sqlite_rescan_succeeded(
-    conn: &Connection,
-    job: &crate::ClaimedJob,
-    total: i32,
-) -> Result<(), String> {
-    mark_sqlite_job_succeeded(conn, &job.id, Some(total), Some(json!({"total": total})))
-}
-
-pub fn mark_sqlite_rescan_failed(
-    conn: &Connection,
-    job: &crate::ClaimedJob,
-    error: &str,
-    max_backoff_sec: i64,
-) -> Result<(), String> {
-    mark_sqlite_job_failed(conn, &job.id, error, max_backoff_sec, None)
 }
 
 pub fn mark_sqlite_metadata_succeeded(
@@ -1728,31 +2017,6 @@ pub fn mark_sqlite_metadata_succeeded(
 }
 
 pub fn mark_sqlite_metadata_failed(
-    conn: &Connection,
-    job: &crate::ClaimedJob,
-    error: &str,
-    total_ms: Option<u128>,
-    max_backoff_sec: i64,
-) -> Result<(), String> {
-    mark_sqlite_job_failed(conn, &job.id, error, max_backoff_sec, total_ms)
-}
-
-pub fn mark_sqlite_scanner_shadow_succeeded(
-    conn: &Connection,
-    job: &crate::ClaimedJob,
-    scan_json: JsonValue,
-    total: i32,
-) -> Result<(), String> {
-    let event_data = json!({
-        "attempt": job.attempt,
-        "completed_at": now_unix(),
-        "scanner_shadow": scan_json,
-        "shadow": true,
-    });
-    mark_sqlite_job_succeeded(conn, &job.id, Some(total), Some(event_data))
-}
-
-pub fn mark_sqlite_scanner_shadow_failed(
     conn: &Connection,
     job: &crate::ClaimedJob,
     error: &str,
@@ -1842,6 +2106,26 @@ fn sqlite_metadata_source_row_from_row(row: &Row<'_>) -> rusqlite::Result<Sqlite
         path: row.get("path")?,
         mtime: row.get("mtime")?,
     })
+}
+
+fn relative_path_is_within(path: &str, prefix: &str) -> bool {
+    relative_suffix(path, prefix).is_some()
+}
+
+fn relative_suffix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    if path == prefix {
+        return Some("");
+    }
+    path.strip_prefix(prefix)?.strip_prefix('/')
+}
+
+fn path_extension(path: &str) -> String {
+    Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn sqlite_job_from_row(row: &Row<'_>) -> rusqlite::Result<SqliteJob> {
@@ -2563,6 +2847,107 @@ mod tests {
     }
 
     #[test]
+    fn live_path_helpers_preserve_ids_and_user_tags() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let root = "/photos";
+        upsert_fixture(&conn, "img-a", root, "old/cat.jpg", 10, 10);
+        upsert_fixture(&conn, "img-b", root, "old/nested/dog.png", 20, 20);
+        upsert_fixture(&conn, "img-collision", root, "new/cat.webp", 30, 30);
+        replace_sqlite_image_tags(&conn, "img-a", &["Favorite".to_string()], "user")
+            .expect("user tag");
+        let (thumb_job, _) = enqueue_sqlite_thumb_job(
+            &conn,
+            "img-a",
+            root,
+            "old/cat.jpg",
+            ".imgindex/thumbs/img-a.jpg",
+            10,
+            20,
+            3,
+        )
+        .expect("thumb job");
+        let (collision_job, _) = enqueue_sqlite_thumb_job(
+            &conn,
+            "img-collision",
+            root,
+            "new/cat.webp",
+            ".imgindex/thumbs/img-collision.jpg",
+            30,
+            20,
+            3,
+        )
+        .expect("collision thumb job");
+
+        let renamed = rename_sqlite_image_path(&conn, root, "old/cat.jpg", "new/cat.webp")
+            .expect("rename image")
+            .expect("renamed image");
+        assert_eq!(
+            retarget_sqlite_active_image_jobs(
+                &conn,
+                "img-a",
+                root,
+                "new/cat.webp",
+                &renamed.thumb,
+                renamed.mtime,
+            )
+            .expect("retarget jobs"),
+            1
+        );
+        assert_eq!(renamed.id, "img-a");
+        assert_eq!(renamed.path, "new/cat.webp");
+        assert_eq!(renamed.ext, "webp");
+        let (_, user_tags) = list_sqlite_tags_for_image(&conn, "img-a").expect("user tags");
+        assert_eq!(user_tags, vec!["Favorite"]);
+        let thumb_job = get_sqlite_job(&conn, thumb_job["id"].as_str().expect("thumb job id"))
+            .expect("get thumb job")
+            .expect("thumb job row");
+        assert_eq!(thumb_job.payload["path"], "new/cat.webp");
+        let collision_job = get_sqlite_job(
+            &conn,
+            collision_job["id"].as_str().expect("collision job id"),
+        )
+        .expect("get collision job")
+        .expect("collision job row");
+        assert_eq!(collision_job.state, "canceled");
+        let collision: (String, i64) = conn
+            .query_row(
+                "SELECT path, hidden FROM images WHERE id = 'img-collision'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("hidden collision");
+        assert!(collision.0.starts_with(".vilra-hidden/img-collision/"));
+        assert_eq!(collision.1, 1);
+
+        let moved = rename_sqlite_images_under_path(&conn, root, "old", "archive")
+            .expect("rename directory");
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].id, "img-b");
+        assert_eq!(moved[0].path, "archive/nested/dog.png");
+
+        let hidden =
+            hide_sqlite_images_under_path(&conn, root, "archive").expect("hide directory images");
+        assert_eq!(hidden.len(), 1);
+        assert!(get_sqlite_image_by_id(&conn, "img-b")
+            .expect("visible lookup")
+            .is_none());
+        assert!(get_sqlite_image_by_root_path_including_hidden(
+            &conn,
+            root,
+            "archive/nested/dog.png"
+        )
+        .expect("hidden lookup")
+        .is_some_and(|image| image.hidden));
+
+        let api_image = get_sqlite_image_api_value(&conn, "img-a")
+            .expect("api image")
+            .expect("visible api image");
+        assert_eq!(api_image["id"], "img-a");
+        assert_eq!(api_image["user_tags"][0], "Favorite");
+    }
+
+    #[test]
     fn tags_session_and_folder_helpers_match_runtime_shapes() {
         let (_dir, db_path) = temp_db_path();
         let conn = init_sqlite_db(&db_path).expect("init");
@@ -2641,14 +3026,9 @@ mod tests {
         let (_dir, db_path) = temp_db_path();
         let conn = init_sqlite_db(&db_path).expect("init");
 
-        let job = enqueue_sqlite_rescan_job(&conn, "/photos", 3).expect("rescan enqueue");
-        assert_eq!(job["type"], "rescan");
-        assert_eq!(
-            count_sqlite_jobs(&conn, Some("rescan"), Some("queued")).expect("count"),
-            1
-        );
-
-        let claimed = claim_next_sqlite_rescan_job(&conn, "worker-a")
+        let queued =
+            enqueue_sqlite_job(&conn, "index", json!({}), 0, 3, None).expect("index enqueue");
+        let claimed = claim_next_sqlite_job(&conn, Some("index"), "worker-a")
             .expect("claim")
             .expect("claimed");
         touch_sqlite_job_progress(&conn, &claimed.id, 2, Some(5)).expect("progress");
@@ -2664,12 +3044,12 @@ mod tests {
         )
         .expect("make stale");
         assert_eq!(
-            count_sqlite_stale_running_jobs(&conn, Some("rescan"), 300).expect("stale count"),
+            count_sqlite_stale_running_jobs(&conn, Some("index"), 300).expect("stale count"),
             1
         );
         let recovered = recover_sqlite_stale_running_jobs(&conn, 300, 10).expect("recover");
         assert_eq!(recovered.requeued, 1);
-        let claimed = claim_next_sqlite_rescan_job(&conn, "worker-b")
+        let claimed = claim_next_sqlite_job(&conn, Some("index"), "worker-b")
             .expect("claim again")
             .expect("claimed again");
         mark_sqlite_job_succeeded(&conn, &claimed.id, Some(5), None).expect("success");
@@ -2725,40 +3105,13 @@ mod tests {
         assert_eq!(cleanup.removed_jobs, 1);
 
         let jobs = list_sqlite_jobs(&conn, None, None, 10).expect("list jobs");
-        assert!(jobs.iter().any(|job| job["type"] == "rescan"));
+        assert!(jobs.iter().any(|job| job["id"] == queued.job.id));
     }
 
     #[test]
-    fn scanner_shadow_metadata_and_rescan_wrappers_write_expected_events() {
+    fn metadata_wrappers_write_expected_events() {
         let (_dir, db_path) = temp_db_path();
         let conn = init_sqlite_db(&db_path).expect("init");
-
-        enqueue_sqlite_job(
-            &conn,
-            "scanner_shadow",
-            json!({"root_path": "/photos"}),
-            10,
-            1,
-            None,
-        )
-        .expect("scanner enqueue");
-        let scanner = claim_next_sqlite_scanner_shadow_job(&conn, "scanner-worker")
-            .expect("scanner claim")
-            .expect("scanner job");
-        mark_sqlite_scanner_shadow_succeeded(
-            &conn,
-            &scanner,
-            json!({"root_path": "/photos", "total": 2}),
-            2,
-        )
-        .expect("scanner success");
-        let scanner_events = list_sqlite_job_events(&conn, &scanner.id).expect("scanner events");
-        let success = scanner_events
-            .iter()
-            .find(|event| event.event == "succeeded")
-            .expect("scanner success event");
-        assert_eq!(success.data["scanner_shadow"]["total"], 2);
-        assert_eq!(success.data["shadow"], true);
 
         enqueue_sqlite_metadata_job(&conn, "img-1", "/photos", "a.jpg", Some(5), 0, 1)
             .expect("metadata enqueue");
@@ -2780,17 +3133,6 @@ mod tests {
         assert_eq!(success.data["metadata"]["image_id"], "img-1");
         assert_eq!(success.data["authoritative"], true);
         assert_eq!(success.data["shadow"], false);
-
-        let rescan_job = enqueue_sqlite_rescan_job(&conn, "/photos", 1).expect("rescan enqueue");
-        let rescan = claim_next_sqlite_rescan_job(&conn, "rescan-worker")
-            .expect("rescan claim")
-            .expect("rescan job");
-        mark_sqlite_rescan_succeeded(&conn, &rescan, 7).expect("rescan success");
-        let rescan_value = get_sqlite_job_api_value(&conn, rescan_job["id"].as_str().unwrap())
-            .expect("rescan value")
-            .expect("rescan value");
-        assert_eq!(rescan_value["state"], "succeeded");
-        assert_eq!(rescan_value["progress"]["total"], 7);
 
         enqueue_sqlite_job(&conn, "metadata", json!({"image_id": "img-2"}), 0, 1, None)
             .expect("metadata failure enqueue");

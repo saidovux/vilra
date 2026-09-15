@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub sqlite_path: PathBuf,
+    pub init_db_only: bool,
     pub host: String,
     pub port: u16,
     pub repo_root: PathBuf,
@@ -12,13 +13,9 @@ pub struct AppConfig {
     pub thumb_poll_ms: u64,
     pub thumb_sync_fallback: bool,
     pub thumb_worker_expected: bool,
-    pub rescan_worker_expected: bool,
-    pub inline_worker: bool,
-    pub rust_scanner: bool,
     pub metadata_worker: bool,
     pub metadata_authoritative: bool,
     pub thumb_max_attempts: i32,
-    pub rescan_max_attempts: i32,
     pub job_stale_running_sec: i64,
 }
 
@@ -32,6 +29,7 @@ impl AppConfig {
         let mut host =
             std::env::var("IMGVIEWER_RUST_API_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let mut port = env_u16("IMGVIEWER_RUST_API_PORT", 8010);
+        let mut init_db_only = false;
         let args = std::env::args().skip(1).collect::<Vec<_>>();
         let mut i = 0;
         while i < args.len() {
@@ -52,8 +50,11 @@ impl AppConfig {
                         .parse::<u16>()
                         .map_err(|e| format!("invalid port {raw}: {e}"))?;
                 }
+                "--init-db" => init_db_only = true,
                 "--help" | "-h" => {
-                    println!("Usage: imgviewer-api-server [--host 127.0.0.1] [--port 8010]");
+                    println!(
+                        "Usage: imgviewer-api-server [--host 127.0.0.1] [--port 8010] [--init-db]"
+                    );
                     std::process::exit(0);
                 }
                 other => return Err(format!("unexpected argument: {other}")),
@@ -67,6 +68,7 @@ impl AppConfig {
 
         Ok(Self {
             sqlite_path,
+            init_db_only,
             host,
             port,
             repo_root,
@@ -76,14 +78,10 @@ impl AppConfig {
             thumb_poll_ms: env_u64("IMGVIEWER_THUMB_POLL_MS", 120).max(10),
             thumb_sync_fallback: false,
             thumb_worker_expected: env_bool("IMGVIEWER_THUMB_WORKER_EXPECTED", true),
-            rescan_worker_expected: env_bool("IMGVIEWER_RESCAN_WORKER_EXPECTED", true),
-            inline_worker: false,
-            rust_scanner: true,
             metadata_worker,
             metadata_authoritative: metadata_worker
                 && env_bool("IMGVIEWER_METADATA_AUTHORITATIVE", true),
             thumb_max_attempts: env_i32("IMGVIEWER_THUMB_MAX_ATTEMPTS", 5).max(1),
-            rescan_max_attempts: env_i32("IMGVIEWER_RESCAN_MAX_ATTEMPTS", 3).max(1),
             job_stale_running_sec: env_i64("IMGVIEWER_JOB_STALE_RUNNING_SEC", 300).max(0),
         })
     }

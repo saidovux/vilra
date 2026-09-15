@@ -12,16 +12,6 @@ pub struct ThumbJobPayload {
     pub max_size: Option<Vec<u32>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RescanJobPayload {
-    pub root_path: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScannerShadowJobPayload {
-    pub root_path: String,
-}
-
 /// Future contract for metadata jobs. Currently unused by workers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataJobPayload {
@@ -34,8 +24,6 @@ pub struct MetadataJobPayload {
 #[serde(rename_all = "snake_case")]
 pub enum JobType {
     Thumb,
-    Rescan,
-    ScannerShadow,
     Metadata,
     Hash,
     Index,

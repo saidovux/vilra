@@ -2,7 +2,6 @@
 members = [
   "thumb-worker",
   "metadata-worker",
-  "scanner-worker",
   "api-server",
   "crates/tagimage-core",
   "crates/tagimage-db",

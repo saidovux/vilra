@@ -9,18 +9,15 @@ LOG_DIR="$SCRIPT_DIR/.logs"
 PORT_FILE="$RUN_DIR/port"
 
 API_PID_FILE="$RUN_DIR/api.pid"
-SCANNER_PID_FILE="$RUN_DIR/scanner-worker.pid"
 THUMB_PID_FILE="$RUN_DIR/thumb-worker.pid"
 METADATA_PID_FILE="$RUN_DIR/metadata-worker.pid"
 
 API_LOG="$LOG_DIR/api.log"
-SCANNER_LOG="$LOG_DIR/scanner-worker.log"
 THUMB_LOG="$LOG_DIR/thumb-worker.log"
 METADATA_LOG="$LOG_DIR/metadata-worker.log"
 
 TARGET_DIR="$SCRIPT_DIR/rust/thumb-worker/target/release"
 API_BIN="$TARGET_DIR/imgviewer-api-server"
-SCANNER_BIN="$TARGET_DIR/imgviewer-scanner-worker"
 THUMB_BIN="$TARGET_DIR/imgviewer-thumb-worker"
 METADATA_BIN="$TARGET_DIR/imgviewer-metadata-worker"
 
@@ -40,7 +37,7 @@ Usage:
   ./start.sh stop
   ./start.sh restart [path]
   ./start.sh status
-  ./start.sh logs [api|scanner|thumb|metadata]
+  ./start.sh logs [api|thumb|metadata]
   ./start.sh open
 
 Flags:
@@ -135,7 +132,6 @@ stop_process() {
 stop_all() {
   stop_process "metadata-worker" "$METADATA_PID_FILE"
   stop_process "thumb-worker" "$THUMB_PID_FILE"
-  stop_process "scanner-worker" "$SCANNER_PID_FILE"
   stop_process "api" "$API_PID_FILE"
   rm -f "$PORT_FILE"
 }
@@ -151,12 +147,11 @@ ensure_frontend() {
 ensure_rust_binaries() {
   command -v cargo >/dev/null 2>&1 || die "cargo not found"
 
-  if [[ "$BUILD_RUST" -eq 1 || ! -x "$API_BIN" || ! -x "$SCANNER_BIN" || ! -x "$THUMB_BIN" || ! -x "$METADATA_BIN" ]]; then
+  if [[ "$BUILD_RUST" -eq 1 || ! -x "$API_BIN" || ! -x "$THUMB_BIN" || ! -x "$METADATA_BIN" ]]; then
     cargo build --manifest-path "$SCRIPT_DIR/rust/Cargo.toml" --workspace --release
   fi
 
   [[ -x "$API_BIN" ]] || die "missing $API_BIN"
-  [[ -x "$SCANNER_BIN" ]] || die "missing $SCANNER_BIN"
   [[ -x "$THUMB_BIN" ]] || die "missing $THUMB_BIN"
   [[ -x "$METADATA_BIN" ]] || die "missing $METADATA_BIN"
 }
@@ -222,10 +217,10 @@ start_all() {
   ensure_port_available
   ensure_frontend
   ensure_rust_binaries
+  "$API_BIN" --init-db
 
   export IMGVIEWER_METADATA_AUTHORITATIVE="${IMGVIEWER_METADATA_AUTHORITATIVE:-1}"
   export IMGVIEWER_THUMB_WORKER_EXPECTED="${IMGVIEWER_THUMB_WORKER_EXPECTED:-1}"
-  export IMGVIEWER_RESCAN_WORKER_EXPECTED="${IMGVIEWER_RESCAN_WORKER_EXPECTED:-1}"
 
   start_process "api" "$API_PID_FILE" "$API_LOG" "$API_BIN" --host 127.0.0.1 --port "$PORT"
   if ! wait_for_api; then
@@ -233,7 +228,6 @@ start_all() {
     die "API did not become ready"
   fi
 
-  start_process "scanner-worker" "$SCANNER_PID_FILE" "$SCANNER_LOG" "$SCANNER_BIN"
   start_process "thumb-worker" "$THUMB_PID_FILE" "$THUMB_LOG" "$THUMB_BIN"
   start_process "metadata-worker" "$METADATA_PID_FILE" "$METADATA_LOG" "$METADATA_BIN"
 
@@ -260,7 +254,6 @@ status_process() {
 
 status_all() {
   status_process "api" "$API_PID_FILE"
-  status_process "scanner-worker" "$SCANNER_PID_FILE"
   status_process "thumb-worker" "$THUMB_PID_FILE"
   status_process "metadata-worker" "$METADATA_PID_FILE"
 
@@ -276,7 +269,7 @@ status_all() {
 show_logs() {
   case "$LOG_TARGET" in
     "")
-      for pair in "api:$API_LOG" "scanner:$SCANNER_LOG" "thumb:$THUMB_LOG" "metadata:$METADATA_LOG"; do
+      for pair in "api:$API_LOG" "thumb:$THUMB_LOG" "metadata:$METADATA_LOG"; do
         local name="${pair%%:*}"
         local file="${pair#*:}"
         echo "===== $name ====="
@@ -284,7 +277,6 @@ show_logs() {
       done
       ;;
     api) tail -n 100 "$API_LOG" 2>/dev/null || true ;;
-    scanner) tail -n 100 "$SCANNER_LOG" 2>/dev/null || true ;;
     thumb) tail -n 100 "$THUMB_LOG" 2>/dev/null || true ;;
     metadata) tail -n 100 "$METADATA_LOG" 2>/dev/null || true ;;
     *) die "Unknown log target: $LOG_TARGET" ;;
@@ -324,7 +316,7 @@ parse_args() {
         usage
         exit 0
         ;;
-      api|scanner|thumb|metadata)
+      api|thumb|metadata)
         if [[ "$ACTION" == "logs" && -z "$LOG_TARGET" ]]; then
           LOG_TARGET="$1"
           shift

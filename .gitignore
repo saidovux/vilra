@@ -1,4 +1,6 @@
 node_modules/
+test-results/
+playwright-report/
 static/dist/
 static/app.js
 static/app.css

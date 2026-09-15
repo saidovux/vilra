@@ -71,6 +71,12 @@ interface ImagePage {
   has_more?: boolean;
 }
 
+interface LiveEventEnvelope {
+  sequence?: number;
+  type: string;
+  data: JsonRecord;
+}
+
 interface TagInputParse {
   prefix: string;
   value: string;
@@ -565,6 +571,11 @@ let settingsActiveTab: SettingsTab = 'general';
 let tagAdminSort: TagAdminSort = 'name';
 let lastScrollY = 0;
 let graphState: GraphState | null = null;
+let liveEventSource: EventSource | null = null;
+let lastLiveSequence = 0;
+let liveRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+let liveFolderRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let liveTagRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 const PAGE = 48;
 const MASONRY_COL_MIN = 230;
 const canvasCache = new Map<string, Promise<HTMLCanvasElement>>();
@@ -885,20 +896,15 @@ async function pollStatus(): Promise<void> {
       const done = Number(s.done || 0);
       const pct = total > 0 ? Math.round(done / total * 100) : 0;
       bar.style.width = pct + '%';
-      txt.textContent = `Сканирование: ${done}/${total}`;
-      if (done % 20 === 0 || done === total) refreshImages(false);
+      txt.textContent = `Синхронизация: ${done}/${total}`;
     } else if (s.queued) {
       prog.style.display = 'block';
       bar.style.width = '0';
-      txt.textContent = 'Сканирование в очереди';
+      txt.textContent = 'Синхронизация ожидает запуска';
     } else {
       prog.style.display = 'none';
       bar.style.width = '0';
       txt.textContent = s.error ? s.error : (s.root || 'Готово');
-      if (s.root) {
-        refreshImages(false);
-        refreshFolderTree();
-      }
       if (statusInterval && !s.error && !s.queued) {
         clearInterval(statusInterval);
         statusInterval = null;
@@ -907,6 +913,169 @@ async function pollStatus(): Promise<void> {
   } catch (e) {
     setDbStatus(false, errorMessage(e));
   }
+}
+
+function startLiveEvents(): void {
+  if (liveEventSource) return;
+  const source = new EventSource('/api/events');
+  liveEventSource = source;
+  source.onmessage = event => {
+    try {
+      const raw: unknown = JSON.parse(event.data);
+      if (!isRecord(raw) || typeof raw.type !== 'string') return;
+      const sequence = Number(raw.sequence || 0);
+      if (sequence > 0 && lastLiveSequence > 0 && sequence > lastLiveSequence + 1) {
+        scheduleLiveRecovery('sequence_gap');
+      }
+      if (sequence > 0) lastLiveSequence = Math.max(lastLiveSequence, sequence);
+      handleLiveEvent({
+        sequence,
+        type: raw.type,
+        data: isRecord(raw.data) ? raw.data : {},
+      });
+    } catch (error) {
+      console.warn('Invalid filesystem event payload', error);
+    }
+  };
+  source.onerror = () => {
+    // EventSource reconnects automatically and sends Last-Event-ID.
+  };
+}
+
+function handleLiveEvent(event: LiveEventEnvelope): void {
+  const image = normalizeImageItem(event.data.image);
+  switch (event.type) {
+    case 'image_created':
+      if (image) applyLiveImage(image, 'created');
+      break;
+    case 'image_updated':
+    case 'image_renamed':
+      if (image) applyLiveImage(image, 'updated');
+      break;
+    case 'image_removed':
+      removeLiveImage(String(event.data.image_id || ''), image);
+      break;
+    case 'directory_created':
+    case 'directory_removed':
+    case 'directory_renamed':
+      scheduleLiveFolderRefresh();
+      break;
+    case 'sync_started':
+      startStatusPolling();
+      break;
+    case 'sync_finished':
+      void refreshImages(true);
+      scheduleLiveFolderRefresh();
+      break;
+    case 'root_online':
+    case 'root_offline':
+      void pollStatus();
+      break;
+    case 'resync_required':
+      scheduleLiveRecovery(String(event.data.reason || 'backend_requested'));
+      break;
+  }
+}
+
+function imageMatchesActiveTab(image: ImageItem): boolean {
+  const tab = activeTab();
+  const tags = new Set((image.tags || []).map(normalizeTag));
+  if ((tab.excludeTags || []).some(tag => tags.has(normalizeTag(tag)))) return false;
+  const required = (tab.includeTags || []).map(normalizeTag).filter(Boolean);
+  if (!required.length) return true;
+  return tab.matchMode === 'all'
+    ? required.every(tag => tags.has(tag))
+    : required.some(tag => tags.has(tag));
+}
+
+function compareLiveImages(left: ImageItem, right: ImageItem): number {
+  const tab = activeTab();
+  const pathOrder = left.path.localeCompare(right.path, undefined, {sensitivity: 'base'}) || left.id.localeCompare(right.id);
+  switch (tab.sortMode) {
+    case 'path_desc': return -pathOrder;
+    case 'date_desc': return Number(right.mtime || 0) - Number(left.mtime || 0) || pathOrder;
+    case 'date_asc': return Number(left.mtime || 0) - Number(right.mtime || 0) || pathOrder;
+    case 'size_desc': return Number(right.size || 0) - Number(left.size || 0) || pathOrder;
+    case 'size_asc': return Number(left.size || 0) - Number(right.size || 0) || pathOrder;
+    default: return pathOrder;
+  }
+}
+
+function applyLiveImage(image: ImageItem, operation: 'created' | 'updated'): void {
+  const existingIndex = allImages.findIndex(item => item.id === image.id);
+  const existingWasVisible = existingIndex >= 0;
+  if (existingIndex >= 0) allImages.splice(existingIndex, 1);
+  if (imageMatchesActiveTab(image)) allImages.push(image);
+  allImages.sort(compareLiveImages);
+  visibleImages = allImages.slice();
+  if (serverTotalKnown && operation === 'created' && !existingWasVisible && imageMatchesActiveTab(image)) {
+    serverTotal += 1;
+  }
+  canvasCache.delete(image.id);
+  renderLiveGalleryState();
+  scheduleLiveFolderRefresh();
+  scheduleLiveTagRefresh();
+  updateLivePreviewImage(image);
+}
+
+function removeLiveImage(imageId: string, removedImage: ImageItem | null): void {
+  if (!imageId) return;
+  const existingIndex = allImages.findIndex(item => item.id === imageId);
+  const wasVisible = existingIndex >= 0;
+  if (existingIndex >= 0) allImages.splice(existingIndex, 1);
+  visibleImages = allImages.slice();
+  if (serverTotalKnown && (wasVisible || (removedImage && imageMatchesActiveTab(removedImage)))) {
+    serverTotal = Math.max(0, serverTotal - 1);
+  }
+  canvasCache.delete(imageId);
+  if (activeTab().lastImageId === imageId) closePreview(true);
+  renderLiveGalleryState();
+  scheduleLiveFolderRefresh();
+  scheduleLiveTagRefresh();
+}
+
+function renderLiveGalleryState(): void {
+  const targetCount = Math.min(
+    visibleImages.length,
+    Math.max(renderedCount, Math.min(PAGE, visibleImages.length)),
+  );
+  renderedCount = targetCount;
+  layoutGallery();
+  updateImageCounter();
+  requiredHtml('empty-state').style.display = visibleImages.length ? 'none' : 'flex';
+  requestGraphRebuild();
+}
+
+function updateLivePreviewImage(image: ImageItem): void {
+  const index = lightboxImages.findIndex(item => item.id === image.id);
+  if (index >= 0) lightboxImages[index] = image;
+  if (previewModal?.isOpen && activeTab().lastImageId === image.id) renderPreviewMeta(image, false);
+}
+
+function scheduleLiveRecovery(reason: string): void {
+  if (liveRecoveryTimer) return;
+  console.warn('Recovering gallery state after filesystem event gap', {reason});
+  liveRecoveryTimer = setTimeout(async () => {
+    liveRecoveryTimer = null;
+    await refreshImages(true);
+    await refreshFolderTree();
+  }, 100);
+}
+
+function scheduleLiveFolderRefresh(): void {
+  if (liveFolderRefreshTimer) clearTimeout(liveFolderRefreshTimer);
+  liveFolderRefreshTimer = setTimeout(() => {
+    liveFolderRefreshTimer = null;
+    void refreshFolderTree();
+  }, 150);
+}
+
+function scheduleLiveTagRefresh(): void {
+  if (liveTagRefreshTimer) clearTimeout(liveTagRefreshTimer);
+  liveTagRefreshTimer = setTimeout(() => {
+    liveTagRefreshTimer = null;
+    void refreshTagPool();
+  }, 150);
 }
 
 function renderDbStatus(status: StatusResponse): void {
@@ -1068,8 +1237,9 @@ function makeCard(img: ImageItem): HTMLElement {
   const name = fileName(img.path);
   const ph = document.createElement('img');
   ph.className = 'lazy';
-  ph.dataset.src = img.thumb_url || `/thumb-file/${img.id}.jpg`;
-  ph.dataset.fallbackSrc = `/thumb/${img.id}`;
+  const version = Number(img.mtime || 0);
+  ph.dataset.src = `${img.thumb_url || `/thumb-file/${img.id}.jpg`}?v=${version}`;
+  ph.dataset.fallbackSrc = `/thumb/${img.id}?v=${version}`;
   ph.alt = name;
   ph.decoding = 'async';
   ph.loading = 'lazy';
@@ -1739,7 +1909,7 @@ async function deleteTagDefinition(tag: string | undefined): Promise<void> {
   const meta = getTagMeta(tag);
   const isAuto = Boolean(meta.is_auto || Number(meta.auto_count || 0) > 0);
   const message = isAuto
-    ? `Удалить авто-тег "${tag}"? Он будет скрыт и не вернется после пересканирования, пока вы не создадите его вручную.`
+    ? `Удалить авто-тег "${tag}"? Он останется скрытым при следующих изменениях файлов, пока вы не создадите его вручную.`
     : `Удалить тег "${tag}"?`;
   if (!confirm(message)) return;
   try {
@@ -2545,16 +2715,6 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'ArrowRight') previewNav(1);
 });
 
-async function rescan() {
-  try {
-    const r = await fetch('/api/rescan', {method: 'POST'});
-    if (!r.ok) throw new Error(await readError(r));
-    startStatusPolling();
-  } catch (e) {
-    alert('Ошибка: ' + errorMessage(e));
-  }
-}
-
 function saveSessionSoon(): void {
   if (sessionSaveTimer) clearTimeout(sessionSaveTimer);
   sessionSaveTimer = setTimeout(saveSession, 250);
@@ -2946,9 +3106,6 @@ function runAction(actionEl: HTMLElement): void {
     case 'preview-nav':
       previewNav(Number(actionEl.dataset.dir || 0));
       break;
-    case 'rescan':
-      rescan();
-      break;
     case 'reset-graph-layout':
       resetGraphLayout();
       break;
@@ -3041,6 +3198,7 @@ initActionBindings();
 initPreview();
 initFilterInput();
 initFishInputs();
+startLiveEvents();
 updateScrollTopButton();
 handleChromeScroll();
 loadSession();
