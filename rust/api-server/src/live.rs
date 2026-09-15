@@ -206,20 +206,16 @@ impl LiveIndexer {
                     }
                 }
                 for root in startup_roots {
-                    if let Err(error) = processor.reconcile_root(&root) {
-                        processor.set_offline(&root, error);
-                    }
+                    processor.reconcile_or_set_offline(&root);
                 }
                 while let Ok(command) = receiver.recv() {
                     match command {
                         LiveCommand::AddRoot { root, reply } => {
                             let result = processor.register_root(&mut debouncer, root.clone());
-                            let should_reconcile = result.as_ref().copied().unwrap_or(false);
+                            let should_reconcile = result.is_ok();
                             let _ = reply.send(result.map(|_| ()));
                             if should_reconcile {
-                                if let Err(error) = processor.reconcile_root(&root) {
-                                    processor.set_offline(&root, error);
-                                }
+                                processor.reconcile_or_set_offline(&root);
                             }
                         }
                         LiveCommand::Filesystem(result) => {
@@ -274,28 +270,26 @@ impl Processor {
         W: notify::Watcher,
         C: notify_debouncer_full::FileIdCache,
     {
-        if self.roots.contains(&root)
-            && lock(&self.statuses)
-                .get(&root)
-                .is_some_and(|status| status.online)
-        {
-            return Ok(false);
-        }
-        self.roots.insert(root.clone());
         lock(&self.statuses)
             .entry(root.clone())
             .or_insert_with(|| RootStatus::new(&root));
 
         if !root.is_dir() {
             let error = format!("root is unavailable: {}", root.display());
+            eprintln!("[live-index] {error}");
             self.set_offline(&root, error.clone());
             return Err(error);
+        }
+        if self.roots.contains(&root) {
+            return Ok(false);
         }
         if let Err(error) = debouncer.watch(&root, RecursiveMode::Recursive) {
             let error = format!("watch {}: {error}", root.display());
+            eprintln!("[live-index] watcher registration failed: {error}");
             self.set_offline(&root, error.clone());
             return Err(error);
         }
+        self.roots.insert(root.clone());
         self.set_online(&root);
         Ok(true)
     }
@@ -323,9 +317,7 @@ impl Processor {
                         "resync_required",
                         json!({"root_path": root.to_string_lossy()}),
                     );
-                    if let Err(error) = self.reconcile_root(&root) {
-                        self.set_offline(&root, error);
-                    }
+                    self.reconcile_or_set_offline(&root);
                 }
             }
             Err(errors) => {
@@ -336,9 +328,7 @@ impl Processor {
                         "resync_required",
                         json!({"root_path": root.to_string_lossy(), "reason": "watcher_error"}),
                     );
-                    if let Err(error) = self.reconcile_root(&root) {
-                        self.set_offline(&root, error);
-                    }
+                    self.reconcile_or_set_offline(&root);
                 }
             }
         }
@@ -376,14 +366,25 @@ impl Processor {
             return Ok(());
         }
         if matches!(event.kind, EventKind::Create(_)) {
-            for path in &event.paths {
-                self.handle_create_or_modify(path, false)?;
-            }
-            return Ok(());
+            return self.handle_create_or_modify_paths(&event.paths, false);
         }
         if matches!(event.kind, EventKind::Modify(_)) {
-            for path in &event.paths {
-                self.handle_create_or_modify(path, true)?;
+            return self.handle_create_or_modify_paths(&event.paths, true);
+        }
+        Ok(())
+    }
+
+    fn handle_create_or_modify_paths(
+        &mut self,
+        paths: &[PathBuf],
+        force: bool,
+    ) -> Result<(), String> {
+        for path in paths {
+            if let Err(error) = self.handle_create_or_modify(path, force) {
+                eprintln!(
+                    "[live-index] filesystem image failed for {}: {error}",
+                    path.display()
+                );
             }
         }
         Ok(())
@@ -549,9 +550,22 @@ impl Processor {
     }
 
     fn index_subtree(&mut self, root: &Path, directory: &Path) -> Result<(), String> {
-        let paths = collect_image_paths(directory)?;
-        for path in paths {
-            self.index_image(root, &path, false)?;
+        let collection = collect_image_paths(directory)?;
+        let mut failed = collection.failed;
+        for path in collection.paths {
+            if let Err(error) = self.index_image(root, &path, false) {
+                failed += 1;
+                eprintln!(
+                    "[live-index] subtree image failed for {}: {error}",
+                    path.display()
+                );
+            }
+        }
+        if failed > 0 {
+            eprintln!(
+                "[live-index] subtree indexing completed with {failed} failure(s): {}",
+                directory.display()
+            );
         }
         Ok(())
     }
@@ -640,48 +654,82 @@ impl Processor {
         self.hub
             .publish("sync_started", json!({"root_path": root_string(root)}));
 
-        let paths = collect_image_paths(root)?;
+        let collection = collect_image_paths(root)?;
         let conn = open_sqlite_runtime_db(&self.db_path)?;
         let existing = list_sqlite_existing_images_for_root(&conn, &root_string(root))?;
         let existing_by_path = existing
             .iter()
             .map(|image| (image.path.clone(), image.clone()))
             .collect::<HashMap<_, _>>();
-        self.update_status(root, |status| status.total = paths.len());
+        self.update_status(root, |status| status.total = collection.paths.len());
 
-        let mut seen = HashSet::with_capacity(paths.len());
+        let mut seen = HashSet::with_capacity(collection.paths.len());
         let mut changed = 0usize;
-        for (index, path) in paths.iter().enumerate() {
-            let rel = relative_path(root, path)?;
+        let mut failed = collection.failed;
+        for (index, path) in collection.paths.iter().enumerate() {
+            let rel = match relative_path(root, path) {
+                Ok(rel) => rel,
+                Err(error) => {
+                    failed += 1;
+                    eprintln!(
+                        "[live-index] reconcile image failed for {}: {error}",
+                        path.display()
+                    );
+                    self.update_status(root, |status| status.done = index + 1);
+                    continue;
+                }
+            };
             seen.insert(rel.clone());
-            let cheap = cheap_metadata(path)?;
-            let old = existing_by_path.get(&rel);
-            let unchanged = old.is_some_and(|image| {
-                !image.hidden
-                    && image.size == cheap.0
-                    && image.mtime == cheap.1
-                    && image.width > 0
-                    && image.height > 0
-            });
-            if !unchanged {
+            let result = (|| {
+                let cheap = cheap_metadata(path)?;
+                let old = existing_by_path.get(&rel);
+                let unchanged = old.is_some_and(|image| {
+                    !image.hidden
+                        && image.size == cheap.0
+                        && image.mtime == cheap.1
+                        && image.width > 0
+                        && image.height > 0
+                });
+                if unchanged {
+                    return Ok(false);
+                }
                 self.index_image(root, path, false)?;
-                changed += 1;
+                Ok::<bool, String>(true)
+            })();
+            match result {
+                Ok(true) => changed += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    failed += 1;
+                    eprintln!(
+                        "[live-index] reconcile image failed for {}: {error}",
+                        path.display()
+                    );
+                }
             }
             self.update_status(root, |status| status.done = index + 1);
         }
 
         let mut removed = 0usize;
-        for image in existing
-            .iter()
-            .filter(|image| !image.hidden && !seen.contains(&image.path))
-        {
-            if hide_sqlite_image_by_root_path(&conn, &root_string(root), &image.path)?.is_some() {
-                removed += 1;
-                self.hub.publish(
-                    "image_removed",
-                    json!({"root_path": root_string(root), "path": image.path, "image_id": image.id}),
-                );
+        if collection.complete {
+            for image in existing
+                .iter()
+                .filter(|image| !image.hidden && !seen.contains(&image.path))
+            {
+                if hide_sqlite_image_by_root_path(&conn, &root_string(root), &image.path)?.is_some()
+                {
+                    removed += 1;
+                    self.hub.publish(
+                        "image_removed",
+                        json!({"root_path": root_string(root), "path": image.path, "image_id": image.id}),
+                    );
+                }
             }
+        } else {
+            eprintln!(
+                "[live-index] reconciliation traversal was incomplete; skipping removals for {}",
+                root.display()
+            );
         }
         self.update_status(root, |status| {
             status.syncing = false;
@@ -692,12 +740,24 @@ impl Processor {
             "sync_finished",
             json!({
                 "root_path": root_string(root),
-                "total": paths.len(),
+                "total": collection.paths.len(),
                 "changed": changed,
                 "removed": removed,
+                "failed": failed,
+                "traversal_complete": collection.complete,
             }),
         );
         Ok(())
+    }
+
+    fn reconcile_or_set_offline(&mut self, root: &Path) {
+        if let Err(error) = self.reconcile_root(root) {
+            eprintln!(
+                "[live-index] reconciliation failed for {}: {error}",
+                root.display()
+            );
+            self.set_offline(root, error);
+        }
     }
 
     fn root_for_event(&self, event: &Event) -> Option<PathBuf> {
@@ -804,36 +864,80 @@ fn cheap_metadata_from(metadata: &fs::Metadata, path: &Path) -> Result<(i64, i64
     Ok((metadata.len().min(i64::MAX as u64) as i64, mtime))
 }
 
-fn collect_image_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
+#[derive(Default)]
+struct ImagePathCollection {
+    paths: Vec<PathBuf>,
+    complete: bool,
+    failed: usize,
+}
+
+fn collect_image_paths(root: &Path) -> Result<ImagePathCollection, String> {
     if !root.is_dir() {
         return Err(format!("root is unavailable: {}", root.display()));
     }
-    let mut output = Vec::new();
-    collect_directory(root, &mut output)?;
-    output.sort_by(|left, right| {
+    let mut collection = ImagePathCollection {
+        complete: true,
+        ..ImagePathCollection::default()
+    };
+    collect_directory(root, &mut collection, true)?;
+    collection.paths.sort_by(|left, right| {
         left.to_string_lossy()
             .to_lowercase()
             .cmp(&right.to_string_lossy().to_lowercase())
     });
-    Ok(output)
+    Ok(collection)
 }
 
-fn collect_directory(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = fs::read_dir(directory)
-        .map_err(|error| format!("read directory {}: {error}", directory.display()))?;
+fn collect_directory(
+    directory: &Path,
+    collection: &mut ImagePathCollection,
+    is_root: bool,
+) -> Result<(), String> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            let error = format!("read directory {}: {error}", directory.display());
+            if is_root {
+                return Err(error);
+            }
+            eprintln!("[live-index] traversal failed: {error}");
+            collection.complete = false;
+            collection.failed += 1;
+            return Ok(());
+        }
+    };
     for entry in entries {
-        let entry = entry
-            .map_err(|error| format!("read directory entry {}: {error}", directory.display()))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                eprintln!(
+                    "[live-index] traversal failed: read directory entry {}: {error}",
+                    directory.display()
+                );
+                collection.complete = false;
+                collection.failed += 1;
+                continue;
+            }
+        };
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("read file type {}: {error}", path.display()))?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                eprintln!(
+                    "[live-index] traversal failed: read file type {}: {error}",
+                    path.display()
+                );
+                collection.complete = false;
+                collection.failed += 1;
+                continue;
+            }
+        };
         if file_type.is_dir() {
             if entry.file_name() != INDEX_DIR_NAME {
-                collect_directory(&path, output)?;
+                collect_directory(&path, collection, false)?;
             }
         } else if file_type.is_file() && supported_image(&path) {
-            output.push(path);
+            collection.paths.push(path);
         }
     }
     Ok(())
@@ -944,7 +1048,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use image::{Rgb, RgbImage};
-    use tagimage_db::sqlite::{count_sqlite_images, init_sqlite_db};
+    use tagimage_db::sqlite::{
+        count_sqlite_images, hide_sqlite_image_by_root_path, init_sqlite_db,
+        list_sqlite_tags_for_image,
+    };
     use tempfile::tempdir;
 
     fn write_image(path: &Path, color: [u8; 3]) {
@@ -958,6 +1065,35 @@ mod tests {
         RgbImage::from_pixel(width, height, Rgb(color))
             .save(path)
             .unwrap();
+    }
+
+    fn seed_image(conn: &rusqlite::Connection, root: &Path, relative: &str, id: &str) {
+        let path = root.join(relative);
+        let metadata = read_image_metadata(&path).unwrap();
+        upsert_sqlite_image(
+            conn,
+            &SqliteImageUpsert {
+                id: Some(id.to_string()),
+                root_path: root_string(root),
+                path: relative.to_string(),
+                thumb: format!(".imgindex/thumbs/{id}.jpg"),
+                size: metadata.size,
+                mtime: metadata.mtime,
+                width: metadata.width,
+                height: metadata.height,
+                ext: metadata.ext,
+            },
+        )
+        .unwrap();
+    }
+
+    fn hidden_count(conn: &rusqlite::Connection, root: &Path) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM images WHERE root_path = ?1 AND hidden = 1",
+            [root_string(root)],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     fn wait_for(label: &str, timeout: Duration, condition: impl Fn() -> bool) {
@@ -1007,6 +1143,287 @@ mod tests {
             hub.publish("image_updated", json!({"index": index}));
         }
         assert!(hub.replay_after(Some(first.sequence)).gap);
+    }
+
+    #[test]
+    fn reconciliation_restores_existing_hidden_rows_and_adds_missing_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("library");
+        write_image(&root.join("hidden-a.png"), [10, 20, 30]);
+        write_image(&root.join("nested/hidden-b.png"), [40, 50, 60]);
+        write_image(&root.join("missing-from-db.png"), [70, 80, 90]);
+        let db_path = dir.path().join("vilra.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        seed_image(&conn, &root, "hidden-a.png", "hidden-a-id");
+        seed_image(&conn, &root, "nested/hidden-b.png", "hidden-b-id");
+        replace_sqlite_image_tags(&conn, "hidden-a-id", &["Favorite".to_string()], "user").unwrap();
+        hide_sqlite_image_by_root_path(&conn, &root_string(&root), "hidden-a.png").unwrap();
+        hide_sqlite_image_by_root_path(&conn, &root_string(&root), "nested/hidden-b.png").unwrap();
+        assert_eq!(
+            count_sqlite_images(&conn, &[root_string(&root)], false).unwrap(),
+            0
+        );
+        assert_eq!(hidden_count(&conn, &root), 2);
+        drop(conn);
+
+        let hub = EventHub::new();
+        let mut events = hub.subscribe();
+        let indexer = LiveIndexer::start(db_path.clone(), hub, vec![root.clone()]).unwrap();
+        let finished = wait_for_event(
+            "hidden row reconciliation",
+            &mut events,
+            Duration::from_secs(5),
+            |event| event.kind == "sync_finished" || event.kind == "root_offline",
+        );
+        assert_eq!(finished.kind, "sync_finished");
+
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        assert_eq!(
+            count_sqlite_images(&conn, &[root_string(&root)], false).unwrap(),
+            3
+        );
+        assert_eq!(hidden_count(&conn, &root), 0);
+        assert_eq!(
+            get_sqlite_image_by_root_path_including_hidden(
+                &conn,
+                &root_string(&root),
+                "hidden-a.png"
+            )
+            .unwrap()
+            .unwrap()
+            .id,
+            "hidden-a-id"
+        );
+        assert_eq!(
+            get_sqlite_image_by_root_path_including_hidden(
+                &conn,
+                &root_string(&root),
+                "nested/hidden-b.png"
+            )
+            .unwrap()
+            .unwrap()
+            .id,
+            "hidden-b-id"
+        );
+        assert!(get_sqlite_image_by_root_path_including_hidden(
+            &conn,
+            &root_string(&root),
+            "missing-from-db.png"
+        )
+        .unwrap()
+        .is_some_and(|image| !image.hidden));
+        let (_, user_tags) = list_sqlite_tags_for_image(&conn, "hidden-a-id").unwrap();
+        assert_eq!(user_tags, vec!["Favorite"]);
+        assert!(indexer
+            .status()
+            .iter()
+            .any(|status| status.online && !status.syncing));
+        drop(indexer);
+    }
+
+    #[test]
+    fn reconciliation_continues_after_one_bad_image() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("000-bad.jpg"), b"not an image").unwrap();
+        write_image(&root.join("100-good.png"), [10, 20, 30]);
+        let db_path = dir.path().join("vilra.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        seed_image(&conn, &root, "100-good.png", "good-id");
+        hide_sqlite_image_by_root_path(&conn, &root_string(&root), "100-good.png").unwrap();
+        drop(conn);
+
+        let hub = EventHub::new();
+        let mut events = hub.subscribe();
+        let indexer = LiveIndexer::start(db_path.clone(), hub, vec![root.clone()]).unwrap();
+        let finished = wait_for_event(
+            "degraded reconciliation",
+            &mut events,
+            Duration::from_secs(5),
+            |event| event.kind == "sync_finished" || event.kind == "root_offline",
+        );
+        assert_eq!(finished.kind, "sync_finished");
+        assert_eq!(finished.data["failed"], 1);
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        assert!(get_sqlite_image_by_root_path_including_hidden(
+            &conn,
+            &root_string(&root),
+            "100-good.png"
+        )
+        .unwrap()
+        .is_some_and(|image| image.id == "good-id" && !image.hidden));
+        assert!(indexer
+            .status()
+            .iter()
+            .any(|status| status.online && !status.syncing));
+        drop(indexer);
+    }
+
+    #[test]
+    fn adding_an_existing_root_requests_reconciliation() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("library");
+        write_image(&root.join("existing.png"), [10, 20, 30]);
+        let db_path = dir.path().join("vilra.sqlite");
+        drop(init_sqlite_db(&db_path).unwrap());
+        let hub = EventHub::new();
+        let mut events = hub.subscribe();
+        let indexer = LiveIndexer::start(db_path.clone(), hub, vec![root.clone()]).unwrap();
+        wait_for_event(
+            "initial reconciliation",
+            &mut events,
+            Duration::from_secs(5),
+            |event| event.kind == "sync_finished",
+        );
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        let image = get_sqlite_image_by_root_path_including_hidden(
+            &conn,
+            &root_string(&root),
+            "existing.png",
+        )
+        .unwrap()
+        .unwrap();
+        hide_sqlite_image_by_root_path(&conn, &root_string(&root), "existing.png").unwrap();
+        drop(conn);
+
+        indexer.add_root(root.clone()).unwrap();
+        wait_for_event(
+            "explicit reconciliation",
+            &mut events,
+            Duration::from_secs(3),
+            |event| event.kind == "sync_finished",
+        );
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        assert!(get_sqlite_image_by_root_path_including_hidden(
+            &conn,
+            &root_string(&root),
+            "existing.png"
+        )
+        .unwrap()
+        .is_some_and(|row| row.id == image.id && !row.hidden));
+        drop(indexer);
+    }
+
+    #[test]
+    fn subtree_indexing_skips_bad_images_and_continues() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("library");
+        let subtree = root.join("new-directory");
+        fs::create_dir_all(&subtree).unwrap();
+        fs::write(subtree.join("000-bad.jpg"), b"not an image").unwrap();
+        write_image(&subtree.join("100-good.png"), [10, 20, 30]);
+        let db_path = dir.path().join("vilra.sqlite");
+        drop(init_sqlite_db(&db_path).unwrap());
+        let mut processor = Processor {
+            db_path: db_path.clone(),
+            hub: EventHub::new(),
+            statuses: Arc::new(Mutex::new(HashMap::new())),
+            roots: HashSet::from([root.clone()]),
+        };
+
+        assert!(processor.index_subtree(&root, &subtree).is_ok());
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        assert!(get_sqlite_image_by_root_path_including_hidden(
+            &conn,
+            &root_string(&root),
+            "new-directory/100-good.png"
+        )
+        .unwrap()
+        .is_some_and(|image| !image.hidden));
+    }
+
+    #[test]
+    fn create_batch_skips_bad_image_and_indexes_remaining_paths() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).unwrap();
+        let bad = root.join("bad.jpg");
+        let good = root.join("good.png");
+        fs::write(&bad, b"not an image").unwrap();
+        write_image(&good, [10, 20, 30]);
+        let db_path = dir.path().join("vilra.sqlite");
+        drop(init_sqlite_db(&db_path).unwrap());
+        let mut processor = Processor {
+            db_path: db_path.clone(),
+            hub: EventHub::new(),
+            statuses: Arc::new(Mutex::new(HashMap::new())),
+            roots: HashSet::from([root.clone()]),
+        };
+
+        processor
+            .handle_create_or_modify_paths(&[bad, good], false)
+            .unwrap();
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        assert!(get_sqlite_image_by_root_path_including_hidden(
+            &conn,
+            &root_string(&root),
+            "good.png"
+        )
+        .unwrap()
+        .is_some_and(|image| !image.hidden));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_traversal_does_not_hide_unseen_images() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("library");
+        let blocked = root.join("blocked");
+        write_image(&blocked.join("existing.png"), [10, 20, 30]);
+        write_image(&root.join("visible.png"), [40, 50, 60]);
+        let db_path = dir.path().join("vilra.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        seed_image(&conn, &root, "blocked/existing.png", "blocked-id");
+        seed_image(&conn, &root, "visible.png", "visible-id");
+        hide_sqlite_image_by_root_path(&conn, &root_string(&root), "visible.png").unwrap();
+        drop(conn);
+
+        let original_permissions = fs::metadata(&blocked).unwrap().permissions();
+        let mut blocked_permissions = original_permissions.clone();
+        blocked_permissions.set_mode(0);
+        fs::set_permissions(&blocked, blocked_permissions).unwrap();
+        let traversal_is_blocked = fs::read_dir(&blocked).is_err();
+
+        let hub = EventHub::new();
+        let mut events = hub.subscribe();
+        let mut processor = Processor {
+            db_path: db_path.clone(),
+            hub,
+            statuses: Arc::new(Mutex::new(HashMap::new())),
+            roots: HashSet::from([root.clone()]),
+        };
+        let result = processor.reconcile_root(&root);
+        fs::set_permissions(&blocked, original_permissions).unwrap();
+        result.unwrap();
+
+        let finished = wait_for_event(
+            "incomplete traversal",
+            &mut events,
+            Duration::from_secs(1),
+            |event| event.kind == "sync_finished",
+        );
+        if traversal_is_blocked {
+            assert_eq!(finished.data["traversal_complete"], false);
+            assert_eq!(finished.data["failed"], 1);
+        }
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        assert!(get_sqlite_image_by_root_path_including_hidden(
+            &conn,
+            &root_string(&root),
+            "blocked/existing.png"
+        )
+        .unwrap()
+        .is_some_and(|image| image.id == "blocked-id" && !image.hidden));
+        assert!(get_sqlite_image_by_root_path_including_hidden(
+            &conn,
+            &root_string(&root),
+            "visible.png"
+        )
+        .unwrap()
+        .is_some_and(|image| image.id == "visible-id" && !image.hidden));
     }
 
     #[test]

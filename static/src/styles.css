@@ -174,7 +174,7 @@ input::placeholder { color: var(--faint); }
 .folder-sidebar-actions {
   width: 100%;
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 6px;
   align-items: center;
 }
