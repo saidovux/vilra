@@ -18,7 +18,7 @@ use tagimage_db::sqlite::{
     list_sqlite_thumb_rebuild_rows, load_sqlite_session, open_sqlite_runtime_db,
     query_sqlite_images_page, save_sqlite_session_value, set_sqlite_session_root,
     sqlite_roots_from_session, tag_sqlite_summary_rows, update_sqlite_tag_definition,
-    SqliteImagesQuery, SqliteSession,
+    SqliteAutoTagCleanupResult, SqliteImagesQuery, SqliteSession,
 };
 
 const VALID_JOB_STATES: &[&str] = &["queued", "running", "succeeded", "failed", "canceled"];
@@ -41,6 +41,7 @@ pub struct Session {
     pub last_image_id: Option<String>,
     pub tabs: Value,
     pub active_tab_id: Option<String>,
+    pub folder_tag_sync: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +184,7 @@ fn session_from_sqlite(session: SqliteSession) -> Session {
         last_image_id: session.last_image_id,
         tabs: session.tabs,
         active_tab_id: session.active_tab_id,
+        folder_tag_sync: session.folder_tag_sync,
     }
 }
 
@@ -213,6 +215,7 @@ pub fn roots_from_session(session: &Session) -> Vec<String> {
         last_image_id: session.last_image_id.clone(),
         tabs: session.tabs.clone(),
         active_tab_id: session.active_tab_id.clone(),
+        folder_tag_sync: session.folder_tag_sync,
     })
 }
 
@@ -257,6 +260,10 @@ pub fn update_tag_definition(
 
 pub fn delete_tag_definition(conn: &Connection, tag: &str) -> Result<(), ApiError> {
     delete_sqlite_tag_definition(conn, tag).map_err(map_db_error)
+}
+
+pub fn delete_all_auto_tags(conn: &Connection) -> Result<SqliteAutoTagCleanupResult, ApiError> {
+    sqlite::delete_all_sqlite_auto_tags(conn).map_err(map_db_error)
 }
 
 pub fn get_image_record(

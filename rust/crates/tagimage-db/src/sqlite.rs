@@ -73,6 +73,27 @@ pub fn init_sqlite_db(path: &Path) -> Result<Connection, String> {
         tx.execute_batch(statement)
             .map_err(|e| format!("create sqlite table: {e}"))?;
     }
+    let recorded_version = tx
+        .query_row(
+            "SELECT version FROM tagimage_schema_version WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| format!("read sqlite schema version: {e}"))?;
+    if let Some(version) = recorded_version {
+        if !(1..=SQLITE_SCHEMA_VERSION).contains(&version) {
+            return Err(format!(
+                "unsupported sqlite schema version {version}; expected 1..={SQLITE_SCHEMA_VERSION}"
+            ));
+        }
+    }
+    if !sqlite_table_has_column(&tx, "app_session", "folder_tag_sync")? {
+        tx.execute_batch(
+            "ALTER TABLE app_session ADD COLUMN folder_tag_sync INTEGER NOT NULL DEFAULT 1 CHECK (folder_tag_sync IN (0, 1))",
+        )
+        .map_err(|e| format!("migrate sqlite app_session folder_tag_sync: {e}"))?;
+    }
     for statement in INDEX_STATEMENTS {
         tx.execute_batch(statement)
             .map_err(|e| format!("create sqlite index: {e}"))?;
@@ -81,7 +102,9 @@ pub fn init_sqlite_db(path: &Path) -> Result<Connection, String> {
         r#"
         INSERT INTO tagimage_schema_version (id, version)
         VALUES (1, ?1)
-        ON CONFLICT(id) DO NOTHING
+        ON CONFLICT(id) DO UPDATE SET
+            version = excluded.version,
+            applied_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         "#,
         [SQLITE_SCHEMA_VERSION],
     )
@@ -103,6 +126,21 @@ pub fn init_sqlite_db(path: &Path) -> Result<Connection, String> {
     tx.commit()
         .map_err(|e| format!("commit sqlite schema tx: {e}"))?;
     Ok(conn)
+}
+
+fn sqlite_table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| format!("inspect sqlite table {table}: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| format!("query sqlite table {table} columns: {e}"))?;
+    for row in rows {
+        if row.map_err(|e| format!("read sqlite table {table} column: {e}"))? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn enqueue_sqlite_job(
@@ -618,6 +656,47 @@ mod tests {
             )
             .expect("schema version");
         assert_eq!(version, SQLITE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn init_migrates_v1_session_without_losing_data() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = Connection::open(&db_path).expect("open legacy db");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE tagimage_schema_version (
+                id INTEGER PRIMARY KEY,
+                version INTEGER NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO tagimage_schema_version (id, version) VALUES (1, 1);
+            CREATE TABLE app_session (
+                id INTEGER PRIMARY KEY,
+                root_path TEXT,
+                root_paths TEXT NOT NULL DEFAULT '[]',
+                search_tags TEXT NOT NULL DEFAULT '[]',
+                search_mode TEXT NOT NULL DEFAULT 'any',
+                last_image_id TEXT,
+                tabs TEXT NOT NULL DEFAULT '[]',
+                active_tab_id TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO app_session (id, root_path, root_paths)
+            VALUES (1, '/legacy', '["/legacy"]');
+            "#,
+        )
+        .expect("seed v1 schema");
+        drop(conn);
+
+        let conn = init_sqlite_db(&db_path).expect("migrate v1");
+        let row: (i64, String, i64) = conn
+            .query_row(
+                "SELECT v.version, s.root_path, s.folder_tag_sync FROM tagimage_schema_version v JOIN app_session s ON s.id = v.id WHERE v.id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("migrated session");
+        assert_eq!(row, (SQLITE_SCHEMA_VERSION, "/legacy".to_string(), 1));
     }
 
     #[test]

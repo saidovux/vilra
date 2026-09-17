@@ -1,4 +1,4 @@
-pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 1;
+pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 2;
 
 pub(crate) const TABLE_STATEMENTS: &[&str] = &[
     r#"
@@ -61,6 +61,7 @@ pub(crate) const TABLE_STATEMENTS: &[&str] = &[
         last_image_id TEXT,
         tabs TEXT NOT NULL DEFAULT '[]',
         active_tab_id TEXT,
+        folder_tag_sync INTEGER NOT NULL DEFAULT 1 CHECK (folder_tag_sync IN (0, 1)),
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     )
     "#,

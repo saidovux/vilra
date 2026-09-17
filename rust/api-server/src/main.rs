@@ -60,6 +60,10 @@ async fn run() -> Result<(), String> {
             "/api/tags/:tag",
             patch(handlers::update_tag).delete(handlers::delete_tag),
         )
+        .route(
+            "/api/auto-tags",
+            axum::routing::delete(handlers::delete_auto_tags),
+        )
         .route("/api/tag/:img_id", post(handlers::set_image_tags))
         .route(
             "/api/session",

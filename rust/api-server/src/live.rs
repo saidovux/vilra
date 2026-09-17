@@ -14,8 +14,9 @@ use tagimage_db::sqlite::{
     enqueue_sqlite_thumb_job, get_sqlite_image_api_value,
     get_sqlite_image_by_root_path_including_hidden, hide_sqlite_image_by_root_path,
     hide_sqlite_images_under_path, list_sqlite_existing_images_for_root, open_sqlite_runtime_db,
-    rename_sqlite_image_path, rename_sqlite_images_under_path, replace_sqlite_image_tags,
-    retarget_sqlite_active_image_jobs, upsert_sqlite_image, SqliteImageUpsert,
+    rename_sqlite_image_path, rename_sqlite_images_under_path, retarget_sqlite_active_image_jobs,
+    sqlite_folder_tag_sync_enabled, sync_sqlite_image_auto_tags, upsert_sqlite_image,
+    SqliteImageUpsert,
 };
 use tokio::sync::broadcast;
 
@@ -151,6 +152,7 @@ enum LiveCommand {
         root: PathBuf,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
+    ReconcileRoot(PathBuf),
     Filesystem(DebounceEventResult),
     Shutdown,
 }
@@ -224,6 +226,11 @@ impl LiveIndexer {
                                 processor.reconcile_or_set_offline(&root);
                             }
                         }
+                        LiveCommand::ReconcileRoot(root) => {
+                            if processor.roots.contains(&root) {
+                                processor.reconcile_or_set_offline(&root);
+                            }
+                        }
                         LiveCommand::Filesystem(result) => {
                             processor.handle_filesystem_result(result)
                         }
@@ -247,6 +254,13 @@ impl LiveIndexer {
         response
             .recv()
             .map_err(|_| "filesystem event processor stopped while adding root".to_string())?
+    }
+
+    pub fn request_reconcile(&self, root: PathBuf) -> Result<(), String> {
+        self.inner
+            .commands
+            .send(LiveCommand::ReconcileRoot(root))
+            .map_err(|_| "filesystem event processor is not running".to_string())
     }
 
     pub fn status(&self) -> Vec<RootStatus> {
@@ -491,7 +505,7 @@ impl Processor {
                         &image.thumb,
                         image.mtime,
                     )?;
-                    replace_sqlite_image_tags(&conn, &image.id, &folder_tags(&new_rel), "auto")?;
+                    sync_folder_tags(&conn, &image.id, &new_rel)?;
                     let image = get_sqlite_image_api_value(&conn, &image.id)?;
                     self.hub.publish(
                         "image_renamed",
@@ -527,7 +541,7 @@ impl Processor {
                         &image.thumb,
                         image.mtime,
                     )?;
-                    replace_sqlite_image_tags(&conn, &image.id, &folder_tags(&image.path), "auto")?;
+                    sync_folder_tags(&conn, &image.id, &image.path)?;
                     let image_value = get_sqlite_image_api_value(&conn, &image.id)?;
                     self.hub.publish(
                         "image_renamed",
@@ -633,8 +647,7 @@ impl Processor {
             },
         )
         .map_err(ImageIndexError::Database)?;
-        replace_sqlite_image_tags(&conn, &image_id, &folder_tags(&rel), "auto")
-            .map_err(ImageIndexError::Database)?;
+        sync_folder_tags(&conn, &image_id, &rel).map_err(ImageIndexError::Database)?;
         enqueue_sqlite_thumb_job(
             &conn,
             &image_id,
@@ -646,8 +659,8 @@ impl Processor {
             THUMB_MAX_ATTEMPTS,
         )
         .map_err(ImageIndexError::Database)?;
-        let image = get_sqlite_image_api_value(&conn, &image_id)
-            .map_err(ImageIndexError::Database)?;
+        let image =
+            get_sqlite_image_api_value(&conn, &image_id).map_err(ImageIndexError::Database)?;
         let event = if existing.is_none() || restored {
             "image_created"
         } else {
@@ -676,6 +689,7 @@ impl Processor {
 
         let collection = collect_image_paths(root)?;
         let conn = open_sqlite_runtime_db(&self.db_path)?;
+        let folder_tag_sync = sqlite_folder_tag_sync_enabled(&conn)?;
         let existing = list_sqlite_existing_images_for_root(&conn, &root_string(root))?;
         let existing_by_path = existing
             .iter()
@@ -721,7 +735,13 @@ impl Processor {
                     && image.width > 0
                     && image.height > 0
             });
-            if !unchanged {
+            if unchanged && folder_tag_sync {
+                if let Some(old) = old {
+                    if sync_sqlite_image_auto_tags(&conn, &old.id, &folder_tags(&rel))? {
+                        changed += 1;
+                    }
+                }
+            } else if !unchanged {
                 match self.index_image(root, path, false) {
                     Ok(_) => changed += 1,
                     Err(ImageIndexError::File(error)) => {
@@ -1044,6 +1064,17 @@ fn folder_tags(relative: &str) -> Vec<String> {
         .collect()
 }
 
+fn sync_folder_tags(
+    conn: &rusqlite::Connection,
+    image_id: &str,
+    relative: &str,
+) -> Result<bool, String> {
+    if !sqlite_folder_tag_sync_enabled(conn)? {
+        return Ok(false);
+    }
+    sync_sqlite_image_auto_tags(conn, image_id, &folder_tags(relative))
+}
+
 fn root_string(root: &Path) -> String {
     root.to_string_lossy().to_string()
 }
@@ -1077,7 +1108,7 @@ mod tests {
     use image::{Rgb, RgbImage};
     use tagimage_db::sqlite::{
         count_sqlite_images, hide_sqlite_image_by_root_path, init_sqlite_db,
-        list_sqlite_tags_for_image,
+        list_sqlite_tags_for_image, replace_sqlite_image_tags, set_sqlite_folder_tag_sync,
     };
     use tempfile::tempdir;
 
@@ -1753,5 +1784,117 @@ mod tests {
                 .is_some_and(|image| !image.hidden)
         });
         drop(second);
+    }
+
+    #[test]
+    fn folder_tag_sync_tracks_index_and_directory_rename_without_losing_user_tags() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("library");
+        let old_dir = root.join("cosplay/character");
+        let image_path = old_dir.join("photo.png");
+        write_image(&image_path, [12, 34, 56]);
+        let db_path = dir.path().join("vilra.sqlite");
+        drop(init_sqlite_db(&db_path).unwrap());
+        let mut processor = Processor {
+            db_path: db_path.clone(),
+            hub: EventHub::new(),
+            statuses: Arc::new(Mutex::new(HashMap::new())),
+            roots: HashSet::from([root.clone()]),
+        };
+
+        let image_id = processor
+            .index_image(&root, &image_path, false)
+            .unwrap()
+            .unwrap();
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        replace_sqlite_image_tags(&conn, &image_id, &["Favorite".to_string()], "user").unwrap();
+        assert_eq!(
+            list_sqlite_tags_for_image(&conn, &image_id).unwrap(),
+            (
+                vec!["character".to_string(), "cosplay".to_string()],
+                vec!["Favorite".to_string()]
+            )
+        );
+        drop(conn);
+
+        let new_dir = root.join("cosplay/costume");
+        fs::rename(&old_dir, &new_dir).unwrap();
+        processor.handle_rename(&old_dir, &new_dir).unwrap();
+
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        let renamed = get_sqlite_image_by_root_path_including_hidden(
+            &conn,
+            &root_string(&root),
+            "cosplay/costume/photo.png",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(renamed.id, image_id);
+        assert_eq!(
+            list_sqlite_tags_for_image(&conn, &image_id).unwrap(),
+            (
+                vec!["cosplay".to_string(), "costume".to_string()],
+                vec!["Favorite".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn disabled_folder_tag_sync_preserves_assignments_until_reenabled() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("library");
+        let old_dir = root.join("existing");
+        let old_image = old_dir.join("photo.png");
+        write_image(&old_image, [11, 22, 33]);
+        let db_path = dir.path().join("vilra.sqlite");
+        drop(init_sqlite_db(&db_path).unwrap());
+        let mut processor = Processor {
+            db_path: db_path.clone(),
+            hub: EventHub::new(),
+            statuses: Arc::new(Mutex::new(HashMap::new())),
+            roots: HashSet::from([root.clone()]),
+        };
+
+        let existing_id = processor
+            .index_image(&root, &old_image, false)
+            .unwrap()
+            .unwrap();
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        replace_sqlite_image_tags(&conn, &existing_id, &["Favorite".to_string()], "user").unwrap();
+        set_sqlite_folder_tag_sync(&conn, false).unwrap();
+        drop(conn);
+
+        let renamed_dir = root.join("renamed");
+        fs::rename(&old_dir, &renamed_dir).unwrap();
+        processor.handle_rename(&old_dir, &renamed_dir).unwrap();
+        let new_image = root.join("fresh/inside.png");
+        write_image(&new_image, [44, 55, 66]);
+        let fresh_id = processor
+            .index_image(&root, &new_image, false)
+            .unwrap()
+            .unwrap();
+
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        assert_eq!(
+            list_sqlite_tags_for_image(&conn, &existing_id).unwrap(),
+            (vec!["existing".to_string()], vec!["Favorite".to_string()])
+        );
+        assert_eq!(
+            list_sqlite_tags_for_image(&conn, &fresh_id).unwrap(),
+            (Vec::new(), Vec::new())
+        );
+        set_sqlite_folder_tag_sync(&conn, true).unwrap();
+        drop(conn);
+
+        processor.reconcile_root(&root).unwrap();
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        assert_eq!(
+            list_sqlite_tags_for_image(&conn, &existing_id).unwrap(),
+            (vec!["renamed".to_string()], vec!["Favorite".to_string()])
+        );
+        assert_eq!(
+            list_sqlite_tags_for_image(&conn, &fresh_id).unwrap().0,
+            vec!["fresh"]
+        );
     }
 }

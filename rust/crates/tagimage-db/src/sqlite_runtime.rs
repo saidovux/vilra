@@ -35,6 +35,7 @@ pub struct SqliteSession {
     pub last_image_id: Option<String>,
     pub tabs: JsonValue,
     pub active_tab_id: Option<String>,
+    pub folder_tag_sync: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,6 +131,12 @@ pub struct SqliteCleanupResult {
     pub removed_jobs: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqliteAutoTagCleanupResult {
+    pub assignments_removed: i64,
+    pub tags_removed: i64,
+}
+
 #[derive(Debug, Clone)]
 struct SqliteImageListRow {
     id: String,
@@ -158,6 +165,8 @@ struct TagLookup {
     name: String,
     normalized: String,
     auto_count: i64,
+    user_count: i64,
+    user_defined: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1018,15 +1027,26 @@ pub fn tag_sqlite_summary_rows(conn: &Connection) -> Result<Vec<JsonValue>, Stri
     let rows = stmt
         .query_map([], |row| {
             let auto_count = row.get::<_, i64>("auto_count")?;
+            let user_count = row.get::<_, i64>("user_count")?;
+            let user_defined = row.get::<_, i64>("user_defined")? != 0;
+            let mut sources = Vec::new();
+            if auto_count > 0 {
+                sources.push("auto");
+            }
+            if user_defined || user_count > 0 {
+                sources.push("user");
+            }
             Ok(json!({
                 "name": row.get::<_, String>("name")?,
                 "normalized": row.get::<_, String>("normalized")?,
                 "color": row.get::<_, Option<String>>("color")?,
                 "image_count": row.get::<_, i64>("image_count")?,
                 "auto_count": auto_count,
-                "user_count": row.get::<_, i64>("user_count")?,
-                "user_defined": row.get::<_, i64>("user_defined")? != 0,
+                "user_count": user_count,
+                "user_defined": user_defined,
                 "is_auto": auto_count > 0,
+                "source": if auto_count > 0 { "auto" } else { "user" },
+                "sources": sources,
             }))
         })
         .map_err(|e| format!("query sqlite tag summary: {e}"))?;
@@ -1193,10 +1213,71 @@ pub fn delete_sqlite_tag_definition(conn: &Connection, tag: &str) -> Result<(), 
                 params![row.normalized, row.name],
             )
             .map_err(|e| format!("insert sqlite suppressed auto tag: {e}"))?;
+            conn.execute(
+                "DELETE FROM image_tags WHERE tag_id = ?1 AND kind = 'auto'",
+                params![row.id],
+            )
+            .map_err(|e| format!("delete sqlite auto tag links: {e}"))?;
+        }
+        if row.user_defined || row.user_count > 0 {
+            return Ok(());
         }
         conn.execute("DELETE FROM tags WHERE id = ?1", params![row.id])
             .map_err(|e| format!("delete sqlite tag: {e}"))?;
         Ok(())
+    })
+}
+
+pub fn sqlite_folder_tag_sync_enabled(conn: &Connection) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT folder_tag_sync FROM app_session WHERE id = 1",
+        [],
+        |row| Ok(row.get::<_, i64>(0)? != 0),
+    )
+    .optional()
+    .map(|value| value.unwrap_or(true))
+    .map_err(|e| format!("read sqlite folder tag sync setting: {e}"))
+}
+
+pub fn set_sqlite_folder_tag_sync(conn: &Connection, enabled: bool) -> Result<bool, String> {
+    conn.execute(
+        r#"
+        INSERT INTO app_session (id, folder_tag_sync)
+        VALUES (1, ?1)
+        ON CONFLICT(id) DO UPDATE SET
+            folder_tag_sync = excluded.folder_tag_sync,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        "#,
+        params![if enabled { 1 } else { 0 }],
+    )
+    .map_err(|e| format!("save sqlite folder tag sync setting: {e}"))?;
+    Ok(enabled)
+}
+
+pub fn delete_all_sqlite_auto_tags(
+    conn: &Connection,
+) -> Result<SqliteAutoTagCleanupResult, String> {
+    with_immediate_tx(conn, || {
+        let assignments_removed = conn
+            .execute("DELETE FROM image_tags WHERE kind = 'auto'", [])
+            .map_err(|e| format!("delete sqlite auto tag assignments: {e}"))?
+            as i64;
+        let tags_removed =
+            conn.execute(
+                r#"
+                DELETE FROM tags
+                WHERE user_defined = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM image_tags WHERE image_tags.tag_id = tags.id
+                  )
+                "#,
+                [],
+            )
+            .map_err(|e| format!("delete sqlite orphan auto tags: {e}"))? as i64;
+        Ok(SqliteAutoTagCleanupResult {
+            assignments_removed,
+            tags_removed,
+        })
     })
 }
 
@@ -1276,6 +1357,29 @@ pub fn replace_sqlite_image_user_tags(
     tags: &[String],
 ) -> Result<(), String> {
     replace_sqlite_image_tags(conn, image_id, tags, "user")
+}
+
+pub fn sync_sqlite_image_auto_tags(
+    conn: &Connection,
+    image_id: &str,
+    tags: &[String],
+) -> Result<bool, String> {
+    let desired = filter_sqlite_suppressed_auto_tags(conn, tags)?;
+    let (current, _) = list_sqlite_tags_for_image(conn, image_id)?;
+    let normalized = |values: &[String]| {
+        let mut values = values
+            .iter()
+            .map(|value| normalize_sqlite_tag(value))
+            .collect::<Vec<_>>();
+        values.sort();
+        values.dedup();
+        values
+    };
+    if normalized(&current) == normalized(&desired) {
+        return Ok(false);
+    }
+    replace_sqlite_image_tags(conn, image_id, &desired, "auto")?;
+    Ok(true)
 }
 
 pub fn list_sqlite_tags_for_image(
@@ -1360,7 +1464,8 @@ pub fn load_sqlite_session(conn: &Connection) -> Result<SqliteSession, String> {
     let row = conn
         .query_row(
             r#"
-            SELECT root_path, root_paths, search_tags, search_mode, last_image_id, tabs, active_tab_id
+            SELECT root_path, root_paths, search_tags, search_mode, last_image_id, tabs, active_tab_id,
+                   folder_tag_sync
             FROM app_session
             WHERE id = 1
             "#,
@@ -1379,6 +1484,7 @@ pub fn load_sqlite_session(conn: &Connection) -> Result<SqliteSession, String> {
                     last_image_id: row.get("last_image_id")?,
                     tabs: parse_json_text(&tabs, json!([])),
                     active_tab_id: row.get("active_tab_id")?,
+                    folder_tag_sync: row.get::<_, i64>("folder_tag_sync")? != 0,
                 })
             },
         )
@@ -1434,6 +1540,9 @@ pub fn save_sqlite_session_value(
             .and_then(JsonValue::as_str)
             .map(|item| item.to_string());
     }
+    if let Some(value) = object.get("folder_tag_sync").and_then(JsonValue::as_bool) {
+        session.folder_tag_sync = value;
+    }
 
     let root_paths = json_text(&session.root_paths)?;
     let search_tags = json_text(&session.search_tags)?;
@@ -1453,6 +1562,7 @@ pub fn save_sqlite_session_value(
             last_image_id = ?5,
             tabs = ?6,
             active_tab_id = ?7,
+            folder_tag_sync = ?8,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         WHERE id = 1
         "#,
@@ -1464,6 +1574,7 @@ pub fn save_sqlite_session_value(
             session.last_image_id,
             tabs,
             session.active_tab_id,
+            if session.folder_tag_sync { 1 } else { 0 },
         ],
     )
     .map_err(|e| format!("save sqlite session: {e}"))?;
@@ -2259,7 +2370,9 @@ fn find_sqlite_tag_lookup(conn: &Connection, norm: &str) -> Result<Option<TagLoo
             t.id,
             t.name,
             t.normalized,
-            COUNT(DISTINCT CASE WHEN it.kind = 'auto' THEN it.image_id END) AS auto_count
+            t.user_defined,
+            COUNT(DISTINCT CASE WHEN it.kind = 'auto' THEN it.image_id END) AS auto_count,
+            COUNT(DISTINCT CASE WHEN it.kind = 'user' THEN it.image_id END) AS user_count
         FROM tags t
         LEFT JOIN image_tags it ON it.tag_id = t.id
         WHERE t.normalized = ?1
@@ -2272,6 +2385,8 @@ fn find_sqlite_tag_lookup(conn: &Connection, norm: &str) -> Result<Option<TagLoo
                 name: row.get("name")?,
                 normalized: row.get("normalized")?,
                 auto_count: row.get("auto_count")?,
+                user_count: row.get("user_count")?,
+                user_defined: row.get::<_, i64>("user_defined")? != 0,
             })
         },
     )
@@ -2349,6 +2464,7 @@ fn default_session() -> SqliteSession {
         last_image_id: None,
         tabs: json!([]),
         active_tab_id: None,
+        folder_tag_sync: true,
     }
 }
 
@@ -3019,6 +3135,48 @@ mod tests {
         let folders = folder_sqlite_tree_rows(&conn, &[root]).expect("folders");
         assert_eq!(folders[0]["path"], "animals/cat.jpg");
         assert_eq!(folders[1]["path"], "zebra.jpg");
+    }
+
+    #[test]
+    fn folder_tag_sync_toggle_and_cleanup_preserve_user_tags() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        upsert_fixture(&conn, "img-1", "/photos", "folder/one.jpg", 10, 10);
+        upsert_fixture(&conn, "img-2", "/photos", "other/two.jpg", 20, 20);
+
+        replace_sqlite_image_tags(&conn, "img-1", &["Shared".to_string()], "auto")
+            .expect("shared auto tag");
+        replace_sqlite_image_tags(&conn, "img-1", &["Shared".to_string()], "user")
+            .expect("shared user tag");
+        replace_sqlite_image_tags(&conn, "img-2", &["Auto only".to_string()], "auto")
+            .expect("auto-only tag");
+        replace_sqlite_image_tags(&conn, "img-2", &["Favorite".to_string()], "user")
+            .expect("user-only tag");
+
+        assert!(sqlite_folder_tag_sync_enabled(&conn).expect("default setting"));
+        set_sqlite_folder_tag_sync(&conn, false).expect("disable sync");
+        assert!(!sqlite_folder_tag_sync_enabled(&conn).expect("disabled setting"));
+        assert_eq!(
+            list_sqlite_tags_for_image(&conn, "img-1").expect("tags while disabled"),
+            (vec!["Shared".to_string()], vec!["Shared".to_string()])
+        );
+
+        let result = delete_all_sqlite_auto_tags(&conn).expect("delete auto tags");
+        assert_eq!(result.assignments_removed, 2);
+        assert_eq!(result.tags_removed, 1);
+        assert_eq!(
+            list_sqlite_tags_for_image(&conn, "img-1").expect("shared user tag remains"),
+            (Vec::new(), vec!["Shared".to_string()])
+        );
+        assert_eq!(
+            list_sqlite_tags_for_image(&conn, "img-2").expect("favorite remains"),
+            (Vec::new(), vec!["Favorite".to_string()])
+        );
+        let summaries = tag_sqlite_summary_rows(&conn).expect("tag summaries");
+        assert!(summaries.iter().any(|tag| {
+            tag["normalized"] == "shared" && tag["source"] == "user" && tag["is_auto"] == false
+        }));
+        assert!(!summaries.iter().any(|tag| tag["normalized"] == "auto only"));
     }
 
     #[test]

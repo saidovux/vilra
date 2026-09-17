@@ -22,22 +22,36 @@
   </section>
 
   <section id="gallery-screen" style="display:none;">
-    <aside id="folder-sidebar" class="collapsed" aria-label="Подключённые папки">
+    <aside id="folder-sidebar" class="collapsed" aria-label="Теги и библиотеки">
       <div id="folder-sidebar-panel">
-        <div class="folder-sidebar-head">
-          <div>
-            <span>Папки</span>
-            <small>Можно добавить несколько путей</small>
+        <section class="sidebar-section sidebar-tags-section">
+          <div class="sidebar-section-head">
+            <span>Теги</span>
+            <small id="sidebar-tag-total">0</small>
           </div>
-          <div class="folder-sidebar-actions">
-            <button class="btn btn-primary btn-sm folder-open-btn" type="button" data-action="pick-folder">Открыть папку</button>
+          <input id="sidebar-tag-search" class="sidebar-search" type="search" placeholder="Поиск по тегам" autocomplete="off">
+          <div class="sidebar-tag-scroll">
+            <div class="sidebar-tag-group">
+              <div class="sidebar-tag-group-title">Из папок</div>
+              <div id="sidebar-auto-tags" class="sidebar-tag-list"></div>
+            </div>
+            <div class="sidebar-tag-group">
+              <div class="sidebar-tag-group-title">Пользовательские</div>
+              <div id="sidebar-user-tags" class="sidebar-tag-list"></div>
+            </div>
           </div>
-        </div>
-        <div id="folder-tree"></div>
+        </section>
+        <section class="sidebar-section sidebar-library-section">
+          <div class="sidebar-section-head">
+            <span>Библиотека</span>
+            <button class="btn btn-ghost btn-sm folder-open-btn" type="button" data-action="pick-folder">Добавить</button>
+          </div>
+          <div id="folder-tree"></div>
+        </section>
       </div>
     </aside>
     <header id="topbar">
-      <button id="folder-sidebar-toggle" type="button" data-action="toggle-folder-sidebar" title="Папки">☰</button>
+      <button id="folder-sidebar-toggle" type="button" data-action="toggle-folder-sidebar" title="Навигация">☰</button>
       <div id="tabbar">
         <div id="tabs"></div>
         <button id="add-tab-btn" class="btn btn-ghost icon-btn" data-action="add-tab" title="Новая вкладка">+</button>
@@ -83,6 +97,26 @@
             </div>
           </section>
           <section class="settings-panel-page" data-settings-panel="tags">
+            <div class="settings-section settings-tag-sync">
+              <div class="settings-section-head">
+                <div>
+                  <h3>Автоматические теги</h3>
+                  <div class="settings-note">Организация библиотеки по структуре каталогов</div>
+                </div>
+                <label class="switch" title="Синхронизировать папки с тегами">
+                  <input id="folder-tag-sync-toggle" type="checkbox" data-action="toggle-folder-tag-sync">
+                  <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+                </label>
+              </div>
+              <div class="settings-note">Новые папки создают auto-tags. Отключение останавливает синхронизацию, но не удаляет уже созданные теги.</div>
+              <div class="settings-danger-row">
+                <div>
+                  <strong>Удалить папочные auto-tags</strong>
+                  <span>Ручные теги, изображения и их ID останутся без изменений.</span>
+                </div>
+                <button class="btn btn-danger btn-sm" type="button" data-action="delete-all-auto-tags">Удалить auto-tags</button>
+              </div>
+            </div>
             <div class="settings-section">
               <div class="settings-section-head">
                 <h3>Теги</h3>

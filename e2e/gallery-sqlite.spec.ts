@@ -7,6 +7,17 @@ type ImageItem = {
   path: string;
   thumb_url?: string;
   width?: number;
+  auto_tags?: string[];
+  user_tags?: string[];
+};
+
+type TagItem = {
+  name: string;
+  image_count: number;
+  auto_count: number;
+  user_count: number;
+  source: 'auto' | 'user';
+  sources: Array<'auto' | 'user'>;
 };
 
 const fatalMessages = [
@@ -41,6 +52,14 @@ async function imageItems(page: Page, limit = 120): Promise<ImageItem[]> {
   const data = await response.json();
   expect(Array.isArray(data.items)).toBeTruthy();
   return data.items;
+}
+
+async function tagItems(page: Page): Promise<TagItem[]> {
+  const response = await page.request.get('/api/tags');
+  expect(response.ok()).toBeTruthy();
+  const data = await response.json();
+  expect(Array.isArray(data.tags)).toBeTruthy();
+  return data.tags;
 }
 
 async function clickCardAndExpectPreview(page: Page, cardIndex: number): Promise<string> {
@@ -89,6 +108,7 @@ test.beforeEach(async ({ page }) => {
       last_image_id: null,
       tabs: [],
       active_tab_id: null,
+      folder_tag_sync: true,
     },
   }).catch(() => undefined);
 });
@@ -191,6 +211,10 @@ test('live filesystem create rename move modify and delete need no refresh', asy
   } finally {
     for (const candidate of [created, renamed, moved]) fs.rmSync(candidate, {force: true});
     fs.rmSync(newDir, {recursive: true, force: true});
+    await expect.poll(async () => {
+      const items = await imageItems(page);
+      return items.some(item => item.path.startsWith('live-'));
+    }, {timeout: 15_000}).toBe(false);
   }
 });
 
@@ -230,10 +254,10 @@ test('delete and recreate at the same path restores the card and total', async (
 });
 
 test('/file id API returns originals and cleanly rejects unknown ids', async ({ page }) => {
-  const [image] = await imageItems(page, 10);
+  const image = (await imageItems(page, 20)).find(item => item.path.startsWith('batch-'));
   expect(image?.id).toBeTruthy();
 
-  const valid = await page.request.get(`/file/${image.id}`);
+  const valid = await page.request.get(`/file/${image?.id}`);
   expect(valid.status()).toBe(200);
   expect(valid.headers()['content-type']).toMatch(/^image\//);
 
@@ -253,4 +277,93 @@ test('original opening is independent from thumbnail state', async ({ page }) =>
   await clickCardAndExpectPreview(page, 0);
   await expect(page.locator('#preview-open')).toHaveAttribute('href', `/file/${imageId}`);
   await closePreview(page);
+});
+
+test('sidebar exposes folder tags above physical libraries and filters by multiple tags', async ({ page }) => {
+  await waitForGallery(page);
+  await page.locator('#folder-sidebar-toggle').click();
+  await expect(page.locator('#folder-sidebar')).not.toHaveClass(/collapsed/);
+
+  const autoGroup = page.locator('.sidebar-tags-section');
+  const libraryGroup = page.locator('.sidebar-library-section');
+  const autoBox = await autoGroup.boundingBox();
+  const libraryBox = await libraryGroup.boundingBox();
+  expect(autoBox?.y).toBeLessThan(libraryBox?.y || 0);
+
+  const batchA = page.locator('[data-sidebar-tag="batch-a"]');
+  await expect(batchA).toBeVisible();
+  await expect(batchA.locator('.auto-label')).toHaveText('AUTO');
+  await expect(batchA.locator('.sidebar-tag-count')).toHaveText('36');
+  await expect(page.locator('.library-root')).toHaveCount(1);
+  await expect(page.locator('.library-root-path')).toContainText(fixtureRoot());
+
+  await batchA.click();
+  await expect(batchA).toHaveClass(/selected/);
+  await expect.poll(async () => Number((await page.locator('#count-text').textContent())?.match(/\d+/)?.[0] || 0))
+    .toBe(36);
+  const paths = await page.locator('.card-name').allTextContents();
+  expect(paths.length).toBeGreaterThan(0);
+  expect(paths.every(value => value.includes('fixture-'))).toBeTruthy();
+
+  await batchA.click();
+  await expect(batchA).not.toHaveClass(/selected/);
+});
+
+test('folder tag setting pauses sync and destructive cleanup preserves user tags', async ({ page }) => {
+  await waitForGallery(page);
+  const root = fixtureRoot();
+  const source = path.join(root, 'batch-a', 'fixture-001.png');
+  const newDir = path.join(root, 'sync-off');
+  const newImage = path.join(newDir, 'inside.png');
+  const keepTag = 'E2E Keep';
+  fs.rmSync(newDir, {recursive: true, force: true});
+
+  const [target] = await imageItems(page, 10);
+  expect(target?.id).toBeTruthy();
+  await page.request.post('/api/tags', {data: {name: keepTag}});
+  await page.request.post(`/api/tag/${target.id}`, {data: {tags: [keepTag]}});
+
+  try {
+    await page.locator('#settings-toggle').click();
+    await page.locator('[data-settings-tab="tags"]').click();
+    const toggle = page.locator('#folder-tag-sync-toggle');
+    await expect(toggle).toBeChecked();
+    await toggle.uncheck();
+    await expect.poll(async () => {
+      const session = await (await page.request.get('/api/session')).json();
+      return session.folder_tag_sync;
+    }).toBe(false);
+
+    fs.mkdirSync(newDir);
+    fs.copyFileSync(source, newImage);
+    await expect.poll(async () => {
+      const items = await imageItems(page);
+      return items.find(item => item.path === 'sync-off/inside.png')?.auto_tags || null;
+    }, {timeout: 15_000}).toEqual([]);
+    expect((await tagItems(page)).some(tag => tag.name === 'batch-a' && tag.auto_count > 0)).toBeTruthy();
+
+    page.once('dialog', dialog => dialog.accept());
+    await page.locator('[data-action="delete-all-auto-tags"]').click();
+    await expect.poll(async () => (await tagItems(page)).every(tag => tag.auto_count === 0))
+      .toBe(true);
+    const afterCleanup = await imageItems(page);
+    expect(afterCleanup.find(item => item.id === target.id)?.user_tags).toContain(keepTag);
+    expect((await tagItems(page)).some(tag => tag.name === keepTag && tag.user_count === 1)).toBeTruthy();
+
+    await toggle.check();
+    await expect.poll(async () => {
+      const session = await (await page.request.get('/api/session')).json();
+      return session.folder_tag_sync;
+    }).toBe(true);
+    await expect.poll(async () => {
+      const items = await imageItems(page);
+      return items.find(item => item.path === 'sync-off/inside.png')?.auto_tags || [];
+    }, {timeout: 20_000}).toContain('sync-off');
+    await expect.poll(async () => (await tagItems(page)).some(tag => tag.source === 'auto' && tag.sources.includes('auto')))
+      .toBe(true);
+  } finally {
+    await page.request.patch('/api/session', {data: {folder_tag_sync: true}}).catch(() => undefined);
+    await page.request.delete(`/api/tags/${encodeURIComponent(keepTag)}`).catch(() => undefined);
+    fs.rmSync(newDir, {recursive: true, force: true});
+  }
 });

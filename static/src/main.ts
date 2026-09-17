@@ -14,7 +14,10 @@ interface TagMeta {
   image_count: number;
   auto_count: number;
   user_count: number;
+  user_defined: boolean;
   is_auto: boolean;
+  source: 'auto' | 'user';
+  sources: Array<'auto' | 'user'>;
 }
 
 interface ImageItem {
@@ -41,16 +44,6 @@ interface GalleryTab {
   sortMode: SortMode;
   lastImageId: string | null;
   scrollTop: number;
-}
-
-interface FolderTreeItem {
-  root_path: string;
-  path: string;
-}
-
-interface FolderNode {
-  name: string;
-  children: Map<string, FolderNode>;
 }
 
 interface StatusResponse {
@@ -542,7 +535,7 @@ let visibleImages: ImageItem[] = [];
 let allTagPool: string[] = [];
 let allTagMeta: Map<string, TagMeta> = new Map();
 let scannedRoots: string[] = [];
-let folderTreeItems: FolderTreeItem[] = [];
+let folderTagSync = true;
 let tabs: GalleryTab[] = [];
 let activeTabId: string | null = null;
 let lbIndex = -1;
@@ -718,12 +711,6 @@ async function refreshFolderTree() {
     const data = await readJsonRecord(r);
     const roots = stringArray(data.roots);
     if (roots.length) scannedRoots = roots;
-    folderTreeItems = Array.isArray(data.items)
-      ? data.items.filter(isRecord).map(item => ({
-        root_path: String(item.root_path || ''),
-        path: String(item.path || '')
-      })).filter(item => item.root_path && item.path)
-      : [];
     renderFolderTree();
     updateRootSummary();
   } catch {}
@@ -755,67 +742,17 @@ function pathName(path: string): string {
   return parts[parts.length - 1] || path || 'Папка';
 }
 
-function makeFolderNode(name: string): FolderNode {
-  return {name, children: new Map()};
-}
-
-function buildFolderTree(): Map<string, FolderNode> {
-  const roots = new Map<string, FolderNode>();
-  scannedRoots.forEach(root => roots.set(root, makeFolderNode(pathName(root))));
-  folderTreeItems.forEach(item => {
-    const root = item.root_path;
-    if (!roots.has(root)) roots.set(root, makeFolderNode(pathName(root)));
-    const relParts = String(item.path || '').split(/[\\/]+/).filter(Boolean).slice(0, -1);
-    const rootNode = roots.get(root);
-    if (!rootNode) return;
-    let node: FolderNode = rootNode;
-    relParts.forEach(part => {
-      let child = node.children.get(part);
-      if (!child) {
-        child = makeFolderNode(part);
-        node.children.set(part, child);
-      }
-      node = child;
-    });
-  });
-  return roots;
-}
-
-function renderFolderNode(node: FolderNode, depth = 0): string {
-  const childNodes = Array.from(node.children.values());
-  const hasChildren = childNodes.length > 0;
-  const children = hasChildren
-    ? `<div class="folder-children">${childNodes.map(child => renderFolderNode(child, depth + 1)).join('')}</div>`
-    : '';
-  return `
-    <div class="folder-node ${hasChildren ? '' : 'leaf'}" data-depth="${depth}">
-      <div class="folder-row" title="${escAttr(node.name)}">
-        <span class="folder-twist">${hasChildren ? '›' : ''}</span>
-        <span class="folder-name">${escHtml(node.name)}</span>
-      </div>
-      ${children}
-    </div>
-  `;
-}
-
 function renderFolderTree(): void {
   const el = optionalHtml('folder-tree');
   if (!el) return;
-  const roots = Array.from(buildFolderTree().values());
-  el.innerHTML = roots.length
-    ? roots.map(root => renderFolderNode(root)).join('')
-    : '<div class="folder-empty">Папки не добавлены</div>';
-  el.querySelectorAll<HTMLElement>('.folder-node:not(.leaf) > .folder-row').forEach(row => {
-    row.addEventListener('click', () => {
-      const node = row.parentElement;
-      if (!node) return;
-      node.classList.toggle('collapsed');
-      const twist = row.querySelector('.folder-twist');
-      if (twist) twist.textContent = node.classList.contains('collapsed') ? '›' : '⌄';
-    });
-    const twist = row.querySelector('.folder-twist');
-    if (twist) twist.textContent = '⌄';
-  });
+  el.innerHTML = scannedRoots.length
+    ? scannedRoots.map(root => `
+      <div class="library-root" title="${escAttr(root)}">
+        <span class="library-root-name">${escHtml(pathName(root))}</span>
+        <span class="library-root-path">${escHtml(root)}</span>
+      </div>
+    `).join('')
+    : '<div class="folder-empty">Библиотеки не добавлены</div>';
 }
 
 function toggleSettings(force?: boolean): void {
@@ -828,6 +765,50 @@ function toggleSettings(force?: boolean): void {
   if (open) {
     showChrome();
     setSettingsTab(settingsActiveTab || 'general');
+    renderFolderTagSyncSetting();
+  }
+}
+
+function renderFolderTagSyncSetting(): void {
+  const toggle = optionalElement('folder-tag-sync-toggle', HTMLInputElement);
+  if (toggle) toggle.checked = folderTagSync;
+}
+
+async function setFolderTagSync(enabled: boolean): Promise<void> {
+  const toggle = optionalElement('folder-tag-sync-toggle', HTMLInputElement);
+  if (toggle) toggle.disabled = true;
+  try {
+    const response = await fetch('/api/session', {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({folder_tag_sync: enabled})
+    });
+    if (!response.ok) throw new Error(await readError(response));
+    const session = await readJsonRecord(response);
+    folderTagSync = session.folder_tag_sync !== false;
+    renderFolderTagSyncSetting();
+  } catch (error) {
+    renderFolderTagSyncSetting();
+    alert('Не удалось изменить синхронизацию тегов: ' + errorMessage(error));
+  } finally {
+    if (toggle) toggle.disabled = false;
+  }
+}
+
+async function deleteAllAutoTags(): Promise<void> {
+  const confirmed = window.confirm(
+    'Удалить все auto-tags, созданные из папок? Ручные теги и изображения останутся без изменений.',
+  );
+  if (!confirmed) return;
+  try {
+    const response = await fetch('/api/auto-tags', {method: 'DELETE'});
+    if (!response.ok) throw new Error(await readError(response));
+    const data = await readJsonRecord(response);
+    setTagPool(data.tags || []);
+    await refreshImages(true);
+    renderTagAdmin();
+  } catch (error) {
+    alert('Не удалось удалить auto-tags: ' + errorMessage(error));
   }
 }
 
@@ -966,6 +947,17 @@ function handleLiveEvent(event: LiveEventEnvelope): void {
     case 'sync_finished':
       void refreshImages(true);
       scheduleLiveFolderRefresh();
+      scheduleLiveTagRefresh();
+      break;
+    case 'tags_changed':
+      scheduleLiveTagRefresh();
+      if (event.data.reason === 'auto_tags_deleted') void refreshImages(true);
+      break;
+    case 'settings_changed':
+      if (typeof event.data.folder_tag_sync === 'boolean') {
+        folderTagSync = event.data.folder_tag_sync;
+        renderFolderTagSyncSetting();
+      }
       break;
     case 'root_online':
     case 'root_offline':
@@ -1471,6 +1463,7 @@ function renderFilterControls(): void {
   if (sortSelect) sortSelect.value = tab.sortMode || DEFAULT_SORT_MODE;
   renderSelectedFilterTags();
   renderFilterSuggestions();
+  renderSidebarTags();
 }
 
 function setMatchMode(mode: string | undefined): void {
@@ -2752,6 +2745,8 @@ async function loadSession(): Promise<void> {
     const r = await fetch('/api/session');
     if (!r.ok) throw new Error(await readError(r));
     const s = await readJsonRecord(r);
+    folderTagSync = s.folder_tag_sync !== false;
+    renderFolderTagSyncSetting();
     tabs = normalizeTabs(s.tabs, s);
     const activeId = typeof s.active_tab_id === 'string' ? s.active_tab_id : null;
     activeTabId = activeId && tabs.some(tab => tab.id === activeId) ? activeId : tabs[0].id;
@@ -2930,7 +2925,15 @@ function setTagPool(rawTags: unknown): void {
         image_count: Number(item.image_count || 0),
         auto_count: Number(item.auto_count || 0),
         user_count: Number(item.user_count || 0),
-        is_auto: Boolean(item.is_auto || Number(item.auto_count || 0) > 0)
+        user_defined: Boolean(item.user_defined || Number(item.user_count || 0) > 0),
+        is_auto: Boolean(item.is_auto || Number(item.auto_count || 0) > 0),
+        source: item.source === 'auto' || Number(item.auto_count || 0) > 0 ? 'auto' : 'user',
+        sources: Array.isArray(item.sources)
+          ? item.sources.filter((value): value is 'auto' | 'user' => value === 'auto' || value === 'user')
+          : [
+            ...(Number(item.auto_count || 0) > 0 ? ['auto' as const] : []),
+            ...(Boolean(item.user_defined) || Number(item.user_count || 0) > 0 ? ['user' as const] : []),
+          ]
       }
       : {
         name,
@@ -2939,13 +2942,17 @@ function setTagPool(rawTags: unknown): void {
         image_count: Number(old.image_count || 0),
         auto_count: Number(old.auto_count || 0),
         user_count: Number(old.user_count || 0),
-        is_auto: Boolean(old.is_auto)
+        user_defined: Boolean(old.user_defined),
+        is_auto: Boolean(old.is_auto),
+        source: old.source === 'auto' ? 'auto' : 'user',
+        sources: old.sources || []
       };
     nextMeta.set(norm, meta);
     names.push(name);
   }
   allTagMeta = nextMeta;
   allTagPool = names;
+  renderSidebarTags();
 }
 
 function getTagMeta(tag: unknown): TagMeta {
@@ -2958,8 +2965,49 @@ function getTagMeta(tag: unknown): TagMeta {
     image_count: 0,
     auto_count: 0,
     user_count: 0,
-    is_auto: false
+    user_defined: false,
+    is_auto: false,
+    source: 'user',
+    sources: []
   };
+}
+
+function renderSidebarTags(): void {
+  const autoTarget = optionalHtml('sidebar-auto-tags');
+  const userTarget = optionalHtml('sidebar-user-tags');
+  if (!autoTarget || !userTarget) return;
+  const query = normalizeTag(optionalInput('sidebar-tag-search')?.value || '');
+  const tab = tabs.length ? activeTab() : null;
+  const included = new Set((tab?.includeTags || []).map(normalizeTag));
+  const excluded = new Set((tab?.excludeTags || []).map(normalizeTag));
+  const tags = Array.from(allTagMeta.values())
+    .filter(tag => !query || normalizeTag(tag.name).includes(query))
+    .sort((left, right) => left.name.localeCompare(right.name, undefined, {sensitivity: 'base'}));
+  const renderRows = (items: TagMeta[], auto: boolean): string => items.length
+    ? items.map(tag => {
+      const norm = normalizeTag(tag.name);
+      const state = included.has(norm) ? 'selected' : (excluded.has(norm) ? 'excluded' : '');
+      return `
+        <button class="sidebar-tag-row ${state}" type="button" data-sidebar-tag="${escAttr(tag.name)}" aria-pressed="${state === 'selected'}">
+          <span class="sidebar-tag-name">${escHtml(tag.name)}</span>
+          ${auto ? '<span class="auto-label">AUTO</span>' : ''}
+          <span class="sidebar-tag-count">${Number(tag.image_count || 0)}</span>
+        </button>
+      `;
+    }).join('')
+    : '<div class="sidebar-empty">Нет тегов</div>';
+  autoTarget.innerHTML = renderRows(tags.filter(tag => tag.auto_count > 0), true);
+  userTarget.innerHTML = renderRows(tags.filter(tag => tag.auto_count <= 0 && (tag.user_defined || tag.user_count > 0)), false);
+  document.querySelectorAll<HTMLElement>('[data-sidebar-tag]').forEach(button => {
+    button.addEventListener('click', () => {
+      const tag = button.dataset.sidebarTag;
+      if (!tag) return;
+      if (included.has(normalizeTag(tag))) removeFilterTag('include', tag);
+      else addFilterTag('include', tag);
+    });
+  });
+  const total = optionalHtml('sidebar-tag-total');
+  if (total) total.textContent = String(tags.length);
 }
 
 function normalizeHexColor(value: unknown, fallback = '#D4D4D4'): string {
@@ -2990,10 +3038,11 @@ function renderTagChip(tag: unknown, options: TagChipOptions = {}): string {
   ].filter(Boolean).join(' ');
   const label = `${options.exclude ? '!' : ''}${name}`;
   const count = options.count ? `<span class="tag-count">${Number(meta.image_count || 0)}</span>` : '';
+  const source = meta.is_auto ? '<span class="auto-label">AUTO</span>' : '';
   const remove = options.removable
     ? `<button type="button" data-kind="${escAttr(options.actionKind || '')}" data-tag="${escAttr(name)}">×</button>`
     : '';
-  return `<span class="${classes}" style="--tag-color:${escAttr(color)};--tag-rgb:${escAttr(rgb)}" title="${escAttr(label)}"><span class="tag-label">${escHtml(label)}</span>${count}${remove}</span>`;
+  return `<span class="${classes}" style="--tag-color:${escAttr(color)};--tag-rgb:${escAttr(rgb)}" title="${escAttr(label)}"><span class="tag-label">${escHtml(label)}</span>${source}${count}${remove}</span>`;
 }
 
 function splitTagPrefix(value: unknown): TagInputParse {
@@ -3091,6 +3140,9 @@ function runAction(actionEl: HTMLElement): void {
     case 'create-tag-from-settings':
       createTagFromSettings();
       break;
+    case 'delete-all-auto-tags':
+      void deleteAllAutoTags();
+      break;
     case 'open-folder':
       openFolder();
       break;
@@ -3150,6 +3202,9 @@ function initActionBindings(): void {
     if (actionEl.dataset.action === 'set-sort-mode') setSortMode(actionValue(actionEl));
     else if (actionEl.dataset.action === 'set-tag-admin-sort') setTagAdminSort(actionValue(actionEl));
     else if (actionEl.dataset.action === 'set-graph-scope') setGraphScope(actionEl.dataset.scope || actionValue(actionEl));
+    else if (actionEl.dataset.action === 'toggle-folder-tag-sync' && actionEl instanceof HTMLInputElement) {
+      void setFolderTagSync(actionEl.checked);
+    }
   });
 }
 
@@ -3182,6 +3237,7 @@ document.addEventListener('click', e => {
 });
 
 requiredInput('tag-admin-search').addEventListener('input', renderTagAdmin);
+requiredInput('sidebar-tag-search').addEventListener('input', renderSidebarTags);
 requiredInput('tag-admin-create').addEventListener('keydown', e => {
   if (e.key === 'Enter') createTagFromSettings();
 });

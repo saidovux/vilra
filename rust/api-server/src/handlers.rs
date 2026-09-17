@@ -233,6 +233,26 @@ pub async fn delete_tag(
     ))
 }
 
+pub async fn delete_auto_tags(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let client = state.connect()?;
+    let result = db::delete_all_auto_tags(&client)?;
+    let tags = db::tag_summary_rows(&client)?;
+    state.events.publish(
+        "tags_changed",
+        json!({
+            "reason": "auto_tags_deleted",
+            "assignments_removed": result.assignments_removed,
+            "tags_removed": result.tags_removed,
+        }),
+    );
+    Ok(json_response(json!({
+        "ok": true,
+        "assignments_removed": result.assignments_removed,
+        "tags_removed": result.tags_removed,
+        "tags": tags,
+    })))
+}
+
 pub async fn set_image_tags(
     State(state): State<Arc<AppState>>,
     Path(img_id): Path<String>,
@@ -289,6 +309,7 @@ pub async fn patch_session(
         return Err(ApiError::bad_request("Request body must be an object"));
     };
     let client = state.connect()?;
+    let previous = db::load_session(&client)?;
     let mut payload = Value::Object(object.clone());
     if let Some(root_path) = payload.get("root_path").and_then(Value::as_str) {
         if !root_path.is_empty() {
@@ -303,9 +324,23 @@ pub async fn patch_session(
             payload["root_paths"] = json!(session.root_paths);
         }
     }
+    let session = db::save_session_value(&client, &payload)?;
+    if session.folder_tag_sync != previous.folder_tag_sync {
+        state.events.publish(
+            "settings_changed",
+            json!({"folder_tag_sync": session.folder_tag_sync}),
+        );
+        if session.folder_tag_sync {
+            for root in db::roots_from_session(&session) {
+                state
+                    .live
+                    .request_reconcile(PathBuf::from(root))
+                    .map_err(ApiError::internal)?;
+            }
+        }
+    }
     Ok(json_response(
-        serde_json::to_value(db::save_session_value(&client, &payload)?)
-            .unwrap_or_else(|_| json!({})),
+        serde_json::to_value(session).unwrap_or_else(|_| json!({})),
     ))
 }
 
