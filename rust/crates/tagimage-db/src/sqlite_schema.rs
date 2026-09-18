@@ -1,4 +1,4 @@
-pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 2;
+pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 3;
 
 pub(crate) const TABLE_STATEMENTS: &[&str] = &[
     r#"
@@ -20,6 +20,24 @@ pub(crate) const TABLE_STATEMENTS: &[&str] = &[
         height INTEGER NOT NULL DEFAULT 0 CHECK (height >= 0),
         ext TEXT NOT NULL DEFAULT 'unknown',
         hidden INTEGER NOT NULL DEFAULT 0 CHECK (hidden IN (0, 1)),
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        UNIQUE (root_path, path)
+    )
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS file_issues (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        image_id TEXT REFERENCES images(id) ON DELETE SET NULL,
+        root_path TEXT NOT NULL,
+        path TEXT NOT NULL,
+        severity TEXT NOT NULL CHECK (severity IN ('error', 'warning')),
+        kind TEXT NOT NULL CHECK (kind IN ('decode_error', 'format_mismatch', 'unsupported_content', 'unreadable')),
+        expected_format TEXT,
+        detected_format TEXT,
+        size INTEGER NOT NULL CHECK (size >= 0),
+        mtime_ns INTEGER NOT NULL,
+        detail TEXT,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         UNIQUE (root_path, path)
@@ -115,6 +133,11 @@ pub(crate) const INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS images_root_hidden_sort_idx ON images(root_path, hidden, lower(path), path, id)",
     "CREATE INDEX IF NOT EXISTS images_root_hidden_mtime_idx ON images(root_path, hidden, mtime, lower(path), path, id)",
     "CREATE INDEX IF NOT EXISTS images_root_hidden_size_idx ON images(root_path, hidden, size, lower(path), path, id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS file_issues_root_path_idx ON file_issues(root_path, path)",
+    "CREATE INDEX IF NOT EXISTS file_issues_severity_idx ON file_issues(severity)",
+    "CREATE INDEX IF NOT EXISTS file_issues_kind_idx ON file_issues(kind)",
+    "CREATE INDEX IF NOT EXISTS file_issues_image_id_idx ON file_issues(image_id)",
+    "CREATE INDEX IF NOT EXISTS file_issues_error_idx ON file_issues(root_path, path) WHERE severity = 'error'",
     "CREATE INDEX IF NOT EXISTS tags_name_idx ON tags(name)",
     "CREATE INDEX IF NOT EXISTS tags_normalized_idx ON tags(normalized)",
     "CREATE INDEX IF NOT EXISTS image_tags_image_idx ON image_tags(image_id)",

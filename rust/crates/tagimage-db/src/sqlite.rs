@@ -637,6 +637,7 @@ mod tests {
         for expected in [
             "tagimage_schema_version",
             "images",
+            "file_issues",
             "tags",
             "suppressed_auto_tags",
             "image_tags",
@@ -700,6 +701,64 @@ mod tests {
     }
 
     #[test]
+    fn init_migrates_v2_to_v3_without_losing_runtime_data() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("seed schema");
+        conn.execute_batch(
+            r#"
+            INSERT INTO images (id, root_path, path, thumb) VALUES ('image-1', '/root', 'a.jpg', '.imgindex/thumbs/a.jpg');
+            INSERT INTO tags (id, name, normalized, user_defined) VALUES (1, 'Favorite', 'favorite', 1);
+            INSERT INTO image_tags (image_id, tag_id, kind) VALUES ('image-1', 1, 'user');
+            INSERT INTO suppressed_auto_tags (normalized, name) VALUES ('folder', 'Folder');
+            INSERT INTO app_session (id, root_path, root_paths) VALUES (1, '/root', '["/root"]');
+            INSERT INTO jobs (id, job_type, state) VALUES ('job-1', 'thumb', 'running');
+            INSERT INTO job_attempts (job_id, attempt, state) VALUES ('job-1', 1, 'running');
+            INSERT INTO job_events (job_id, event) VALUES ('job-1', 'started');
+            DROP TABLE file_issues;
+            UPDATE tagimage_schema_version SET version = 2 WHERE id = 1;
+            "#,
+        )
+        .expect("seed v2 runtime data");
+        drop(conn);
+
+        let conn = init_sqlite_db(&db_path).expect("migrate v2");
+        let version: i64 = conn
+            .query_row(
+                "SELECT version FROM tagimage_schema_version WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("schema version");
+        assert_eq!(version, SQLITE_SCHEMA_VERSION);
+        for (table, expected) in [
+            ("images", 1_i64),
+            ("tags", 1),
+            ("image_tags", 1),
+            ("suppressed_auto_tags", 1),
+            ("app_session", 1),
+            ("jobs", 1),
+            ("job_attempts", 1),
+            ("job_events", 1),
+            ("file_issues", 0),
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap_or_else(|error| panic!("count {table}: {error}"));
+            assert_eq!(count, expected, "preserve {table}");
+        }
+        let tag: String = conn
+            .query_row(
+                "SELECT t.name FROM tags t JOIN image_tags it ON it.tag_id = t.id WHERE it.image_id = 'image-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preserved user tag");
+        assert_eq!(tag, "Favorite");
+    }
+
+    #[test]
     fn init_creates_required_indexes() {
         let (_dir, db_path) = temp_db_path();
         let conn = init_sqlite_db(&db_path).expect("init");
@@ -714,6 +773,11 @@ mod tests {
             "images_root_hidden_sort_idx",
             "images_root_hidden_mtime_idx",
             "images_root_hidden_size_idx",
+            "file_issues_root_path_idx",
+            "file_issues_severity_idx",
+            "file_issues_kind_idx",
+            "file_issues_image_id_idx",
+            "file_issues_error_idx",
             "tags_name_idx",
             "tags_normalized_idx",
             "image_tags_image_idx",

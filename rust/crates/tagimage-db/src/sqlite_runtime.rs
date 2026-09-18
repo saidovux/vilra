@@ -11,6 +11,7 @@ use serde_json::{json, Value as JsonValue};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tagimage_core::{FileIssueKind, FileIssueSeverity, SupportedImageFormat};
 use uuid::Uuid;
 
 const DEFAULT_PAGE_LIMIT: i64 = 120;
@@ -25,6 +26,15 @@ const IMAGE_SORTS: &[&str] = &[
     "size_desc",
     "size_asc",
 ];
+const ACTIVE_IMAGE_PREDICATE: &str = r#"
+    i.hidden = 0
+    AND NOT EXISTS (
+        SELECT 1
+        FROM file_issues fi
+        WHERE fi.severity = 'error'
+          AND (fi.image_id = i.id OR (fi.root_path = i.root_path AND fi.path = i.path))
+    )
+"#;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SqliteSession {
@@ -72,6 +82,37 @@ pub struct SqliteImageMetadataUpdate {
     pub width: i32,
     pub height: i32,
     pub ext: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteFileIssue {
+    pub id: i64,
+    pub image_id: Option<String>,
+    pub root_path: String,
+    pub path: String,
+    pub severity: FileIssueSeverity,
+    pub kind: FileIssueKind,
+    pub expected_format: Option<SupportedImageFormat>,
+    pub detected_format: Option<String>,
+    pub size: i64,
+    pub mtime_ns: i64,
+    pub detail: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteFileIssueUpsert {
+    pub image_id: Option<String>,
+    pub root_path: String,
+    pub path: String,
+    pub severity: FileIssueSeverity,
+    pub kind: FileIssueKind,
+    pub expected_format: Option<SupportedImageFormat>,
+    pub detected_format: Option<String>,
+    pub size: i64,
+    pub mtime_ns: i64,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -250,6 +291,7 @@ pub fn verify_sqlite_core_tables(conn: &Connection) -> Result<(), String> {
         &[
             "tagimage_schema_version",
             "images",
+            "file_issues",
             "tags",
             "suppressed_auto_tags",
             "image_tags",
@@ -260,6 +302,200 @@ pub fn verify_sqlite_core_tables(conn: &Connection) -> Result<(), String> {
 
 pub fn verify_sqlite_job_tables(conn: &Connection) -> Result<(), String> {
     verify_sqlite_tables(conn, &["jobs", "job_attempts", "job_events"])
+}
+
+pub fn get_sqlite_file_issue(
+    conn: &Connection,
+    root_path: &str,
+    path: &str,
+) -> Result<Option<SqliteFileIssue>, String> {
+    let issue = conn
+        .query_row(
+            "SELECT * FROM file_issues WHERE root_path = ?1 AND path = ?2",
+            params![root_path, path],
+            raw_sqlite_file_issue_from_row,
+        )
+        .optional()
+        .map_err(|e| format!("get sqlite file issue {root_path}/{path}: {e}"))?;
+    issue.map(SqliteFileIssue::try_from).transpose()
+}
+
+pub fn list_sqlite_file_issues_for_root(
+    conn: &Connection,
+    root_path: &str,
+) -> Result<Vec<SqliteFileIssue>, String> {
+    let mut stmt = conn
+        .prepare("SELECT * FROM file_issues WHERE root_path = ?1 ORDER BY lower(path), path")
+        .map_err(|e| format!("prepare sqlite file issues: {e}"))?;
+    let rows = stmt
+        .query_map(params![root_path], raw_sqlite_file_issue_from_row)
+        .map_err(|e| format!("query sqlite file issues: {e}"))?;
+    let mut issues = Vec::new();
+    for row in rows {
+        issues.push(SqliteFileIssue::try_from(
+            row.map_err(|e| format!("read sqlite file issue: {e}"))?,
+        )?);
+    }
+    Ok(issues)
+}
+
+pub fn upsert_sqlite_file_issue(
+    conn: &Connection,
+    input: &SqliteFileIssueUpsert,
+) -> Result<bool, String> {
+    if get_sqlite_file_issue(conn, &input.root_path, &input.path)?
+        .as_ref()
+        .is_some_and(|existing| file_issue_matches_input(existing, input))
+    {
+        return Ok(false);
+    }
+    conn.execute(
+        r#"
+        INSERT INTO file_issues (
+            image_id, root_path, path, severity, kind, expected_format, detected_format,
+            size, mtime_ns, detail
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, max(0, ?8), ?9, ?10)
+        ON CONFLICT(root_path, path) DO UPDATE SET
+            image_id = excluded.image_id,
+            severity = excluded.severity,
+            kind = excluded.kind,
+            expected_format = excluded.expected_format,
+            detected_format = excluded.detected_format,
+            size = excluded.size,
+            mtime_ns = excluded.mtime_ns,
+            detail = excluded.detail,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        "#,
+        params![
+            input.image_id,
+            input.root_path,
+            input.path,
+            input.severity.as_str(),
+            input.kind.as_str(),
+            input.expected_format.map(SupportedImageFormat::as_str),
+            input.detected_format,
+            input.size,
+            input.mtime_ns,
+            input.detail,
+        ],
+    )
+    .map_err(|e| {
+        format!(
+            "upsert sqlite file issue {}/{}: {e}",
+            input.root_path, input.path
+        )
+    })?;
+    Ok(true)
+}
+
+pub fn delete_sqlite_file_issue(
+    conn: &Connection,
+    root_path: &str,
+    path: &str,
+) -> Result<bool, String> {
+    conn.execute(
+        "DELETE FROM file_issues WHERE root_path = ?1 AND path = ?2",
+        params![root_path, path],
+    )
+    .map(|count| count > 0)
+    .map_err(|e| format!("delete sqlite file issue {root_path}/{path}: {e}"))
+}
+
+pub fn delete_sqlite_file_issues_under_path(
+    conn: &Connection,
+    root_path: &str,
+    path_prefix: &str,
+) -> Result<i64, String> {
+    let prefix = path_prefix.trim_end_matches('/');
+    let issues = list_sqlite_file_issues_for_root(conn, root_path)?
+        .into_iter()
+        .filter(|issue| relative_path_is_within(&issue.path, prefix))
+        .collect::<Vec<_>>();
+    with_immediate_tx(conn, || {
+        for issue in &issues {
+            conn.execute("DELETE FROM file_issues WHERE id = ?1", params![issue.id])
+                .map_err(|e| format!("delete sqlite file issue {}: {e}", issue.path))?;
+        }
+        Ok(())
+    })?;
+    Ok(issues.len() as i64)
+}
+
+pub fn rename_sqlite_file_issue_path(
+    conn: &Connection,
+    root_path: &str,
+    old_path: &str,
+    new_path: &str,
+) -> Result<bool, String> {
+    let Some(issue) = get_sqlite_file_issue(conn, root_path, old_path)? else {
+        return Ok(false);
+    };
+    with_immediate_tx(conn, || {
+        conn.execute(
+            "DELETE FROM file_issues WHERE root_path = ?1 AND path = ?2 AND id <> ?3",
+            params![root_path, new_path, issue.id],
+        )
+        .map_err(|e| format!("remove sqlite file issue rename collision {new_path}: {e}"))?;
+        conn.execute(
+            r#"
+            UPDATE file_issues
+            SET path = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+            "#,
+            params![issue.id, new_path],
+        )
+        .map_err(|e| format!("rename sqlite file issue {old_path} to {new_path}: {e}"))?;
+        Ok(())
+    })?;
+    Ok(true)
+}
+
+pub fn rename_sqlite_file_issues_under_path(
+    conn: &Connection,
+    root_path: &str,
+    old_prefix: &str,
+    new_prefix: &str,
+) -> Result<i64, String> {
+    let old_prefix = old_prefix.trim_end_matches('/');
+    let new_prefix = new_prefix.trim_end_matches('/');
+    let candidates = list_sqlite_file_issues_for_root(conn, root_path)?
+        .into_iter()
+        .filter_map(|issue| {
+            let suffix = relative_suffix(&issue.path, old_prefix)?.to_string();
+            let next_path = if suffix.is_empty() {
+                new_prefix.to_string()
+            } else {
+                format!("{new_prefix}/{suffix}")
+            };
+            Some((issue, next_path))
+        })
+        .collect::<Vec<_>>();
+    with_immediate_tx(conn, || {
+        for (issue, next_path) in &candidates {
+            conn.execute(
+                "DELETE FROM file_issues WHERE root_path = ?1 AND path = ?2 AND id <> ?3",
+                params![root_path, next_path, issue.id],
+            )
+            .map_err(|e| format!("remove sqlite file issue collision {next_path}: {e}"))?;
+            conn.execute(
+                r#"
+                UPDATE file_issues
+                SET path = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                "#,
+                params![issue.id, next_path],
+            )
+            .map_err(|e| {
+                format!(
+                    "rename sqlite file issue {} to {next_path}: {e}",
+                    issue.path
+                )
+            })?;
+        }
+        Ok(())
+    })?;
+    Ok(candidates.len() as i64)
 }
 
 pub fn upsert_sqlite_image(conn: &Connection, input: &SqliteImageUpsert) -> Result<String, String> {
@@ -308,13 +544,10 @@ pub fn get_sqlite_image_by_id(
     conn: &Connection,
     image_id: &str,
 ) -> Result<Option<SqliteImageRecord>, String> {
-    conn.query_row(
-        "SELECT * FROM images WHERE id = ?1 AND hidden = 0",
-        params![image_id],
-        sqlite_image_record_from_row,
-    )
-    .optional()
-    .map_err(|e| format!("get sqlite image by id {image_id}: {e}"))
+    let sql = format!("SELECT i.* FROM images i WHERE i.id = ?1 AND {ACTIVE_IMAGE_PREDICATE}");
+    conn.query_row(&sql, params![image_id], sqlite_image_record_from_row)
+        .optional()
+        .map_err(|e| format!("get sqlite image by id {image_id}: {e}"))
 }
 
 pub fn get_sqlite_image_by_root_path(
@@ -322,13 +555,12 @@ pub fn get_sqlite_image_by_root_path(
     root_path: &str,
     path: &str,
 ) -> Result<Option<SqliteImageRecord>, String> {
-    conn.query_row(
-        "SELECT * FROM images WHERE root_path = ?1 AND path = ?2 AND hidden = 0",
-        params![root_path, path],
-        sqlite_image_record_from_row,
-    )
-    .optional()
-    .map_err(|e| format!("get sqlite image by path {root_path}/{path}: {e}"))
+    let sql = format!(
+        "SELECT i.* FROM images i WHERE i.root_path = ?1 AND i.path = ?2 AND {ACTIVE_IMAGE_PREDICATE}"
+    );
+    conn.query_row(&sql, params![root_path, path], sqlite_image_record_from_row)
+        .optional()
+        .map_err(|e| format!("get sqlite image by path {root_path}/{path}: {e}"))
 }
 
 pub fn list_sqlite_existing_images_for_root(
@@ -486,7 +718,7 @@ pub fn rename_sqlite_image_path(
         .map_err(|e| format!("rename sqlite image {old_path} to {new_path}: {e}"))?;
         Ok(())
     })?;
-    get_sqlite_image_by_id(conn, &image.id)
+    get_sqlite_image_by_root_path_including_hidden(conn, root_path, new_path)
 }
 
 pub fn rename_sqlite_images_under_path(
@@ -565,8 +797,8 @@ pub fn rename_sqlite_images_under_path(
 
     candidates
         .into_iter()
-        .map(|(image, _)| {
-            get_sqlite_image_by_id(conn, &image.id)?
+        .map(|(image, next_path)| {
+            get_sqlite_image_by_root_path_including_hidden(conn, root_path, &next_path)?
                 .ok_or_else(|| format!("renamed sqlite image {} disappeared", image.id))
         })
         .collect()
@@ -682,6 +914,10 @@ fn cancel_active_image_jobs_in_tx(conn: &Connection, image_id: &str) -> Result<(
     Ok(())
 }
 
+pub fn cancel_sqlite_active_image_jobs(conn: &Connection, image_id: &str) -> Result<(), String> {
+    with_immediate_tx(conn, || cancel_active_image_jobs_in_tx(conn, image_id))
+}
+
 pub fn get_sqlite_image_api_value(
     conn: &Connection,
     image_id: &str,
@@ -779,12 +1015,13 @@ pub fn count_sqlite_images(
         .cloned()
         .map(SqlValue::Text)
         .collect::<Vec<_>>();
-    let hidden_sql = if include_hidden {
-        ""
+    let active_sql = if include_hidden {
+        String::new()
     } else {
-        " AND hidden = 0"
+        format!(" AND {ACTIVE_IMAGE_PREDICATE}")
     };
-    let sql = format!("SELECT COUNT(*) FROM images WHERE root_path IN ({root_sql}){hidden_sql}");
+    let sql =
+        format!("SELECT COUNT(*) FROM images i WHERE i.root_path IN ({root_sql}){active_sql}");
     conn.query_row(&sql, params_from_iter(params.iter()), |row| row.get(0))
         .map_err(|e| format!("count sqlite images: {e}"))
 }
@@ -829,7 +1066,7 @@ pub fn query_sqlite_images_page(
     let root_sql = placeholders(roots.len());
     let mut filters = vec![
         format!("i.root_path IN ({root_sql})"),
-        "i.hidden = 0".to_string(),
+        ACTIVE_IMAGE_PREDICATE.to_string(),
     ];
     let mut params = roots
         .iter()
@@ -910,7 +1147,7 @@ pub fn query_sqlite_images_page(
             WITH filtered AS (
                 SELECT i.id
                 FROM images i {join_sql}
-                WHERE i.root_path IN ({root_sql}) AND i.hidden = 0
+                WHERE i.root_path IN ({root_sql}) AND {ACTIVE_IMAGE_PREDICATE}
                 GROUP BY i.id
                 {having_sql}
             )
@@ -1003,9 +1240,8 @@ pub fn parse_csv_sqlite_tags(raw: Option<&str>) -> Vec<String> {
 }
 
 pub fn tag_sqlite_summary_rows(conn: &Connection) -> Result<Vec<JsonValue>, String> {
-    let mut stmt = conn
-        .prepare(
-            r#"
+    let sql = format!(
+        r#"
             SELECT
                 t.id,
                 t.name,
@@ -1017,12 +1253,14 @@ pub fn tag_sqlite_summary_rows(conn: &Connection) -> Result<Vec<JsonValue>, Stri
                 COUNT(DISTINCT CASE WHEN i.id IS NOT NULL AND it.kind = 'user' THEN it.image_id END) AS user_count
             FROM tags t
             LEFT JOIN image_tags it ON it.tag_id = t.id
-            LEFT JOIN images i ON i.id = it.image_id AND i.hidden = 0
+            LEFT JOIN images i ON i.id = it.image_id AND {ACTIVE_IMAGE_PREDICATE}
             GROUP BY t.id
             HAVING t.user_defined = 1 OR COUNT(DISTINCT i.id) > 0
             ORDER BY lower(t.name), t.name
-            "#,
-        )
+            "#
+    );
+    let mut stmt = conn
+        .prepare(&sql)
         .map_err(|e| format!("prepare sqlite tag summary: {e}"))?;
     let rows = stmt
         .query_map([], |row| {
@@ -1441,18 +1679,19 @@ pub fn list_sqlite_images_by_tag(
     tag: &str,
 ) -> Result<Vec<SqliteImageRecord>, String> {
     let norm = normalize_sqlite_tag(tag);
-    let mut stmt = conn
-        .prepare(
-            r#"
+    let sql = format!(
+        r#"
             SELECT i.*
             FROM images i
             JOIN image_tags it ON it.image_id = i.id
             JOIN tags t ON t.id = it.tag_id
-            WHERE t.normalized = ?1 AND i.hidden = 0
+            WHERE t.normalized = ?1 AND {ACTIVE_IMAGE_PREDICATE}
             GROUP BY i.id
             ORDER BY i.root_path, lower(i.path), i.path
-            "#,
-        )
+            "#
+    );
+    let mut stmt = conn
+        .prepare(&sql)
         .map_err(|e| format!("prepare sqlite images by tag: {e}"))?;
     let rows = stmt
         .query_map(params![norm], sqlite_image_record_from_row)
@@ -1642,10 +1881,10 @@ pub fn folder_sqlite_tree_rows(
         .collect::<Vec<_>>();
     let sql = format!(
         r#"
-        SELECT root_path, path
-        FROM images
-        WHERE root_path IN ({root_sql}) AND hidden = 0
-        ORDER BY root_path, lower(path), path
+        SELECT i.root_path, i.path
+        FROM images i
+        WHERE i.root_path IN ({root_sql}) AND {ACTIVE_IMAGE_PREDICATE}
+        ORDER BY i.root_path, lower(i.path), i.path
         "#
     );
     let mut stmt = conn
@@ -2046,10 +2285,10 @@ pub fn list_sqlite_thumb_rebuild_rows(
     };
     let sql = format!(
         r#"
-        SELECT id, root_path, path, thumb, mtime
-        FROM images
-        WHERE root_path IN ({root_sql}) AND hidden = 0
-        ORDER BY root_path, lower(path), path
+        SELECT i.id, i.root_path, i.path, i.thumb, i.mtime
+        FROM images i
+        WHERE i.root_path IN ({root_sql}) AND {ACTIVE_IMAGE_PREDICATE}
+        ORDER BY i.root_path, lower(i.path), i.path
         {limit_sql}
         "#
     );
@@ -2078,10 +2317,10 @@ pub fn list_sqlite_metadata_source_rows(
     let limit_sql = if max_rows > 0 { " LIMIT ?1" } else { "" };
     let sql = format!(
         r#"
-        SELECT id, root_path, path, mtime
-        FROM images
-        WHERE hidden = 0
-        ORDER BY root_path, lower(path), path
+        SELECT i.id, i.root_path, i.path, i.mtime
+        FROM images i
+        WHERE {ACTIVE_IMAGE_PREDICATE}
+        ORDER BY i.root_path, lower(i.path), i.path
         {limit_sql}
         "#
     );
@@ -2195,6 +2434,85 @@ fn sqlite_image_record_from_row(row: &Row<'_>) -> rusqlite::Result<SqliteImageRe
         ext: row.get("ext")?,
         hidden: row.get::<_, i64>("hidden")? != 0,
     })
+}
+
+struct RawSqliteFileIssue {
+    id: i64,
+    image_id: Option<String>,
+    root_path: String,
+    path: String,
+    severity: String,
+    kind: String,
+    expected_format: Option<String>,
+    detected_format: Option<String>,
+    size: i64,
+    mtime_ns: i64,
+    detail: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+fn raw_sqlite_file_issue_from_row(row: &Row<'_>) -> rusqlite::Result<RawSqliteFileIssue> {
+    Ok(RawSqliteFileIssue {
+        id: row.get("id")?,
+        image_id: row.get("image_id")?,
+        root_path: row.get("root_path")?,
+        path: row.get("path")?,
+        severity: row.get("severity")?,
+        kind: row.get("kind")?,
+        expected_format: row.get("expected_format")?,
+        detected_format: row.get("detected_format")?,
+        size: row.get("size")?,
+        mtime_ns: row.get("mtime_ns")?,
+        detail: row.get("detail")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+impl TryFrom<RawSqliteFileIssue> for SqliteFileIssue {
+    type Error = String;
+
+    fn try_from(raw: RawSqliteFileIssue) -> Result<Self, Self::Error> {
+        let severity = FileIssueSeverity::parse(&raw.severity)
+            .ok_or_else(|| format!("invalid sqlite file issue severity: {}", raw.severity))?;
+        let kind = FileIssueKind::parse(&raw.kind)
+            .ok_or_else(|| format!("invalid sqlite file issue kind: {}", raw.kind))?;
+        let expected_format = raw
+            .expected_format
+            .as_deref()
+            .map(|value| {
+                SupportedImageFormat::parse(value)
+                    .ok_or_else(|| format!("invalid sqlite expected image format: {value}"))
+            })
+            .transpose()?;
+        Ok(Self {
+            id: raw.id,
+            image_id: raw.image_id,
+            root_path: raw.root_path,
+            path: raw.path,
+            severity,
+            kind,
+            expected_format,
+            detected_format: raw.detected_format,
+            size: raw.size,
+            mtime_ns: raw.mtime_ns,
+            detail: raw.detail,
+            created_at: raw.created_at,
+            updated_at: raw.updated_at,
+        })
+    }
+}
+
+fn file_issue_matches_input(existing: &SqliteFileIssue, input: &SqliteFileIssueUpsert) -> bool {
+    existing.image_id == input.image_id
+        && existing.severity == input.severity
+        && existing.kind == input.kind
+        && existing.expected_format == input.expected_format
+        && existing.detected_format == input.detected_format
+        && existing.size == input.size.max(0)
+        && existing.mtime_ns == input.mtime_ns
+        && existing.detail == input.detail
 }
 
 fn sqlite_image_list_row_from_row(row: &Row<'_>) -> rusqlite::Result<SqliteImageListRow> {
@@ -2960,6 +3278,139 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM image_tags", [], |row| row.get(0))
             .expect("tag count");
         assert_eq!(tag_count, 0);
+    }
+
+    #[test]
+    fn file_issue_severity_is_consistent_across_active_image_queries() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let root = "/photos";
+        upsert_fixture(&conn, "img-a", root, "folder/a.jpg", 10, 20);
+        replace_sqlite_image_tags(&conn, "img-a", &["Favorite".to_string()], "user")
+            .expect("user tag");
+
+        let issue = SqliteFileIssueUpsert {
+            image_id: Some("img-a".to_string()),
+            root_path: root.to_string(),
+            path: "folder/a.jpg".to_string(),
+            severity: FileIssueSeverity::Error,
+            kind: FileIssueKind::DecodeError,
+            expected_format: Some(SupportedImageFormat::Jpeg),
+            detected_format: None,
+            size: 20,
+            mtime_ns: 100,
+            detail: Some("truncated".to_string()),
+        };
+        assert!(upsert_sqlite_file_issue(&conn, &issue).expect("insert issue"));
+        assert!(!upsert_sqlite_file_issue(&conn, &issue).expect("same issue"));
+        assert!(get_sqlite_image_by_id(&conn, "img-a")
+            .expect("active image")
+            .is_none());
+        assert_eq!(
+            count_sqlite_images(&conn, &[root.to_string()], false).unwrap(),
+            0
+        );
+        assert!(
+            query_sqlite_images_page(&conn, &[root.to_string()], SqliteImagesQuery::default())
+                .unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(list_sqlite_images_by_tag(&conn, "Favorite")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            tag_sqlite_summary_by_norm(&conn, "favorite")
+                .unwrap()
+                .unwrap()["image_count"],
+            0
+        );
+        assert!(folder_sqlite_tree_rows(&conn, &[root.to_string()])
+            .unwrap()
+            .is_empty());
+        assert!(
+            list_sqlite_thumb_rebuild_rows(&conn, &[root.to_string()], None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(list_sqlite_metadata_source_rows(&conn, None)
+            .unwrap()
+            .is_empty());
+
+        let warning = SqliteFileIssueUpsert {
+            severity: FileIssueSeverity::Warning,
+            kind: FileIssueKind::FormatMismatch,
+            detected_format: Some("png".to_string()),
+            detail: Some("format mismatch".to_string()),
+            ..issue
+        };
+        assert!(upsert_sqlite_file_issue(&conn, &warning).expect("warning"));
+        assert!(get_sqlite_image_by_id(&conn, "img-a").unwrap().is_some());
+        assert_eq!(
+            count_sqlite_images(&conn, &[root.to_string()], false).unwrap(),
+            1
+        );
+        assert_eq!(
+            list_sqlite_images_by_tag(&conn, "Favorite").unwrap().len(),
+            1
+        );
+        assert_eq!(
+            list_sqlite_thumb_rebuild_rows(&conn, &[root.to_string()], None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            list_sqlite_metadata_source_rows(&conn, None).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn file_issue_path_helpers_follow_renames_and_deletes() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let root = "/photos";
+        for path in ["old/a.jpg", "old/nested/b.png"] {
+            upsert_sqlite_file_issue(
+                &conn,
+                &SqliteFileIssueUpsert {
+                    image_id: None,
+                    root_path: root.to_string(),
+                    path: path.to_string(),
+                    severity: FileIssueSeverity::Error,
+                    kind: FileIssueKind::DecodeError,
+                    expected_format: Some(if path.ends_with("png") {
+                        SupportedImageFormat::Png
+                    } else {
+                        SupportedImageFormat::Jpeg
+                    }),
+                    detected_format: None,
+                    size: 3,
+                    mtime_ns: 4,
+                    detail: None,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            rename_sqlite_file_issues_under_path(&conn, root, "old", "new").unwrap(),
+            2
+        );
+        assert!(get_sqlite_file_issue(&conn, root, "old/a.jpg")
+            .unwrap()
+            .is_none());
+        assert!(get_sqlite_file_issue(&conn, root, "new/a.jpg")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            delete_sqlite_file_issues_under_path(&conn, root, "new").unwrap(),
+            2
+        );
+        assert!(list_sqlite_file_issues_for_root(&conn, root)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
