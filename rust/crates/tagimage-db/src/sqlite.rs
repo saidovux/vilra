@@ -94,6 +94,8 @@ pub fn init_sqlite_db(path: &Path) -> Result<Connection, String> {
         )
         .map_err(|e| format!("migrate sqlite app_session folder_tag_sync: {e}"))?;
     }
+    tx.execute_batch("DROP INDEX IF EXISTS file_issues_root_path_idx")
+        .map_err(|e| format!("remove duplicate sqlite file issue index: {e}"))?;
     for statement in INDEX_STATEMENTS {
         tx.execute_batch(statement)
             .map_err(|e| format!("create sqlite index: {e}"))?;
@@ -773,7 +775,6 @@ mod tests {
             "images_root_hidden_sort_idx",
             "images_root_hidden_mtime_idx",
             "images_root_hidden_size_idx",
-            "file_issues_root_path_idx",
             "file_issues_severity_idx",
             "file_issues_kind_idx",
             "file_issues_image_id_idx",
@@ -793,6 +794,15 @@ mod tests {
         ] {
             assert!(indexes.contains(expected), "missing index {expected}");
         }
+        assert!(!indexes.contains("file_issues_root_path_idx"));
+        let unique_indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_index_list('file_issues') WHERE \"unique\" = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("file issue unique indexes");
+        assert_eq!(unique_indexes, 1);
     }
 
     #[test]

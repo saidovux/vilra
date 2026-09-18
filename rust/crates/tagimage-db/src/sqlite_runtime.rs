@@ -116,6 +116,12 @@ pub struct SqliteFileIssueUpsert {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct SqliteFileDeactivation {
+    pub image: Option<SqliteImageRecord>,
+    pub issue_deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SqliteExistingImage {
     pub id: String,
     pub path: String,
@@ -639,6 +645,55 @@ pub fn hide_sqlite_image_by_root_path(
     )
     .map_err(|e| format!("hide sqlite image {root_path}/{path}: {e}"))?;
     Ok(Some(image))
+}
+
+pub fn deactivate_sqlite_file_path(
+    conn: &Connection,
+    root_path: &str,
+    path: &str,
+) -> Result<SqliteFileDeactivation, String> {
+    with_immediate_tx(conn, || {
+        let image = get_sqlite_image_by_root_path_including_hidden(conn, root_path, path)?;
+        let active_image = image.filter(|image| !image.hidden);
+        if let Some(image) = &active_image {
+            cancel_active_image_jobs_in_tx(conn, &image.id)?;
+            conn.execute(
+                r#"
+                UPDATE images
+                SET hidden = 1,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                "#,
+                params![image.id],
+            )
+            .map_err(|e| format!("deactivate sqlite image {root_path}/{path}: {e}"))?;
+        }
+        let issue_deleted = conn
+            .execute(
+                "DELETE FROM file_issues WHERE root_path = ?1 AND path = ?2",
+                params![root_path, path],
+            )
+            .map_err(|e| format!("delete sqlite file issue {root_path}/{path}: {e}"))?
+            > 0;
+        Ok(SqliteFileDeactivation {
+            image: active_image,
+            issue_deleted,
+        })
+    })
+}
+
+pub fn restore_sqlite_image_presence(conn: &Connection, image_id: &str) -> Result<bool, String> {
+    conn.execute(
+        r#"
+        UPDATE images
+        SET hidden = 0,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ?1 AND hidden = 1
+        "#,
+        params![image_id],
+    )
+    .map(|count| count > 0)
+    .map_err(|e| format!("restore sqlite image presence {image_id}: {e}"))
 }
 
 pub fn hide_sqlite_images_under_path(
@@ -3365,6 +3420,87 @@ mod tests {
             list_sqlite_metadata_source_rows(&conn, None).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn file_deactivation_hides_image_cancels_jobs_and_deletes_issue_atomically() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let root = "/photos";
+        upsert_fixture(&conn, "img-a", root, "bad.jpg", 10, 20);
+        upsert_sqlite_file_issue(
+            &conn,
+            &SqliteFileIssueUpsert {
+                image_id: Some("img-a".to_string()),
+                root_path: root.to_string(),
+                path: "bad.jpg".to_string(),
+                severity: FileIssueSeverity::Error,
+                kind: FileIssueKind::DecodeError,
+                expected_format: Some(SupportedImageFormat::Jpeg),
+                detected_format: None,
+                size: 20,
+                mtime_ns: 100,
+                detail: None,
+            },
+        )
+        .unwrap();
+        let (job, _) = enqueue_sqlite_thumb_job(
+            &conn,
+            "img-a",
+            root,
+            "bad.jpg",
+            ".imgindex/thumbs/img-a.jpg",
+            10,
+            20,
+            3,
+        )
+        .unwrap();
+        let job_id = job["id"].as_str().unwrap();
+
+        conn.execute_batch(
+            r#"
+            CREATE TRIGGER reject_file_issue_delete
+            BEFORE DELETE ON file_issues
+            BEGIN
+                SELECT RAISE(ABORT, 'reject issue delete');
+            END;
+            "#,
+        )
+        .unwrap();
+        assert!(deactivate_sqlite_file_path(&conn, root, "bad.jpg").is_err());
+        let hidden: i64 = conn
+            .query_row("SELECT hidden FROM images WHERE id = 'img-a'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(hidden, 0, "image hide must roll back with issue delete");
+        assert!(get_sqlite_file_issue(&conn, root, "bad.jpg")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            get_sqlite_job(&conn, job_id).unwrap().unwrap().state,
+            "queued"
+        );
+
+        conn.execute_batch("DROP TRIGGER reject_file_issue_delete")
+            .unwrap();
+        let result = deactivate_sqlite_file_path(&conn, root, "bad.jpg").unwrap();
+        assert!(result.image.is_some_and(|image| image.id == "img-a"));
+        assert!(result.issue_deleted);
+        let hidden: i64 = conn
+            .query_row("SELECT hidden FROM images WHERE id = 'img-a'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(hidden, 1);
+        assert!(get_sqlite_file_issue(&conn, root, "bad.jpg")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            get_sqlite_job(&conn, job_id).unwrap().unwrap().state,
+            "canceled"
+        );
+        assert!(get_sqlite_image_by_id(&conn, "img-a").unwrap().is_none());
     }
 
     #[test]

@@ -14,15 +14,16 @@ use tagimage_core::{
     FileFingerprint, FileIssueKind, FileIssueSeverity, ImageInspectionErrorKind,
 };
 use tagimage_db::sqlite::{
-    cancel_sqlite_active_image_jobs, delete_sqlite_file_issue,
+    cancel_sqlite_active_image_jobs, deactivate_sqlite_file_path, delete_sqlite_file_issue,
     delete_sqlite_file_issues_under_path, enqueue_sqlite_thumb_job, get_sqlite_file_issue,
     get_sqlite_image_api_value, get_sqlite_image_by_root_path_including_hidden,
     hide_sqlite_image_by_root_path, hide_sqlite_images_under_path,
     list_sqlite_existing_images_for_root, list_sqlite_file_issues_for_root, open_sqlite_runtime_db,
     rename_sqlite_file_issue_path, rename_sqlite_file_issues_under_path, rename_sqlite_image_path,
-    rename_sqlite_images_under_path, retarget_sqlite_active_image_jobs,
-    sqlite_folder_tag_sync_enabled, sync_sqlite_image_auto_tags, upsert_sqlite_file_issue,
-    upsert_sqlite_image, SqliteFileIssue, SqliteFileIssueUpsert, SqliteImageUpsert,
+    rename_sqlite_images_under_path, restore_sqlite_image_presence,
+    retarget_sqlite_active_image_jobs, sqlite_folder_tag_sync_enabled, sync_sqlite_image_auto_tags,
+    upsert_sqlite_file_issue, upsert_sqlite_image, SqliteExistingImage, SqliteFileIssue,
+    SqliteFileIssueUpsert, SqliteImageUpsert,
 };
 use tokio::sync::broadcast;
 
@@ -38,6 +39,11 @@ struct ImageIndexOutcome {
     changed: bool,
     new_issue: bool,
     known_issue: bool,
+}
+
+enum CachedIssueResolution<T> {
+    Reused,
+    Inspected(T),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -475,14 +481,15 @@ impl Processor {
         let rel = relative_path(&root, path)?;
         let conn = open_sqlite_runtime_db(&self.db_path)?;
         if is_supported_image_path(path) {
-            if delete_sqlite_file_issue(&conn, &root_string(&root), &rel)? {
-                self.publish_problems_changed(&root, &rel, true);
-            }
-            if let Some(image) = hide_sqlite_image_by_root_path(&conn, &root_string(&root), &rel)? {
+            let deactivated = deactivate_sqlite_file_path(&conn, &root_string(&root), &rel)?;
+            if let Some(image) = deactivated.image {
                 self.hub.publish(
                     "image_removed",
                     json!({"root_path": root_string(&root), "path": rel, "image_id": image.id}),
                 );
+            }
+            if deactivated.issue_deleted {
+                self.publish_problems_changed(&root, &rel, true);
             }
             return Ok(());
         }
@@ -527,14 +534,15 @@ impl Processor {
         let new_supported = is_supported_image_path(new_path);
 
         if old_supported && !new_supported {
-            if delete_sqlite_file_issue(&conn, &root_path, &old_rel)? {
-                self.publish_problems_changed(&root, &old_rel, true);
-            }
-            if let Some(image) = hide_sqlite_image_by_root_path(&conn, &root_path, &old_rel)? {
+            let deactivated = deactivate_sqlite_file_path(&conn, &root_path, &old_rel)?;
+            if let Some(image) = deactivated.image {
                 self.hub.publish(
                     "image_removed",
                     json!({"root_path": root_path, "path": old_rel, "image_id": image.id}),
                 );
+            }
+            if deactivated.issue_deleted {
+                self.publish_problems_changed(&root, &old_rel, true);
             }
             return Ok(());
         }
@@ -724,6 +732,11 @@ impl Processor {
                         detail: Some(error.detail),
                     },
                 )?;
+                let presence_restored = if let Some(image) = &existing {
+                    restore_sqlite_image_presence(&conn, &image.id)?
+                } else {
+                    false
+                };
                 if let Some(image) = &existing {
                     cancel_sqlite_active_image_jobs(&conn, &image.id)?;
                     if was_active {
@@ -737,7 +750,7 @@ impl Processor {
                     self.publish_problems_changed(&root_path, &rel, false);
                 }
                 return Ok(ImageIndexOutcome {
-                    changed: issue_changed || was_active,
+                    changed: issue_changed || was_active || presence_restored,
                     new_issue: issue_changed,
                     known_issue: !issue_changed,
                 });
@@ -875,23 +888,32 @@ impl Processor {
             let fingerprint = file_fingerprint(path).ok();
             let old = existing_by_path.get(&rel);
             let known_issue = issues_by_path.get(&rel);
-            if known_issue.is_some_and(|issue| {
-                fingerprint
-                    .as_ref()
-                    .is_some_and(|value| should_reuse_known_issue(issue, value))
-            }) {
-                known_issues += 1;
-                if folder_tag_sync
-                    && known_issue.is_some_and(|issue| issue.severity == FileIssueSeverity::Warning)
-                {
-                    if let Some(old) = old {
-                        if sync_sqlite_image_auto_tags(&conn, &old.id, &folder_tags(&rel))? {
-                            changed += 1;
+            if let (Some(issue), Some(fingerprint)) = (known_issue, fingerprint.as_ref()) {
+                match inspect_cached_issue_if_needed(issue, fingerprint, old, || {
+                    self.index_image(root, path, false)
+                }) {
+                    CachedIssueResolution::Reused => {
+                        known_issues += 1;
+                        if folder_tag_sync && issue.severity == FileIssueSeverity::Warning {
+                            if let Some(old) = old {
+                                if sync_sqlite_image_auto_tags(&conn, &old.id, &folder_tags(&rel))?
+                                {
+                                    changed += 1;
+                                }
+                            }
                         }
+                        self.update_status(root, |status| status.done = index + 1);
+                        continue;
+                    }
+                    CachedIssueResolution::Inspected(outcome) => {
+                        let outcome = outcome?;
+                        changed += usize::from(outcome.changed);
+                        new_issues += usize::from(outcome.new_issue);
+                        known_issues += usize::from(outcome.known_issue);
+                        self.update_status(root, |status| status.done = index + 1);
+                        continue;
                     }
                 }
-                self.update_status(root, |status| status.done = index + 1);
-                continue;
             }
             let unchanged = old.is_some_and(|image| {
                 !image.hidden
@@ -1053,6 +1075,24 @@ fn should_reuse_known_issue(issue: &SqliteFileIssue, fingerprint: &FileFingerpri
     issue.kind.is_fingerprint_cacheable()
         && issue.size == fingerprint.size
         && issue.mtime_ns == fingerprint.mtime_ns
+}
+
+fn inspect_cached_issue_if_needed<T>(
+    issue: &SqliteFileIssue,
+    fingerprint: &FileFingerprint,
+    existing: Option<&SqliteExistingImage>,
+    inspect: impl FnOnce() -> T,
+) -> CachedIssueResolution<T> {
+    let image_state_matches = match issue.image_id.as_deref() {
+        None => true,
+        Some(image_id) => existing
+            .is_some_and(|image| image.id == image_id && image.path == issue.path && !image.hidden),
+    };
+    if should_reuse_known_issue(issue, fingerprint) && image_state_matches {
+        CachedIssueResolution::Reused
+    } else {
+        CachedIssueResolution::Inspected(inspect())
+    }
 }
 
 #[derive(Default)]
@@ -1687,6 +1727,100 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_rechecks_cached_issues_when_linked_image_rows_are_hidden() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("library");
+        let warning_path = root.join("warning.jpg");
+        let error_path = root.join("error.jpg");
+        write_image_as(&warning_path, ImageFormat::Png, [10, 20, 30]);
+        write_image_as(&error_path, ImageFormat::Jpeg, [40, 50, 60]);
+        let db_path = dir.path().join("vilra.sqlite");
+        drop(init_sqlite_db(&db_path).unwrap());
+        let mut processor = Processor {
+            db_path: db_path.clone(),
+            hub: EventHub::new(),
+            statuses: Arc::new(Mutex::new(HashMap::new())),
+            roots: HashSet::from([root.clone()]),
+        };
+        processor.index_image(&root, &warning_path, false).unwrap();
+        processor.index_image(&root, &error_path, false).unwrap();
+
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        let warning_id = get_sqlite_image_by_root_path_including_hidden(
+            &conn,
+            &root_string(&root),
+            "warning.jpg",
+        )
+        .unwrap()
+        .unwrap()
+        .id;
+        let error_id =
+            get_sqlite_image_by_root_path_including_hidden(&conn, &root_string(&root), "error.jpg")
+                .unwrap()
+                .unwrap()
+                .id;
+        replace_sqlite_image_tags(&conn, &warning_id, &["WarningTag".to_string()], "user").unwrap();
+        replace_sqlite_image_tags(&conn, &error_id, &["ErrorTag".to_string()], "user").unwrap();
+        drop(conn);
+
+        fs::write(&error_path, b"invalid jpeg").unwrap();
+        processor.index_image(&root, &error_path, true).unwrap();
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        hide_sqlite_image_by_root_path(&conn, &root_string(&root), "warning.jpg").unwrap();
+        hide_sqlite_image_by_root_path(&conn, &root_string(&root), "error.jpg").unwrap();
+        drop(conn);
+
+        processor.reconcile_root(&root).unwrap();
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        let warning = get_sqlite_image_by_root_path_including_hidden(
+            &conn,
+            &root_string(&root),
+            "warning.jpg",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(warning.id, warning_id);
+        assert!(!warning.hidden);
+        assert_eq!(
+            get_sqlite_file_issue(&conn, &root_string(&root), "warning.jpg")
+                .unwrap()
+                .unwrap()
+                .severity,
+            FileIssueSeverity::Warning
+        );
+        assert_eq!(
+            list_sqlite_tags_for_image(&conn, &warning_id).unwrap().1,
+            vec!["WarningTag"]
+        );
+
+        let error =
+            get_sqlite_image_by_root_path_including_hidden(&conn, &root_string(&root), "error.jpg")
+                .unwrap()
+                .unwrap();
+        assert_eq!(error.id, error_id);
+        assert!(
+            !error.hidden,
+            "existing file must not retain missing-file state"
+        );
+        assert_eq!(
+            get_sqlite_file_issue(&conn, &root_string(&root), "error.jpg")
+                .unwrap()
+                .unwrap()
+                .severity,
+            FileIssueSeverity::Error
+        );
+        assert!(
+            tagimage_db::sqlite::get_sqlite_image_by_id(&conn, &error_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            list_sqlite_tags_for_image(&conn, &error_id).unwrap().1,
+            vec!["ErrorTag"]
+        );
+    }
+
+    #[test]
     fn mismatch_unsupported_and_invalid_files_get_expected_issue_semantics() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("library");
@@ -1801,17 +1935,51 @@ mod tests {
         };
         let mut inspections = 0;
         for fingerprint in [&same, &changed] {
-            if !should_reuse_known_issue(&issue, fingerprint) {
+            let _ = inspect_cached_issue_if_needed(&issue, fingerprint, None, || {
                 inspections += 1;
-            }
+            });
         }
-        assert_eq!(inspections, 1, "same fingerprint must skip inspection");
+        assert_eq!(
+            inspections, 1,
+            "unchanged cached DecodeError must not invoke inspection"
+        );
+
+        let existing = SqliteExistingImage {
+            id: "image-1".to_string(),
+            path: "bad.jpg".to_string(),
+            thumb: ".imgindex/thumbs/image-1.jpg".to_string(),
+            size: 10,
+            mtime: 0,
+            width: 10,
+            height: 10,
+            ext: "jpg".to_string(),
+            hidden: false,
+        };
+        let linked = SqliteFileIssue {
+            image_id: Some(existing.id.clone()),
+            ..issue.clone()
+        };
+        let _ = inspect_cached_issue_if_needed(&linked, &same, Some(&existing), || {
+            inspections += 1;
+        });
+        assert_eq!(inspections, 1, "active linked row may reuse cache");
+        let hidden = SqliteExistingImage {
+            hidden: true,
+            ..existing
+        };
+        let _ = inspect_cached_issue_if_needed(&linked, &same, Some(&hidden), || {
+            inspections += 1;
+        });
+        assert_eq!(inspections, 2, "hidden linked row must be inspected");
 
         let unreadable = SqliteFileIssue {
             kind: FileIssueKind::Unreadable,
             ..issue
         };
-        assert!(!should_reuse_known_issue(&unreadable, &same));
+        let _ = inspect_cached_issue_if_needed(&unreadable, &same, None, || {
+            inspections += 1;
+        });
+        assert_eq!(inspections, 3, "unreadable issues are never cached");
     }
 
     #[test]
@@ -1821,7 +1989,7 @@ mod tests {
         let old_dir = root.join("old");
         fs::create_dir_all(&old_dir).unwrap();
         let bad = old_dir.join("bad.jpg");
-        fs::write(&bad, b"invalid").unwrap();
+        write_image_as(&bad, ImageFormat::Jpeg, [1, 2, 3]);
         let db_path = dir.path().join("vilra.sqlite");
         drop(init_sqlite_db(&db_path).unwrap());
         let mut processor = Processor {
@@ -1831,6 +1999,18 @@ mod tests {
             roots: HashSet::from([root.clone()]),
         };
         processor.index_image(&root, &bad, false).unwrap();
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        let image_id = get_sqlite_image_by_root_path_including_hidden(
+            &conn,
+            &root_string(&root),
+            "old/bad.jpg",
+        )
+        .unwrap()
+        .unwrap()
+        .id;
+        drop(conn);
+        fs::write(&bad, b"invalid").unwrap();
+        processor.index_image(&root, &bad, true).unwrap();
 
         let new_dir = root.join("new");
         fs::rename(&old_dir, &new_dir).unwrap();
@@ -1849,6 +2029,7 @@ mod tests {
         drop(conn);
 
         let unsupported = new_dir.join("bad.txt");
+        let mut events = processor.hub.subscribe();
         fs::rename(new_dir.join("bad.jpg"), &unsupported).unwrap();
         processor
             .handle_rename(&new_dir.join("bad.jpg"), &unsupported)
@@ -1857,6 +2038,21 @@ mod tests {
         assert!(list_sqlite_file_issues_for_root(&conn, &root_string(&root))
             .unwrap()
             .is_empty());
+        assert!(get_sqlite_image_by_root_path_including_hidden(
+            &conn,
+            &root_string(&root),
+            "new/bad.jpg"
+        )
+        .unwrap()
+        .is_some_and(|image| image.id == image_id && image.hidden));
+        assert!(
+            tagimage_db::sqlite::get_sqlite_image_by_id(&conn, &image_id)
+                .unwrap()
+                .is_none()
+        );
+        let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(emitted.iter().any(|event| event.kind == "image_removed"));
+        assert!(emitted.iter().any(|event| event.kind == "problems_changed"));
         drop(conn);
 
         fs::rename(&unsupported, new_dir.join("bad.jpg")).unwrap();
@@ -1869,6 +2065,13 @@ mod tests {
         assert!(list_sqlite_file_issues_for_root(&conn, &root_string(&root))
             .unwrap()
             .is_empty());
+        assert!(get_sqlite_image_by_root_path_including_hidden(
+            &conn,
+            &root_string(&root),
+            "new/bad.jpg"
+        )
+        .unwrap()
+        .is_some_and(|image| image.id == image_id && image.hidden));
     }
 
     #[cfg(unix)]

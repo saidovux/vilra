@@ -133,7 +133,6 @@ pub(crate) const INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS images_root_hidden_sort_idx ON images(root_path, hidden, lower(path), path, id)",
     "CREATE INDEX IF NOT EXISTS images_root_hidden_mtime_idx ON images(root_path, hidden, mtime, lower(path), path, id)",
     "CREATE INDEX IF NOT EXISTS images_root_hidden_size_idx ON images(root_path, hidden, size, lower(path), path, id)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS file_issues_root_path_idx ON file_issues(root_path, path)",
     "CREATE INDEX IF NOT EXISTS file_issues_severity_idx ON file_issues(severity)",
     "CREATE INDEX IF NOT EXISTS file_issues_kind_idx ON file_issues(kind)",
     "CREATE INDEX IF NOT EXISTS file_issues_image_id_idx ON file_issues(image_id)",

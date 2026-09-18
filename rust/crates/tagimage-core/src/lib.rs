@@ -215,54 +215,93 @@ pub fn inspect_supported_image(path: &Path) -> Result<ImageInspection, ImageInsp
         });
     };
     let before = file_fingerprint(path)?;
-    let file = File::open(path).map_err(|error| ImageInspectionError {
-        kind: ImageInspectionErrorKind::Unreadable,
-        expected_format: Some(expected_format),
-        detected_format: None,
-        fingerprint: Some(before),
-        detail: format!("open image {}: {error}", path.display()),
+    let file = File::open(path).map_err(|error| {
+        stable_inspection_error(
+            path,
+            before,
+            ImageInspectionError {
+                kind: ImageInspectionErrorKind::Unreadable,
+                expected_format: Some(expected_format),
+                detected_format: None,
+                fingerprint: Some(before),
+                detail: format!("open image {}: {error}", path.display()),
+            },
+        )
     })?;
     let reader = ImageReader::new(BufReader::new(file))
         .with_guessed_format()
-        .map_err(|error| ImageInspectionError {
-            kind: ImageInspectionErrorKind::Unreadable,
-            expected_format: Some(expected_format),
-            detected_format: None,
-            fingerprint: Some(before),
-            detail: format!("read image header {}: {error}", path.display()),
+        .map_err(|error| {
+            stable_inspection_error(
+                path,
+                before,
+                ImageInspectionError {
+                    kind: ImageInspectionErrorKind::Unreadable,
+                    expected_format: Some(expected_format),
+                    detected_format: None,
+                    fingerprint: Some(before),
+                    detail: format!("read image header {}: {error}", path.display()),
+                },
+            )
         })?;
     let Some(raw_format) = reader.format() else {
-        return Err(ImageInspectionError {
-            kind: ImageInspectionErrorKind::DecodeError,
-            expected_format: Some(expected_format),
-            detected_format: None,
-            fingerprint: Some(before),
-            detail: format!("unrecognized image content: {}", path.display()),
-        });
+        return Err(stable_inspection_error(
+            path,
+            before,
+            ImageInspectionError {
+                kind: ImageInspectionErrorKind::DecodeError,
+                expected_format: Some(expected_format),
+                detected_format: None,
+                fingerprint: Some(before),
+                detail: format!("unrecognized image content: {}", path.display()),
+            },
+        ));
     };
     let Some(detected_format) = SupportedImageFormat::from_image_format(raw_format) else {
-        return Err(ImageInspectionError {
-            kind: ImageInspectionErrorKind::UnsupportedContent,
-            expected_format: Some(expected_format),
-            detected_format: Some(image_format_name(raw_format)),
-            fingerprint: Some(before),
-            detail: format!(
-                "unsupported image content {}: {}",
-                image_format_name(raw_format),
-                path.display()
-            ),
-        });
+        return Err(stable_inspection_error(
+            path,
+            before,
+            ImageInspectionError {
+                kind: ImageInspectionErrorKind::UnsupportedContent,
+                expected_format: Some(expected_format),
+                detected_format: Some(image_format_name(raw_format)),
+                fingerprint: Some(before),
+                detail: format!(
+                    "unsupported image content {}: {}",
+                    image_format_name(raw_format),
+                    path.display()
+                ),
+            },
+        ));
     };
-    let (width, height) = reader
-        .into_dimensions()
-        .map_err(|error| ImageInspectionError {
-            kind: ImageInspectionErrorKind::DecodeError,
-            expected_format: Some(expected_format),
-            detected_format: Some(detected_format.as_str().to_string()),
-            fingerprint: Some(before),
-            detail: format!("read image dimensions {}: {error}", path.display()),
-        })?;
-    let after = file_fingerprint(path)?;
+    let (width, height) = reader.into_dimensions().map_err(|error| {
+        stable_inspection_error(
+            path,
+            before,
+            ImageInspectionError {
+                kind: ImageInspectionErrorKind::DecodeError,
+                expected_format: Some(expected_format),
+                detected_format: Some(detected_format.as_str().to_string()),
+                fingerprint: Some(before),
+                detail: format!("read image dimensions {}: {error}", path.display()),
+            },
+        )
+    })?;
+    let after = match file_fingerprint(path) {
+        Ok(after) => after,
+        Err(error) => {
+            return Err(classify_inspection_error_stability(
+                before,
+                Err(error),
+                ImageInspectionError {
+                    kind: ImageInspectionErrorKind::Unreadable,
+                    expected_format: Some(expected_format),
+                    detected_format: Some(detected_format.as_str().to_string()),
+                    fingerprint: Some(before),
+                    detail: format!("verify image stability: {}", path.display()),
+                },
+            ));
+        }
+    };
     if before != after {
         return Err(ImageInspectionError {
             kind: ImageInspectionErrorKind::ChangedDuringInspection,
@@ -279,6 +318,41 @@ pub fn inspect_supported_image(path: &Path) -> Result<ImageInspection, ImageInsp
         width,
         height,
     })
+}
+
+fn stable_inspection_error(
+    path: &Path,
+    initial: FileFingerprint,
+    error: ImageInspectionError,
+) -> ImageInspectionError {
+    classify_inspection_error_stability(initial, file_fingerprint(path), error)
+}
+
+fn classify_inspection_error_stability(
+    initial: FileFingerprint,
+    current: Result<FileFingerprint, ImageInspectionError>,
+    error: ImageInspectionError,
+) -> ImageInspectionError {
+    match current {
+        Ok(current) if current == initial => error,
+        Ok(current) => ImageInspectionError {
+            kind: ImageInspectionErrorKind::ChangedDuringInspection,
+            expected_format: error.expected_format,
+            detected_format: error.detected_format,
+            fingerprint: Some(current),
+            detail: format!("image changed during inspection: {}", error.detail),
+        },
+        Err(current_error) => ImageInspectionError {
+            kind: ImageInspectionErrorKind::ChangedDuringInspection,
+            expected_format: error.expected_format,
+            detected_format: error.detected_format,
+            fingerprint: current_error.fingerprint.or(Some(initial)),
+            detail: format!(
+                "image changed or became unavailable during inspection: {}; fingerprint recheck failed: {}",
+                error.detail, current_error.detail
+            ),
+        },
+    }
 }
 
 pub fn decode_supported_image(path: &Path) -> Result<DynamicImage, ImageInspectionError> {
@@ -495,6 +569,60 @@ mod tests {
         assert_eq!(
             inspect_supported_image(&png).unwrap_err().kind,
             ImageInspectionErrorKind::DecodeError
+        );
+    }
+
+    #[test]
+    fn post_error_stability_check_rejects_changed_or_missing_files() {
+        let initial = FileFingerprint {
+            size: 10,
+            mtime: 1,
+            mtime_ns: 100,
+        };
+        let changed = FileFingerprint {
+            size: 11,
+            mtime: 1,
+            mtime_ns: 101,
+        };
+        let permanent = || ImageInspectionError {
+            kind: ImageInspectionErrorKind::DecodeError,
+            expected_format: Some(SupportedImageFormat::Jpeg),
+            detected_format: None,
+            fingerprint: Some(initial),
+            detail: "invalid header".to_string(),
+        };
+
+        assert_eq!(
+            classify_inspection_error_stability(initial, Ok(initial), permanent()).kind,
+            ImageInspectionErrorKind::DecodeError
+        );
+        let changed_error = classify_inspection_error_stability(initial, Ok(changed), permanent());
+        assert_eq!(
+            changed_error.kind,
+            ImageInspectionErrorKind::ChangedDuringInspection
+        );
+        assert_eq!(changed_error.fingerprint, Some(changed));
+
+        let disappeared = ImageInspectionError {
+            kind: ImageInspectionErrorKind::Unreadable,
+            expected_format: Some(SupportedImageFormat::Jpeg),
+            detected_format: None,
+            fingerprint: None,
+            detail: "file disappeared".to_string(),
+        };
+        assert_eq!(
+            classify_inspection_error_stability(initial, Err(disappeared), permanent()).kind,
+            ImageInspectionErrorKind::ChangedDuringInspection
+        );
+
+        let unsupported = ImageInspectionError {
+            kind: ImageInspectionErrorKind::UnsupportedContent,
+            detected_format: Some("gif".to_string()),
+            ..permanent()
+        };
+        assert_eq!(
+            classify_inspection_error_stability(initial, Ok(changed), unsupported).kind,
+            ImageInspectionErrorKind::ChangedDuringInspection
         );
     }
 
