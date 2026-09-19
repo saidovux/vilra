@@ -225,7 +225,7 @@ pub fn claim_next_sqlite_job(
                     ORDER BY priority DESC, scheduled_at, created_at
                     LIMIT 1
                 )
-                RETURNING id, attempt, max_attempts, payload
+                RETURNING id, attempt, max_attempts, worker_id, payload
                 "#,
                 params![worker_id, job_type],
                 claimed_job_from_row,
@@ -249,7 +249,7 @@ pub fn claim_next_sqlite_job(
                     ORDER BY priority DESC, scheduled_at, created_at
                     LIMIT 1
                 )
-                RETURNING id, attempt, max_attempts, payload
+                RETURNING id, attempt, max_attempts, worker_id, payload
                 "#,
                 params![worker_id],
                 claimed_job_from_row,
@@ -283,21 +283,49 @@ pub fn mark_sqlite_job_succeeded(
     job_id: &str,
     total: Option<i32>,
     event_data: Option<Value>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     with_immediate_tx(conn, || {
-        let current = get_sqlite_job(conn, job_id)?
-            .ok_or_else(|| format!("sqlite job not found for success: {job_id}"))?;
-        let resolved_total = total.unwrap_or_else(|| {
-            if current.progress_total > 0 {
-                current.progress_total
-            } else {
-                current.progress_done
-            }
-        });
+        mark_sqlite_job_succeeded_in_tx(conn, job_id, None, total, event_data)
+    })
+}
 
-        if let Some(total) = total {
-            conn.execute(
-                r#"
+pub fn mark_sqlite_claimed_job_succeeded(
+    conn: &Connection,
+    job: &ClaimedJob,
+    total: Option<i32>,
+    event_data: Option<Value>,
+) -> Result<bool, String> {
+    with_immediate_tx(conn, || {
+        mark_sqlite_job_succeeded_in_tx(conn, &job.id, Some(&job.worker_id), total, event_data)
+    })
+}
+
+pub(crate) fn mark_sqlite_job_succeeded_in_tx(
+    conn: &Connection,
+    job_id: &str,
+    expected_worker_id: Option<&str>,
+    total: Option<i32>,
+    event_data: Option<Value>,
+) -> Result<bool, String> {
+    let current = get_sqlite_job(conn, job_id)?
+        .ok_or_else(|| format!("sqlite job not found for success: {job_id}"))?;
+    if current.state != "running"
+        || expected_worker_id
+            .is_some_and(|worker_id| current.worker_id.as_deref() != Some(worker_id))
+    {
+        return Ok(false);
+    }
+    let resolved_total = total.unwrap_or_else(|| {
+        if current.progress_total > 0 {
+            current.progress_total
+        } else {
+            current.progress_done
+        }
+    });
+
+    if let Some(total) = total {
+        conn.execute(
+            r#"
                 UPDATE jobs
                 SET state = 'succeeded',
                     progress_done = max(0, ?2),
@@ -305,33 +333,33 @@ pub fn mark_sqlite_job_succeeded(
                     finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                     error = NULL,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                WHERE id = ?1
+                WHERE id = ?1 AND state = 'running'
                 "#,
-                params![job_id, total],
-            )
-        } else {
-            conn.execute(
-                r#"
+            params![job_id, total],
+        )
+    } else {
+        conn.execute(
+            r#"
                 UPDATE jobs
                 SET state = 'succeeded',
                     finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                     error = NULL,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                WHERE id = ?1
+                WHERE id = ?1 AND state = 'running'
                 "#,
-                params![job_id],
-            )
-        }
-        .map_err(|e| format!("update sqlite job succeeded: {e}"))?;
-
-        set_latest_attempt_state(conn, job_id, "succeeded", None)?;
-        insert_job_event(
-            conn,
-            job_id,
-            "succeeded",
-            event_data.unwrap_or_else(|| json!({"total": resolved_total})),
+            params![job_id],
         )
-    })
+    }
+    .map_err(|e| format!("update sqlite job succeeded: {e}"))?;
+
+    set_latest_attempt_state(conn, job_id, "succeeded", None)?;
+    insert_job_event(
+        conn,
+        job_id,
+        "succeeded",
+        event_data.unwrap_or_else(|| json!({"total": resolved_total})),
+    )?;
+    Ok(true)
 }
 
 pub fn mark_sqlite_job_failed(
@@ -340,63 +368,168 @@ pub fn mark_sqlite_job_failed(
     error: &str,
     max_backoff_sec: i64,
     total_ms: Option<u128>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     with_immediate_tx(conn, || {
-        let job = get_sqlite_job(conn, job_id)?
-            .ok_or_else(|| format!("sqlite job not found for failure: {job_id}"))?;
-        let retries_left = (job.max_attempts - job.attempt).max(0);
-        let (next_state, event_name, backoff) = if retries_left > 0 {
-            let secs = 2_i64
-                .pow(job.attempt.max(1) as u32)
-                .min(max_backoff_sec.max(1));
-            ("queued", "retry_scheduled", secs)
-        } else {
-            ("failed", "failed", 0)
-        };
+        mark_sqlite_job_failed_in_tx(conn, job_id, None, error, max_backoff_sec, total_ms)
+    })
+}
 
-        if next_state == "queued" {
-            conn.execute(
-                r#"
+pub fn mark_sqlite_claimed_job_failed(
+    conn: &Connection,
+    job: &ClaimedJob,
+    error: &str,
+    max_backoff_sec: i64,
+    total_ms: Option<u128>,
+) -> Result<bool, String> {
+    with_immediate_tx(conn, || {
+        mark_sqlite_job_failed_in_tx(
+            conn,
+            &job.id,
+            Some(&job.worker_id),
+            error,
+            max_backoff_sec,
+            total_ms,
+        )
+    })
+}
+
+pub(crate) fn mark_sqlite_job_failed_in_tx(
+    conn: &Connection,
+    job_id: &str,
+    expected_worker_id: Option<&str>,
+    error: &str,
+    max_backoff_sec: i64,
+    total_ms: Option<u128>,
+) -> Result<bool, String> {
+    let job = get_sqlite_job(conn, job_id)?
+        .ok_or_else(|| format!("sqlite job not found for failure: {job_id}"))?;
+    if job.state != "running"
+        || expected_worker_id.is_some_and(|worker_id| job.worker_id.as_deref() != Some(worker_id))
+    {
+        return Ok(false);
+    }
+    let retries_left = (job.max_attempts - job.attempt).max(0);
+    let (next_state, event_name, backoff) = if retries_left > 0 {
+        let secs = 2_i64
+            .pow(job.attempt.max(1) as u32)
+            .min(max_backoff_sec.max(1));
+        ("queued", "retry_scheduled", secs)
+    } else {
+        ("failed", "failed", 0)
+    };
+
+    if next_state == "queued" {
+        conn.execute(
+            r#"
                 UPDATE jobs
                 SET state = 'queued',
                     error = ?2,
                     scheduled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', printf('+%d seconds', ?3)),
                     worker_id = NULL,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                WHERE id = ?1
+                WHERE id = ?1 AND state = 'running'
                 "#,
-                params![job_id, error, backoff],
-            )
-        } else {
-            conn.execute(
-                r#"
+            params![job_id, error, backoff],
+        )
+    } else {
+        conn.execute(
+            r#"
                 UPDATE jobs
                 SET state = 'failed',
                     error = ?2,
                     finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                WHERE id = ?1
+                WHERE id = ?1 AND state = 'running'
                 "#,
-                params![job_id, error],
-            )
-        }
-        .map_err(|e| format!("update sqlite job failed: {e}"))?;
-
-        set_latest_attempt_state(conn, job_id, next_state, Some(error))?;
-        insert_job_event(
-            conn,
-            job_id,
-            event_name,
-            json!({
-                "error": error,
-                "attempt": job.attempt,
-                "max_attempts": job.max_attempts,
-                "next_state": next_state,
-                "backoff": backoff,
-                "total_ms": total_ms.map(ms_to_u64),
-            }),
+            params![job_id, error],
         )
+    }
+    .map_err(|e| format!("update sqlite job failed: {e}"))?;
+
+    set_latest_attempt_state(conn, job_id, next_state, Some(error))?;
+    insert_job_event(
+        conn,
+        job_id,
+        event_name,
+        json!({
+            "error": error,
+            "attempt": job.attempt,
+            "max_attempts": job.max_attempts,
+            "next_state": next_state,
+            "backoff": backoff,
+            "total_ms": total_ms.map(ms_to_u64),
+        }),
+    )?;
+    Ok(true)
+}
+
+pub fn mark_sqlite_job_terminal_failed(
+    conn: &Connection,
+    job_id: &str,
+    error: &str,
+    total_ms: Option<u128>,
+) -> Result<bool, String> {
+    with_immediate_tx(conn, || {
+        mark_sqlite_job_terminal_failed_in_tx(conn, job_id, None, error, total_ms)
     })
+}
+
+pub fn mark_sqlite_claimed_job_terminal_failed(
+    conn: &Connection,
+    job: &ClaimedJob,
+    error: &str,
+    total_ms: Option<u128>,
+) -> Result<bool, String> {
+    with_immediate_tx(conn, || {
+        mark_sqlite_job_terminal_failed_in_tx(conn, &job.id, Some(&job.worker_id), error, total_ms)
+    })
+}
+
+pub(crate) fn mark_sqlite_job_terminal_failed_in_tx(
+    conn: &Connection,
+    job_id: &str,
+    expected_worker_id: Option<&str>,
+    error: &str,
+    total_ms: Option<u128>,
+) -> Result<bool, String> {
+    let job = get_sqlite_job(conn, job_id)?
+        .ok_or_else(|| format!("sqlite job not found for terminal failure: {job_id}"))?;
+    if job.state != "running"
+        || expected_worker_id.is_some_and(|worker_id| job.worker_id.as_deref() != Some(worker_id))
+    {
+        return Ok(false);
+    }
+    let updated = conn
+        .execute(
+            r#"
+            UPDATE jobs
+            SET state = 'failed',
+                error = ?2,
+                finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1 AND state = 'running'
+            "#,
+            params![job_id, error],
+        )
+        .map_err(|e| format!("update sqlite job terminal failure: {e}"))?;
+    if updated == 0 {
+        return Ok(false);
+    }
+    set_latest_attempt_state(conn, job_id, "failed", Some(error))?;
+    insert_job_event(
+        conn,
+        job_id,
+        "terminal_failed",
+        json!({
+            "error": error,
+            "attempt": job.attempt,
+            "max_attempts": job.max_attempts,
+            "next_state": "failed",
+            "backoff": 0,
+            "total_ms": total_ms.map(ms_to_u64),
+        }),
+    )?;
+    Ok(true)
 }
 
 pub fn get_sqlite_job(conn: &Connection, job_id: &str) -> Result<Option<SqliteJob>, String> {
@@ -474,7 +607,7 @@ fn find_active_job_by_dedupe(
     .optional()
 }
 
-fn insert_job_event(
+pub(crate) fn insert_job_event(
     conn: &Connection,
     job_id: &str,
     event: &str,
@@ -490,7 +623,7 @@ fn insert_job_event(
     Ok(())
 }
 
-fn set_latest_attempt_state(
+pub(crate) fn set_latest_attempt_state(
     conn: &Connection,
     job_id: &str,
     state: &str,
@@ -523,6 +656,7 @@ fn claimed_job_from_row(row: &Row<'_>) -> rusqlite::Result<ClaimedJob> {
         id: row.get("id")?,
         attempt: row.get("attempt")?,
         max_attempts: row.get("max_attempts")?,
+        worker_id: row.get("worker_id")?,
         payload,
     })
 }
@@ -579,8 +713,9 @@ fn ms_to_u64(value: u128) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_next_sqlite_job, enqueue_sqlite_job, get_sqlite_job, init_sqlite_db,
-        list_sqlite_job_events, mark_sqlite_job_failed, mark_sqlite_job_succeeded,
+        cancel_sqlite_job, claim_next_sqlite_job, enqueue_sqlite_job, get_sqlite_job,
+        init_sqlite_db, list_sqlite_job_events, mark_sqlite_claimed_job_succeeded,
+        mark_sqlite_job_failed, mark_sqlite_job_succeeded, mark_sqlite_job_terminal_failed,
     };
     use crate::sqlite_schema::SQLITE_SCHEMA_VERSION;
     use rusqlite::Connection;
@@ -1339,5 +1474,89 @@ mod tests {
         assert_eq!(event.data["next_state"], "failed");
         assert_eq!(event.data["backoff"], 0);
         assert_eq!(event.data["total_ms"], Value::Null);
+    }
+
+    #[test]
+    fn canceled_job_ignores_late_worker_success_and_failure() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+
+        for callback in ["success", "failure"] {
+            let enqueued = enqueue_sqlite_job(&conn, "thumb", payload(callback), 10, 3, None)
+                .expect("enqueue");
+            let claimed = claim_next_sqlite_job(&conn, Some("thumb"), "worker-a")
+                .expect("claim")
+                .expect("claimed");
+            assert!(cancel_sqlite_job(&conn, &claimed.id).expect("cancel"));
+            let applied = if callback == "success" {
+                mark_sqlite_job_succeeded(&conn, &claimed.id, Some(1), None).expect("late success")
+            } else {
+                mark_sqlite_job_failed(&conn, &claimed.id, "late failure", 120, None)
+                    .expect("late failure")
+            };
+            assert!(!applied);
+            let job = get_sqlite_job(&conn, &enqueued.job.id)
+                .expect("job")
+                .expect("job row");
+            assert_eq!(job.state, "canceled");
+            let names = event_names(&conn, &job.id);
+            assert!(!names.iter().any(|event| event == "succeeded"));
+            assert!(!names.iter().any(|event| event == "failed"));
+            assert!(!names.iter().any(|event| event == "retry_scheduled"));
+        }
+    }
+
+    #[test]
+    fn terminal_failure_never_requeues_and_records_terminal_event() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let enqueued =
+            enqueue_sqlite_job(&conn, "thumb", payload("permanent"), 10, 5, None).expect("enqueue");
+        let claimed = claim_next_sqlite_job(&conn, Some("thumb"), "worker-a")
+            .expect("claim")
+            .expect("claimed");
+
+        assert!(mark_sqlite_job_terminal_failed(
+            &conn,
+            &claimed.id,
+            "permanent decode failure",
+            Some(9),
+        )
+        .expect("terminal failure"));
+        let job = get_sqlite_job(&conn, &enqueued.job.id)
+            .expect("job")
+            .expect("job row");
+        assert_eq!(job.state, "failed");
+        assert_eq!(job.attempt, 1);
+        assert!(job.finished_at.is_some());
+        let event = list_sqlite_job_events(&conn, &job.id)
+            .expect("events")
+            .pop()
+            .expect("terminal event");
+        assert_eq!(event.event, "terminal_failed");
+        assert_eq!(event.data["backoff"], 0);
+    }
+
+    #[test]
+    fn claimed_transition_checks_worker_ownership() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        enqueue_sqlite_job(&conn, "thumb", payload("owned"), 10, 1, None).expect("enqueue");
+        let mut claimed = claim_next_sqlite_job(&conn, Some("thumb"), "worker-a")
+            .expect("claim")
+            .expect("claimed");
+        claimed.worker_id = "worker-b".to_string();
+
+        assert!(
+            !mark_sqlite_claimed_job_succeeded(&conn, &claimed, Some(1), None)
+                .expect("foreign success")
+        );
+        assert_eq!(
+            get_sqlite_job(&conn, &claimed.id)
+                .expect("job")
+                .expect("job row")
+                .state,
+            "running"
+        );
     }
 }

@@ -1,8 +1,9 @@
 use crate::{
     db::{
-        self, active_root, clean_tag_list, get_image_record, image_file_path, image_thumb_path,
-        require_roots, roots_from_session, set_root, thumb_path_for_id, validate_image_id,
-        AppState, ImageRow, ImagesQuery, ThumbRebuildInput,
+        self, active_root, clean_tag_list, get_image_file_issue, get_image_record,
+        get_image_record_for_delivery, image_file_path, image_thumb_path, require_roots,
+        roots_from_session, set_root, validate_image_id, AppState, ImageRecord, ImageRow,
+        ImagesQuery, ThumbRebuildInput,
     },
     error::ApiError,
 };
@@ -16,6 +17,8 @@ use axum::{
 use serde::{de, Deserialize, Deserializer};
 use serde_json::{json, Value};
 use std::{convert::Infallible, path::PathBuf, sync::Arc, time::Instant};
+use tagimage_core::FileIssueSeverity;
+use tagimage_db::sqlite::SqliteFileIssue;
 use tokio::time::{sleep, Duration};
 
 #[derive(Debug, Deserialize)]
@@ -434,9 +437,13 @@ pub async fn get_thumb_file(
         return Err(ApiError::not_found("Not found"));
     }
     let client = state.connect()?;
-    let session = db::load_session(&client)?;
-    let root = active_root(&session).ok_or_else(|| ApiError::bad_request("No folder set"))?;
-    let path = thumb_path_for_id(&root, img_id);
+    let image = get_image_record_for_delivery(&client, img_id)?
+        .ok_or_else(|| ApiError::not_found("Not found"))?;
+    if let Some(response) = unavailable_image_response(get_image_file_issue(&client, &image)?, true)
+    {
+        return Ok(response);
+    }
+    let path = image_thumb_path(&image);
     if !path.exists() {
         return Err(ApiError::not_found("Not found"));
     }
@@ -455,8 +462,12 @@ pub async fn get_thumb(
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let client = state.connect()?;
-    let image =
-        get_image_record(&client, &img_id)?.ok_or_else(|| ApiError::not_found("Not found"))?;
+    let image = get_image_record_for_delivery(&client, &img_id)?
+        .ok_or_else(|| ApiError::not_found("Not found"))?;
+    if let Some(response) = unavailable_image_response(get_image_file_issue(&client, &image)?, true)
+    {
+        return Ok(response);
+    }
     let db_elapsed_ms = elapsed_ms(started);
     let thumb_path = image_thumb_path(&image);
     if thumb_path.exists() {
@@ -475,7 +486,7 @@ pub async fn get_thumb(
     }
 
     if state.config.thumb_job_mode == "queue" {
-        let (job, _) = db::enqueue_thumb_job(
+        let enqueue = db::enqueue_thumb_job(
             &client,
             &img_id,
             &image.root_path,
@@ -484,7 +495,19 @@ pub async fn get_thumb(
             image.mtime,
             30,
             state.config.thumb_max_attempts,
-        )?;
+        );
+        let (job, _) = match enqueue {
+            Ok(enqueued) => enqueued,
+            Err(error) if error.status == StatusCode::UNPROCESSABLE_ENTITY => {
+                if let Some(response) =
+                    unavailable_image_response(get_image_file_issue(&client, &image)?, true)
+                {
+                    return Ok(response);
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         drop(client);
         if state.config.thumb_wait_ms > 0 {
             let deadline = Instant::now() + Duration::from_millis(state.config.thumb_wait_ms);
@@ -494,6 +517,12 @@ pub async fn get_thumb(
                 }
                 sleep(Duration::from_millis(state.config.thumb_poll_ms)).await;
             }
+        }
+        let check_client = state.connect()?;
+        if let Some(response) =
+            unavailable_image_response(get_image_file_issue(&check_client, &image)?, true)
+        {
+            return Ok(response);
         }
         if thumb_path.exists() {
             return file_response_with_timings(
@@ -531,18 +560,55 @@ pub async fn get_file(
     Path(img_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let client = state.connect()?;
-    let image =
-        get_image_record(&client, &img_id)?.ok_or_else(|| ApiError::not_found("Not found"))?;
+    let image = get_image_record_for_delivery(&client, &img_id)?
+        .ok_or_else(|| ApiError::not_found("Not found"))?;
+    let issue = get_image_file_issue(&client, &image)?;
+    if let Some(response) = unavailable_image_response(issue.clone(), false) {
+        return Ok(response);
+    }
     let path = image_file_path(&image);
     if !path.exists() {
         return Err(ApiError::not_found("File not found on disk"));
     }
+    let mime = original_image_content_type(&image, issue.as_ref())
+        .ok_or_else(|| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "Unsupported image"))?;
     drop(client);
-    let mime = mime_guess::from_path(&path)
-        .first()
-        .map(|mime| mime.to_string())
-        .unwrap_or_else(|| "application/octet-stream".to_string());
-    file_response(path, Some(&mime), Some("public, max-age=3600")).await
+    file_response(path, Some(mime), Some("public, max-age=3600")).await
+}
+
+fn unavailable_image_response(
+    issue: Option<SqliteFileIssue>,
+    include_issue: bool,
+) -> Option<Response> {
+    let issue = issue.filter(|issue| issue.severity == FileIssueSeverity::Error)?;
+    let payload = if include_issue {
+        json!({
+            "error": "image_unavailable",
+            "issue": {
+                "kind": issue.kind.as_str(),
+                "severity": issue.severity.as_str(),
+            }
+        })
+    } else {
+        json!({"error": "image_unavailable"})
+    };
+    Some((StatusCode::UNPROCESSABLE_ENTITY, Json(payload)).into_response())
+}
+
+fn original_image_content_type<'a>(
+    image: &'a ImageRecord,
+    issue: Option<&'a SqliteFileIssue>,
+) -> Option<&'static str> {
+    let format = issue
+        .filter(|issue| issue.severity == FileIssueSeverity::Warning)
+        .and_then(|issue| issue.detected_format.as_deref())
+        .unwrap_or(&image.ext);
+    match format.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
 }
 
 async fn file_response(
@@ -618,4 +684,183 @@ fn timing_headers(db_elapsed_ms: f64, server_timing: Option<String>) -> HeaderMa
 fn elapsed_ms(started: Instant) -> f64 {
     let ms = started.elapsed().as_secs_f64() * 1000.0;
     (ms * 100.0).round() / 100.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::AppConfig,
+        live::{EventHub, LiveIndexer},
+    };
+    use axum::body::to_bytes;
+    use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+    use std::{fs, io::Cursor};
+    use tagimage_core::{file_fingerprint, FileIssueKind, FileIssueSeverity, SupportedImageFormat};
+    use tagimage_db::sqlite::{
+        count_sqlite_jobs, init_sqlite_db, upsert_sqlite_file_issue, upsert_sqlite_image,
+        SqliteFileIssueUpsert, SqliteImageUpsert,
+    };
+
+    fn encoded(format: ImageFormat) -> Vec<u8> {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(4, 3, Rgb([7, 8, 9])));
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, format).unwrap();
+        bytes.into_inner()
+    }
+
+    fn test_state(repo_root: &std::path::Path, db_path: PathBuf) -> Arc<AppState> {
+        let events = EventHub::new();
+        let live = LiveIndexer::start(db_path.clone(), events.clone(), Vec::new()).unwrap();
+        Arc::new(AppState::new(
+            AppConfig {
+                sqlite_path: db_path,
+                init_db_only: false,
+                host: "127.0.0.1".to_string(),
+                port: 0,
+                repo_root: repo_root.to_path_buf(),
+                static_dir: repo_root.to_path_buf(),
+                thumb_job_mode: "queue".to_string(),
+                thumb_wait_ms: 0,
+                thumb_poll_ms: 10,
+                thumb_sync_fallback: false,
+                thumb_worker_expected: true,
+                metadata_worker: true,
+                metadata_authoritative: true,
+                thumb_max_attempts: 3,
+                job_stale_running_sec: 300,
+            },
+            live,
+            events,
+        ))
+    }
+
+    fn insert_delivery_image(
+        conn: &rusqlite::Connection,
+        root: &std::path::Path,
+        contents: &[u8],
+    ) -> tagimage_core::FileFingerprint {
+        fs::write(root.join("photo.jpg"), contents).unwrap();
+        let fingerprint = file_fingerprint(&root.join("photo.jpg")).unwrap();
+        upsert_sqlite_image(
+            conn,
+            &SqliteImageUpsert {
+                id: Some("image-1".to_string()),
+                root_path: root.to_string_lossy().to_string(),
+                path: "photo.jpg".to_string(),
+                thumb: ".imgindex/thumbs/image-1.jpg".to_string(),
+                size: fingerprint.size,
+                mtime: fingerprint.mtime,
+                width: 4,
+                height: 3,
+                ext: "jpg".to_string(),
+            },
+        )
+        .unwrap();
+        fingerprint
+    }
+
+    #[tokio::test]
+    async fn error_issue_blocks_stale_thumb_file_and_original_without_enqueuing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        let fingerprint = insert_delivery_image(&conn, dir.path(), &encoded(ImageFormat::Jpeg));
+        let thumb = dir.path().join(".imgindex/thumbs/image-1.jpg");
+        fs::create_dir_all(thumb.parent().unwrap()).unwrap();
+        fs::write(&thumb, b"stale thumbnail").unwrap();
+        upsert_sqlite_file_issue(
+            &conn,
+            &SqliteFileIssueUpsert {
+                image_id: Some("image-1".to_string()),
+                root_path: dir.path().to_string_lossy().to_string(),
+                path: "photo.jpg".to_string(),
+                severity: FileIssueSeverity::Error,
+                kind: FileIssueKind::DecodeError,
+                expected_format: Some(SupportedImageFormat::Jpeg),
+                detected_format: Some("jpeg".to_string()),
+                size: fingerprint.size,
+                mtime_ns: fingerprint.mtime_ns,
+                detail: Some("full decode failed".to_string()),
+            },
+        )
+        .unwrap();
+        drop(conn);
+        let state = test_state(dir.path(), db_path.clone());
+
+        for _ in 0..2 {
+            let response = get_thumb(State(state.clone()), Path("image-1".to_string()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(payload["error"], "image_unavailable");
+            assert_eq!(payload["issue"]["kind"], "decode_error");
+        }
+        let conn = state.connect().unwrap();
+        assert_eq!(count_sqlite_jobs(&conn, Some("thumb"), None).unwrap(), 0);
+        drop(conn);
+
+        let thumb_file = get_thumb_file(State(state.clone()), Path("image-1.jpg".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(thumb_file.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let original = get_file(State(state), Path("image-1".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(original.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(original.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"],
+            "image_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatch_warning_serves_thumb_and_uses_detected_original_mime() {
+        for (format, detected, mime) in [
+            (ImageFormat::Png, "png", "image/png"),
+            (ImageFormat::WebP, "webp", "image/webp"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("db.sqlite");
+            let conn = init_sqlite_db(&db_path).unwrap();
+            let fingerprint = insert_delivery_image(&conn, dir.path(), &encoded(format));
+            let thumb = dir.path().join(".imgindex/thumbs/image-1.jpg");
+            fs::create_dir_all(thumb.parent().unwrap()).unwrap();
+            fs::write(&thumb, b"thumbnail").unwrap();
+            upsert_sqlite_file_issue(
+                &conn,
+                &SqliteFileIssueUpsert {
+                    image_id: Some("image-1".to_string()),
+                    root_path: dir.path().to_string_lossy().to_string(),
+                    path: "photo.jpg".to_string(),
+                    severity: FileIssueSeverity::Warning,
+                    kind: FileIssueKind::FormatMismatch,
+                    expected_format: Some(SupportedImageFormat::Jpeg),
+                    detected_format: Some(detected.to_string()),
+                    size: fingerprint.size,
+                    mtime_ns: fingerprint.mtime_ns,
+                    detail: Some("format mismatch".to_string()),
+                },
+            )
+            .unwrap();
+            drop(conn);
+            let state = test_state(dir.path(), db_path);
+
+            let thumb_response = get_thumb(State(state.clone()), Path("image-1".to_string()))
+                .await
+                .unwrap();
+            assert_eq!(thumb_response.status(), StatusCode::OK);
+            let file_response = get_file(State(state), Path("image-1".to_string()))
+                .await
+                .unwrap();
+            assert_eq!(file_response.status(), StatusCode::OK);
+            assert_eq!(
+                file_response.headers().get(header::CONTENT_TYPE).unwrap(),
+                mime
+            );
+        }
+    }
 }

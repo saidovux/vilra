@@ -14,17 +14,16 @@ use std::{
 use tagimage_db::sqlite::{
     self, clean_sqlite_tag_list, count_sqlite_jobs, count_sqlite_stale_running_jobs,
     create_sqlite_user_tag_entry, delete_sqlite_tag_definition, fetch_sqlite_tags_for_image_ids,
-    folder_sqlite_tree_rows, get_sqlite_image_by_id, get_sqlite_job_api_value, list_sqlite_jobs,
+    folder_sqlite_tree_rows, get_sqlite_file_issue_for_image, get_sqlite_image_by_id,
+    get_sqlite_image_by_id_including_hidden, get_sqlite_job_api_value, list_sqlite_jobs,
     list_sqlite_thumb_rebuild_rows, load_sqlite_session, open_sqlite_runtime_db,
     query_sqlite_images_page, save_sqlite_session_value, set_sqlite_session_root,
     sqlite_roots_from_session, tag_sqlite_summary_rows, update_sqlite_tag_definition,
-    SqliteAutoTagCleanupResult, SqliteImagesQuery, SqliteSession,
+    SqliteAutoTagCleanupResult, SqliteFileIssue, SqliteImageRecord, SqliteImagesQuery,
+    SqliteSession,
 };
 
 const VALID_JOB_STATES: &[&str] = &["queued", "running", "succeeded", "failed", "canceled"];
-const INDEX_DIR_NAME: &str = ".imgindex";
-const THUMBS_DIR_NAME: &str = "thumbs";
-
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
@@ -54,6 +53,7 @@ pub struct ImageRecord {
     pub mtime: i64,
     pub width: i32,
     pub height: i32,
+    pub ext: String,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +171,9 @@ fn map_db_error(error: String) -> ApiError {
         _ if error.starts_with("No folder set") => ApiError::bad_request(error),
         _ if error.starts_with("Unsupported sort") => ApiError::bad_request(error),
         _ if error.starts_with("Not a directory") => ApiError::bad_request(error),
+        _ if error.starts_with("image unavailable:") => {
+            ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, error)
+        }
         _ => ApiError::internal(format!("Database error: {error}")),
     }
 }
@@ -272,16 +275,39 @@ pub fn get_image_record(
 ) -> Result<Option<ImageRecord>, ApiError> {
     Ok(get_sqlite_image_by_id(conn, image_id)
         .map_err(map_db_error)?
-        .map(|row| ImageRecord {
-            id: row.id,
-            root_path: row.root_path,
-            path: row.path,
-            thumb: row.thumb,
-            size: row.size,
-            mtime: row.mtime,
-            width: row.width,
-            height: row.height,
-        }))
+        .map(image_record_from_sqlite))
+}
+
+pub fn get_image_record_for_delivery(
+    conn: &Connection,
+    image_id: &str,
+) -> Result<Option<ImageRecord>, ApiError> {
+    Ok(get_sqlite_image_by_id_including_hidden(conn, image_id)
+        .map_err(map_db_error)?
+        .filter(|row| !row.hidden)
+        .map(image_record_from_sqlite))
+}
+
+pub fn get_image_file_issue(
+    conn: &Connection,
+    image: &ImageRecord,
+) -> Result<Option<SqliteFileIssue>, ApiError> {
+    get_sqlite_file_issue_for_image(conn, &image.id, &image.root_path, &image.path)
+        .map_err(map_db_error)
+}
+
+fn image_record_from_sqlite(row: SqliteImageRecord) -> ImageRecord {
+    ImageRecord {
+        id: row.id,
+        root_path: row.root_path,
+        path: row.path,
+        thumb: row.thumb,
+        size: row.size,
+        mtime: row.mtime,
+        width: row.width,
+        height: row.height,
+        ext: row.ext,
+    }
 }
 
 pub fn replace_image_user_tags(
@@ -580,13 +606,6 @@ pub fn status_payload(state: &AppState, conn: &Connection) -> Result<Value, ApiE
             "periodic_scan": false,
         },
     }))
-}
-
-pub fn thumb_path_for_id(root: &str, image_id: &str) -> PathBuf {
-    Path::new(root)
-        .join(INDEX_DIR_NAME)
-        .join(THUMBS_DIR_NAME)
-        .join(format!("{image_id}.jpg"))
 }
 
 pub fn image_thumb_path(image: &ImageRecord) -> PathBuf {

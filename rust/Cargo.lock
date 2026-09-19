@@ -799,7 +799,6 @@ dependencies = [
  "dotenvy",
  "futures-core",
  "image",
- "mime_guess",
  "notify",
  "notify-debouncer-full",
  "rusqlite",
@@ -819,9 +818,11 @@ version = "0.1.0"
 dependencies = [
  "dotenvy",
  "image",
+ "rusqlite",
  "serde_json",
  "tagimage-core",
  "tagimage-db",
+ "tempfile",
  "tokio",
 ]
 
@@ -831,10 +832,12 @@ version = "0.1.0"
 dependencies = [
  "dotenvy",
  "image",
+ "rusqlite",
  "serde",
  "serde_json",
  "tagimage-core",
  "tagimage-db",
+ "tempfile",
  "tokio",
 ]
 

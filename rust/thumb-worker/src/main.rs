@@ -6,11 +6,18 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tagimage_core::{parse_u64_env, parse_usize_env, ThumbJobPayload};
-use tagimage_db::sqlite::{
-    claim_next_sqlite_thumb_job, mark_sqlite_thumb_failed, mark_sqlite_thumb_succeeded,
-    open_sqlite_runtime_db, resolve_sqlite_runtime_path,
+use tagimage_core::{
+    decode_supported_image, expected_format_for_path, file_fingerprint, parse_u64_env,
+    parse_usize_env, FileIssueSeverity, ImageInspectionError, ImageInspectionErrorKind,
+    ThumbJobPayload,
 };
+use tagimage_db::sqlite::{
+    claim_next_sqlite_thumb_job, get_sqlite_file_issue_for_image,
+    mark_sqlite_claimed_job_terminal_failed, mark_sqlite_image_job_terminal_failed,
+    mark_sqlite_thumb_failed, mark_sqlite_thumb_succeeded, open_sqlite_runtime_db,
+    record_sqlite_permanent_image_job_failure, resolve_sqlite_runtime_path, SqliteFileIssueUpsert,
+};
+use tagimage_db::ClaimedJob;
 use tokio::time::sleep;
 
 #[derive(Debug, Clone)]
@@ -166,9 +173,11 @@ fn lock_worker_metrics(metrics: &Arc<Mutex<WorkerMetrics>>) -> MutexGuard<'_, Wo
     }
 }
 
-fn render_thumb(source: &Path, target: &Path, max_size: (u32, u32)) -> Result<(), String> {
-    let dyn_img =
-        image::open(source).map_err(|e| format!("open image {}: {e}", source.display()))?;
+fn render_thumb(
+    dyn_img: image::DynamicImage,
+    target: &Path,
+    max_size: (u32, u32),
+) -> Result<(), String> {
     let thumb = dyn_img.thumbnail(max_size.0, max_size.1).to_rgb8();
 
     if let Some(parent) = target.parent() {
@@ -195,17 +204,212 @@ fn render_thumb(source: &Path, target: &Path, max_size: (u32, u32)) -> Result<()
 
 fn process_payload(
     payload: Value,
-) -> Result<(PathBuf, PathBuf, i64, (u32, u32), Option<String>), String> {
+) -> Result<(ThumbJobPayload, PathBuf, PathBuf, (u32, u32)), String> {
     let parsed: ThumbJobPayload =
         serde_json::from_value(payload).map_err(|e| format!("invalid payload: {e}"))?;
     let source = Path::new(&parsed.root_path).join(&parsed.path);
     let target = Path::new(&parsed.root_path).join(&parsed.thumb);
-    let source_mtime = parsed
-        .mtime
-        .or_else(|| file_mtime(&source))
-        .ok_or_else(|| format!("cannot read source mtime: {}", source.display()))?;
     let max_size = parse_max_size(&parsed);
-    Ok((source, target, source_mtime, max_size, parsed.image_id))
+    Ok((parsed, source, target, max_size))
+}
+
+#[derive(Debug)]
+enum ThumbExecution {
+    Succeeded(ThumbJobMetrics),
+    Failed { error: String, total_ms: u128 },
+}
+
+fn execute_thumb_job(
+    conn: &rusqlite::Connection,
+    job: &ClaimedJob,
+    max_backoff_sec: i64,
+) -> Result<ThumbExecution, String> {
+    execute_thumb_job_with_decoder(conn, job, max_backoff_sec, decode_supported_image)
+}
+
+fn execute_thumb_job_with_decoder<F>(
+    conn: &rusqlite::Connection,
+    job: &ClaimedJob,
+    max_backoff_sec: i64,
+    decoder: F,
+) -> Result<ThumbExecution, String>
+where
+    F: FnOnce(&Path) -> Result<image::DynamicImage, ImageInspectionError>,
+{
+    let started = Instant::now();
+    let (payload, source, target, max_size) = match process_payload(job.payload.clone()) {
+        Ok(value) => value,
+        Err(error) => {
+            mark_sqlite_claimed_job_terminal_failed(
+                conn,
+                job,
+                &error,
+                Some(started.elapsed().as_millis()),
+            )?;
+            return Ok(ThumbExecution::Failed {
+                error,
+                total_ms: started.elapsed().as_millis(),
+            });
+        }
+    };
+    let Some(image_id) = payload.image_id.as_deref() else {
+        let error = "thumbnail job has no image_id".to_string();
+        mark_sqlite_claimed_job_terminal_failed(
+            conn,
+            job,
+            &error,
+            Some(started.elapsed().as_millis()),
+        )?;
+        return Ok(ThumbExecution::Failed {
+            error,
+            total_ms: started.elapsed().as_millis(),
+        });
+    };
+    if expected_format_for_path(&source).is_none() {
+        let error = format!("unsupported image job path: {}", source.display());
+        mark_sqlite_claimed_job_terminal_failed(
+            conn,
+            job,
+            &error,
+            Some(started.elapsed().as_millis()),
+        )?;
+        return Ok(ThumbExecution::Failed {
+            error,
+            total_ms: started.elapsed().as_millis(),
+        });
+    }
+
+    let fingerprint = match file_fingerprint(&source) {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            let total_ms = started.elapsed().as_millis();
+            mark_sqlite_thumb_failed(conn, job, &error.detail, max_backoff_sec, Some(total_ms))?;
+            return Ok(ThumbExecution::Failed {
+                error: error.detail,
+                total_ms,
+            });
+        }
+    };
+    if let Some(issue) =
+        get_sqlite_file_issue_for_image(conn, image_id, &payload.root_path, &payload.path)?
+    {
+        if issue.severity == FileIssueSeverity::Error
+            && issue.size == fingerprint.size
+            && issue.mtime_ns == fingerprint.mtime_ns
+        {
+            let error = format!("image unavailable: {}", issue.kind.as_str());
+            let total_ms = started.elapsed().as_millis();
+            mark_sqlite_image_job_terminal_failed(conn, job, image_id, &error, Some(total_ms))?;
+            return Ok(ThumbExecution::Failed { error, total_ms });
+        }
+    }
+
+    let decoded = match decoder(&source) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            let total_ms = started.elapsed().as_millis();
+            match error.kind {
+                ImageInspectionErrorKind::DecodeError
+                | ImageInspectionErrorKind::UnsupportedContent => {
+                    let issue = permanent_issue_from_error(&payload, image_id, &error)?;
+                    record_sqlite_permanent_image_job_failure(
+                        conn,
+                        job,
+                        image_id,
+                        &issue,
+                        &error.detail,
+                        Some(total_ms),
+                    )?;
+                }
+                ImageInspectionErrorKind::UnsupportedPath => {
+                    mark_sqlite_claimed_job_terminal_failed(
+                        conn,
+                        job,
+                        &error.detail,
+                        Some(total_ms),
+                    )?;
+                }
+                ImageInspectionErrorKind::ChangedDuringInspection
+                | ImageInspectionErrorKind::Unreadable => {
+                    mark_sqlite_thumb_failed(
+                        conn,
+                        job,
+                        &error.detail,
+                        max_backoff_sec,
+                        Some(total_ms),
+                    )?;
+                }
+            }
+            return Ok(ThumbExecution::Failed {
+                error: error.detail,
+                total_ms,
+            });
+        }
+    };
+
+    let source_mtime = payload.mtime.unwrap_or(fingerprint.mtime);
+    let source_bytes = Some(fingerprint.size.max(0) as u64);
+    let mut skipped_existing = false;
+    let mut render_ms = 0_u128;
+    if let Some(current_mtime) = file_mtime(&target) {
+        if current_mtime >= source_mtime {
+            skipped_existing = true;
+        }
+    }
+    if !skipped_existing {
+        let render_started = Instant::now();
+        if let Err(error) = render_thumb(decoded, &target, max_size) {
+            let total_ms = started.elapsed().as_millis();
+            mark_sqlite_thumb_failed(conn, job, &error, max_backoff_sec, Some(total_ms))?;
+            return Ok(ThumbExecution::Failed { error, total_ms });
+        }
+        render_ms = render_started.elapsed().as_millis();
+    }
+    let total_ms = started.elapsed().as_millis();
+    let metrics = ThumbJobMetrics {
+        image_id: Some(image_id.to_string()),
+        ext: ext_lower(&source),
+        total_ms,
+        render_ms,
+        source_bytes,
+        thumb_bytes: file_size(&target),
+        skipped_existing,
+    };
+    let event_data = json!({
+        "total_ms": metrics.total_ms.min(u64::MAX as u128) as u64,
+        "render_ms": metrics.render_ms.min(u64::MAX as u128) as u64,
+        "source_bytes": metrics.source_bytes,
+        "thumb_bytes": metrics.thumb_bytes,
+        "skipped_existing": metrics.skipped_existing,
+        "ext": &metrics.ext,
+    });
+    mark_sqlite_thumb_succeeded(conn, job, Some(event_data))?;
+    Ok(ThumbExecution::Succeeded(metrics))
+}
+
+fn permanent_issue_from_error(
+    payload: &ThumbJobPayload,
+    image_id: &str,
+    error: &ImageInspectionError,
+) -> Result<SqliteFileIssueUpsert, String> {
+    let kind = error
+        .file_issue_kind()
+        .ok_or_else(|| format!("non-permanent image error: {}", error.detail))?;
+    let fingerprint = error
+        .fingerprint
+        .ok_or_else(|| format!("permanent image error has no fingerprint: {}", error.detail))?;
+    Ok(SqliteFileIssueUpsert {
+        image_id: Some(image_id.to_string()),
+        root_path: payload.root_path.clone(),
+        path: payload.path.clone(),
+        severity: FileIssueSeverity::Error,
+        kind,
+        expected_format: error.expected_format,
+        detected_format: error.detected_format.clone(),
+        size: fingerprint.size,
+        mtime_ns: fingerprint.mtime_ns,
+        detail: Some(error.detail.clone()),
+    })
 }
 
 async fn run_worker_loop(
@@ -238,48 +442,8 @@ async fn run_worker_loop(
             continue;
         };
 
-        let job_started = Instant::now();
-
-        let result = (|| -> Result<ThumbJobMetrics, String> {
-            let (source, target, source_mtime, max_size, image_id) =
-                process_payload(job.payload.clone())?;
-            if !source.exists() {
-                return Err(format!("source not found: {}", source.display()));
-            }
-
-            let ext = ext_lower(&source);
-            let source_bytes = file_size(&source);
-            let mut skipped_existing = false;
-            let mut render_ms = 0_u128;
-
-            if let Some(current_mtime) = file_mtime(&target) {
-                if current_mtime >= source_mtime {
-                    skipped_existing = true;
-                }
-            }
-
-            if !skipped_existing {
-                let render_started = Instant::now();
-                render_thumb(&source, &target, max_size)?;
-                render_ms = render_started.elapsed().as_millis();
-            }
-
-            let thumb_bytes = file_size(&target);
-            let total_ms = job_started.elapsed().as_millis();
-
-            Ok(ThumbJobMetrics {
-                image_id,
-                ext,
-                total_ms,
-                render_ms,
-                source_bytes,
-                thumb_bytes,
-                skipped_existing,
-            })
-        })();
-
-        match result {
-            Ok(job_metrics) => {
+        match execute_thumb_job(&conn, &job, max_backoff_sec)? {
+            ThumbExecution::Succeeded(job_metrics) => {
                 let image = job_metrics.image_id.as_deref().unwrap_or("unknown");
                 eprintln!(
                     "[rust-thumb-worker] job_done worker={} slot={} job={} image={} ext={} total_ms={} render_ms={} source_bytes={} thumb_bytes={} skipped={}",
@@ -308,43 +472,17 @@ async fn run_worker_loop(
                     );
                 }
 
-                let success_metrics = json!({
-                    "total_ms": job_metrics.total_ms.min(u64::MAX as u128) as u64,
-                    "render_ms": job_metrics.render_ms.min(u64::MAX as u128) as u64,
-                    "source_bytes": job_metrics.source_bytes,
-                    "thumb_bytes": job_metrics.thumb_bytes,
-                    "skipped_existing": job_metrics.skipped_existing,
-                    "ext": &job_metrics.ext,
-                });
-                if let Err(e) = mark_sqlite_thumb_succeeded(&conn, &job.id, Some(success_metrics)) {
-                    eprintln!(
-                        "[rust-thumb-worker] mark success failed worker={} slot={} job={} error={}",
-                        worker_id, slot, job.id, e
-                    );
-                }
-
                 {
                     let mut worker_metrics = lock_worker_metrics(&shared_metrics);
                     worker_metrics.record_success(&job_metrics);
                     worker_metrics.maybe_log_summary(metrics_interval_sec, worker_count);
                 }
             }
-            Err(err) => {
-                let total_ms = job_started.elapsed().as_millis();
+            ThumbExecution::Failed { error, total_ms } => {
                 eprintln!(
                     "[rust-thumb-worker] job_failed worker={} slot={} job={} total_ms={} error={}",
-                    worker_id, slot, job.id, total_ms, err
+                    worker_id, slot, job.id, total_ms, error
                 );
-
-                if let Err(e) =
-                    mark_sqlite_thumb_failed(&conn, &job.id, &err, max_backoff_sec, Some(total_ms))
-                {
-                    eprintln!(
-                        "[rust-thumb-worker] mark fail failed worker={} slot={} job={} error={}",
-                        worker_id, slot, job.id, e
-                    );
-                }
-
                 {
                     let mut worker_metrics = lock_worker_metrics(&shared_metrics);
                     worker_metrics.record_failure(total_ms);
@@ -437,5 +575,353 @@ async fn main() {
     if let Err(e) = run().await {
         eprintln!("[rust-thumb-worker] fatal: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+    use std::io::Cursor;
+    use tagimage_core::{
+        file_fingerprint, inspect_supported_image, FileFingerprint, FileIssueKind,
+        SupportedImageFormat,
+    };
+    use tagimage_db::sqlite::{
+        enqueue_sqlite_job, enqueue_sqlite_thumb_job, get_sqlite_file_issue, get_sqlite_job,
+        init_sqlite_db, upsert_sqlite_file_issue, upsert_sqlite_image, SqliteImageUpsert,
+    };
+
+    fn encoded(format: ImageFormat) -> Vec<u8> {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(8, 6, Rgb([20, 40, 60])));
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, format).unwrap();
+        bytes.into_inner()
+    }
+
+    fn corrupt_png_pixels() -> Vec<u8> {
+        let mut bytes = encoded(ImageFormat::Png);
+        let chunk_type = bytes
+            .windows(4)
+            .position(|window| window == b"IDAT")
+            .expect("IDAT chunk");
+        bytes[chunk_type + 5] ^= 0x7f;
+        bytes
+    }
+
+    fn setup_claimed_thumb(
+        root: &Path,
+        conn: &rusqlite::Connection,
+        image_id: &str,
+        path: &str,
+        contents: &[u8],
+    ) -> (ClaimedJob, PathBuf) {
+        let source = root.join(path);
+        if let Some(parent) = source.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&source, contents).unwrap();
+        let fingerprint = file_fingerprint(&source).unwrap();
+        let thumb = format!(".imgindex/thumbs/{image_id}.jpg");
+        upsert_sqlite_image(
+            conn,
+            &SqliteImageUpsert {
+                id: Some(image_id.to_string()),
+                root_path: root.to_string_lossy().to_string(),
+                path: path.to_string(),
+                thumb: thumb.clone(),
+                size: fingerprint.size,
+                mtime: fingerprint.mtime,
+                width: 8,
+                height: 6,
+                ext: ext_lower(&source),
+            },
+        )
+        .unwrap();
+        enqueue_sqlite_thumb_job(
+            conn,
+            image_id,
+            &root.to_string_lossy(),
+            path,
+            &thumb,
+            fingerprint.mtime,
+            20,
+            3,
+        )
+        .unwrap();
+        let claimed = claim_next_sqlite_thumb_job(conn, "thumb-test")
+            .unwrap()
+            .expect("claimed thumb");
+        (claimed, root.join(thumb))
+    }
+
+    #[test]
+    fn supported_and_mismatched_content_generate_thumbnails() {
+        for (name, format, warning) in [
+            ("valid.jpg", ImageFormat::Jpeg, false),
+            ("valid.png", ImageFormat::Png, false),
+            ("valid.webp", ImageFormat::WebP, false),
+            ("png-as-jpeg.jpg", ImageFormat::Png, true),
+            ("webp-as-jpeg.jpg", ImageFormat::WebP, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = init_sqlite_db(&dir.path().join("db.sqlite")).unwrap();
+            let (job, target) =
+                setup_claimed_thumb(dir.path(), &conn, "image-1", name, &encoded(format));
+            if warning {
+                let fingerprint = file_fingerprint(&dir.path().join(name)).unwrap();
+                upsert_sqlite_file_issue(
+                    &conn,
+                    &SqliteFileIssueUpsert {
+                        image_id: Some("image-1".to_string()),
+                        root_path: dir.path().to_string_lossy().to_string(),
+                        path: name.to_string(),
+                        severity: FileIssueSeverity::Warning,
+                        kind: FileIssueKind::FormatMismatch,
+                        expected_format: Some(SupportedImageFormat::Jpeg),
+                        detected_format: Some(if format == ImageFormat::Png {
+                            "png".to_string()
+                        } else {
+                            "webp".to_string()
+                        }),
+                        size: fingerprint.size,
+                        mtime_ns: fingerprint.mtime_ns,
+                        detail: Some("mismatch".to_string()),
+                    },
+                )
+                .unwrap();
+            }
+
+            assert!(matches!(
+                execute_thumb_job(&conn, &job, 120).unwrap(),
+                ThumbExecution::Succeeded(_)
+            ));
+            assert!(target.exists(), "thumbnail missing for {name}");
+            assert_eq!(
+                get_sqlite_job(&conn, &job.id).unwrap().unwrap().state,
+                "succeeded"
+            );
+            if warning {
+                assert_eq!(
+                    get_sqlite_file_issue(&conn, &dir.path().to_string_lossy(), name)
+                        .unwrap()
+                        .unwrap()
+                        .severity,
+                    FileIssueSeverity::Warning
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_content_is_terminal_and_creates_no_thumbnail() {
+        for (name, contents) in [
+            (
+                "gif-as-jpeg.jpg",
+                b"GIF89a\x01\0\x01\0\x80\0\0\0\0\0\xff\xff\xff".as_slice(),
+            ),
+            ("tiff-as-jpeg.jpg", b"II*\0\x08\0\0\0\0\0\0\0".as_slice()),
+            (
+                "bmp-as-jpeg.jpg",
+                b"BM\x1a\0\0\0\0\0\0\0\x1a\0\0\0\x0c\0\0\0\x01\0\x01\0\x01\0\x18\0".as_slice(),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = init_sqlite_db(&dir.path().join("db.sqlite")).unwrap();
+            let (job, target) = setup_claimed_thumb(dir.path(), &conn, "image-1", name, contents);
+
+            assert!(matches!(
+                execute_thumb_job(&conn, &job, 120).unwrap(),
+                ThumbExecution::Failed { .. }
+            ));
+            assert!(!target.exists());
+            assert_eq!(
+                get_sqlite_job(&conn, &job.id).unwrap().unwrap().state,
+                "failed"
+            );
+            assert_eq!(
+                get_sqlite_file_issue(&conn, &dir.path().to_string_lossy(), name)
+                    .unwrap()
+                    .unwrap()
+                    .kind,
+                FileIssueKind::UnsupportedContent
+            );
+        }
+    }
+
+    #[test]
+    fn header_valid_full_decode_failure_creates_terminal_decode_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = init_sqlite_db(&dir.path().join("db.sqlite")).unwrap();
+        let contents = corrupt_png_pixels();
+        let source = dir.path().join("corrupt.png");
+        fs::write(&source, &contents).unwrap();
+        assert!(inspect_supported_image(&source).is_ok());
+        assert_eq!(
+            decode_supported_image(&source).unwrap_err().kind,
+            ImageInspectionErrorKind::DecodeError
+        );
+        fs::remove_file(&source).unwrap();
+        let (job, target) =
+            setup_claimed_thumb(dir.path(), &conn, "image-1", "corrupt.png", &contents);
+
+        execute_thumb_job(&conn, &job, 120).unwrap();
+        assert!(!target.exists());
+        assert_eq!(
+            get_sqlite_file_issue(&conn, &dir.path().to_string_lossy(), "corrupt.png")
+                .unwrap()
+                .unwrap()
+                .kind,
+            FileIssueKind::DecodeError
+        );
+    }
+
+    #[test]
+    fn changed_during_decode_is_retryable_without_file_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = init_sqlite_db(&dir.path().join("db.sqlite")).unwrap();
+        let (job, _) = setup_claimed_thumb(
+            dir.path(),
+            &conn,
+            "image-1",
+            "changing.jpg",
+            &encoded(ImageFormat::Jpeg),
+        );
+        let fingerprint = file_fingerprint(&dir.path().join("changing.jpg")).unwrap();
+        let result = execute_thumb_job_with_decoder(&conn, &job, 120, |_| {
+            Err(ImageInspectionError {
+                kind: ImageInspectionErrorKind::ChangedDuringInspection,
+                expected_format: Some(SupportedImageFormat::Jpeg),
+                detected_format: Some("jpeg".to_string()),
+                fingerprint: Some(FileFingerprint {
+                    size: fingerprint.size + 1,
+                    ..fingerprint
+                }),
+                detail: "changed while decoding".to_string(),
+            })
+        })
+        .unwrap();
+        assert!(matches!(result, ThumbExecution::Failed { .. }));
+        assert_eq!(
+            get_sqlite_job(&conn, &job.id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert!(
+            get_sqlite_file_issue(&conn, &dir.path().to_string_lossy(), "changing.jpg")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extensionless_legacy_job_is_terminal_without_sniffing_or_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = init_sqlite_db(&dir.path().join("db.sqlite")).unwrap();
+        let path = "extensionless";
+        fs::write(dir.path().join(path), encoded(ImageFormat::Jpeg)).unwrap();
+        let job = enqueue_sqlite_job(
+            &conn,
+            "thumb",
+            json!({
+                "image_id": "image-1",
+                "root_path": dir.path(),
+                "path": path,
+                "thumb": ".imgindex/thumbs/image-1.jpg",
+                "mtime": 1,
+                "max_size": [640, 640],
+            }),
+            10,
+            3,
+            None,
+        )
+        .unwrap();
+        let claimed = claim_next_sqlite_thumb_job(&conn, "thumb-test")
+            .unwrap()
+            .unwrap();
+        execute_thumb_job_with_decoder(&conn, &claimed, 120, |_| {
+            panic!("extensionless job must not be content-sniffed")
+        })
+        .unwrap();
+        assert_eq!(
+            get_sqlite_job(&conn, &job.job.id).unwrap().unwrap().state,
+            "failed"
+        );
+        assert!(
+            get_sqlite_file_issue(&conn, &dir.path().to_string_lossy(), path)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unchanged_known_error_skips_full_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = init_sqlite_db(&dir.path().join("db.sqlite")).unwrap();
+        let path = "known.jpg";
+        let contents = encoded(ImageFormat::Jpeg);
+        let source = dir.path().join(path);
+        fs::write(&source, &contents).unwrap();
+        let fingerprint = file_fingerprint(&source).unwrap();
+        upsert_sqlite_image(
+            &conn,
+            &SqliteImageUpsert {
+                id: Some("image-1".to_string()),
+                root_path: dir.path().to_string_lossy().to_string(),
+                path: path.to_string(),
+                thumb: ".imgindex/thumbs/image-1.jpg".to_string(),
+                size: fingerprint.size,
+                mtime: fingerprint.mtime,
+                width: 8,
+                height: 6,
+                ext: "jpg".to_string(),
+            },
+        )
+        .unwrap();
+        upsert_sqlite_file_issue(
+            &conn,
+            &SqliteFileIssueUpsert {
+                image_id: Some("image-1".to_string()),
+                root_path: dir.path().to_string_lossy().to_string(),
+                path: path.to_string(),
+                severity: FileIssueSeverity::Error,
+                kind: FileIssueKind::DecodeError,
+                expected_format: Some(SupportedImageFormat::Jpeg),
+                detected_format: Some("jpeg".to_string()),
+                size: fingerprint.size,
+                mtime_ns: fingerprint.mtime_ns,
+                detail: Some("known decode error".to_string()),
+            },
+        )
+        .unwrap();
+        let queued = enqueue_sqlite_job(
+            &conn,
+            "thumb",
+            json!({
+                "image_id": "image-1",
+                "root_path": dir.path(),
+                "path": path,
+                "thumb": ".imgindex/thumbs/image-1.jpg",
+                "mtime": fingerprint.mtime,
+                "max_size": [640, 640],
+            }),
+            10,
+            3,
+            None,
+        )
+        .unwrap();
+        let claimed = claim_next_sqlite_thumb_job(&conn, "thumb-test")
+            .unwrap()
+            .unwrap();
+        execute_thumb_job_with_decoder(&conn, &claimed, 120, |_| {
+            panic!("unchanged known error must skip full decode")
+        })
+        .unwrap();
+        assert_eq!(
+            get_sqlite_job(&conn, &queued.job.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "failed"
+        );
     }
 }

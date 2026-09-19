@@ -762,7 +762,10 @@ impl Processor {
             .map(|image| image.id.clone())
             .unwrap_or_else(new_image_id);
         let thumb = format!("{INDEX_DIR_NAME}/{THUMBS_DIR_NAME}/{image_id}.jpg");
-        if force && existing.is_some() {
+        let recovered_from_error = previous_issue
+            .as_ref()
+            .is_some_and(|issue| issue.severity == FileIssueSeverity::Error);
+        if (force || recovered_from_error) && existing.is_some() {
             let _ = fs::remove_file(root.join(&thumb));
         }
         let image_id = upsert_sqlite_image(
@@ -817,9 +820,6 @@ impl Processor {
             THUMB_MAX_ATTEMPTS,
         )?;
         let image = get_sqlite_image_api_value(&conn, &image_id)?;
-        let recovered_from_error = previous_issue
-            .as_ref()
-            .is_some_and(|issue| issue.severity == FileIssueSeverity::Error);
         let event = if existing.is_none() || restored || recovered_from_error {
             "image_created"
         } else {

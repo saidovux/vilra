@@ -1,6 +1,7 @@
 use crate::sqlite::{
-    claim_next_sqlite_job, enqueue_sqlite_job, get_sqlite_job, mark_sqlite_job_failed,
-    mark_sqlite_job_succeeded, SqliteJob,
+    claim_next_sqlite_job, enqueue_sqlite_job, get_sqlite_job, insert_job_event,
+    mark_sqlite_claimed_job_failed, mark_sqlite_claimed_job_succeeded,
+    mark_sqlite_job_terminal_failed_in_tx, set_latest_attempt_state, SqliteJob,
 };
 use crate::sqlite_schema::SQLITE_SCHEMA_VERSION;
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
@@ -11,7 +12,9 @@ use serde_json::{json, Value as JsonValue};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tagimage_core::{FileIssueKind, FileIssueSeverity, SupportedImageFormat};
+use tagimage_core::{
+    expected_format_for_path, FileIssueKind, FileIssueSeverity, SupportedImageFormat,
+};
 use uuid::Uuid;
 
 const DEFAULT_PAGE_LIMIT: i64 = 120;
@@ -326,6 +329,41 @@ pub fn get_sqlite_file_issue(
     issue.map(SqliteFileIssue::try_from).transpose()
 }
 
+pub fn get_sqlite_file_issue_for_image(
+    conn: &Connection,
+    image_id: &str,
+    root_path: &str,
+    path: &str,
+) -> Result<Option<SqliteFileIssue>, String> {
+    let issue = conn
+        .query_row(
+            r#"
+            SELECT *
+            FROM file_issues
+            WHERE image_id = ?1 OR (root_path = ?2 AND path = ?3)
+            ORDER BY CASE WHEN image_id = ?1 THEN 0 ELSE 1 END
+            LIMIT 1
+            "#,
+            params![image_id, root_path, path],
+            raw_sqlite_file_issue_from_row,
+        )
+        .optional()
+        .map_err(|e| format!("get sqlite file issue for image {image_id}: {e}"))?;
+    issue.map(SqliteFileIssue::try_from).transpose()
+}
+
+pub fn sqlite_image_has_error_issue(
+    conn: &Connection,
+    image_id: &str,
+    root_path: &str,
+    path: &str,
+) -> Result<bool, String> {
+    Ok(
+        get_sqlite_file_issue_for_image(conn, image_id, root_path, path)?
+            .is_some_and(|issue| issue.severity == FileIssueSeverity::Error),
+    )
+}
+
 pub fn list_sqlite_file_issues_for_root(
     conn: &Connection,
     root_path: &str,
@@ -554,6 +592,19 @@ pub fn get_sqlite_image_by_id(
     conn.query_row(&sql, params![image_id], sqlite_image_record_from_row)
         .optional()
         .map_err(|e| format!("get sqlite image by id {image_id}: {e}"))
+}
+
+pub fn get_sqlite_image_by_id_including_hidden(
+    conn: &Connection,
+    image_id: &str,
+) -> Result<Option<SqliteImageRecord>, String> {
+    conn.query_row(
+        "SELECT * FROM images WHERE id = ?1",
+        params![image_id],
+        sqlite_image_record_from_row,
+    )
+    .optional()
+    .map_err(|e| format!("get sqlite image by id including hidden {image_id}: {e}"))
 }
 
 pub fn get_sqlite_image_by_root_path(
@@ -928,10 +979,18 @@ pub fn retarget_sqlite_active_image_jobs(
 }
 
 fn cancel_active_image_jobs_in_tx(conn: &Connection, image_id: &str) -> Result<(), String> {
+    cancel_active_image_jobs_except_in_tx(conn, image_id, None)
+}
+
+fn cancel_active_image_jobs_except_in_tx(
+    conn: &Connection,
+    image_id: &str,
+    exclude_job_id: Option<&str>,
+) -> Result<(), String> {
     let mut stmt = conn
         .prepare(
             r#"
-            SELECT id, payload
+            SELECT id, state, payload
             FROM jobs
             WHERE state IN ('queued', 'running')
               AND job_type IN ('thumb', 'metadata')
@@ -940,37 +999,65 @@ fn cancel_active_image_jobs_in_tx(conn: &Connection, image_id: &str) -> Result<(
         .map_err(|e| format!("prepare sqlite image jobs for cancellation: {e}"))?;
     let rows = stmt
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })
         .map_err(|e| format!("query sqlite image jobs for cancellation: {e}"))?;
-    let mut job_ids = Vec::new();
+    let mut jobs = Vec::new();
     for row in rows {
-        let (job_id, payload_text) =
+        let (job_id, state, payload_text) =
             row.map_err(|e| format!("read sqlite image job for cancellation: {e}"))?;
         let payload = parse_json_text(&payload_text, json!({}));
-        if payload.get("image_id").and_then(JsonValue::as_str) == Some(image_id) {
-            job_ids.push(job_id);
+        if payload.get("image_id").and_then(JsonValue::as_str) == Some(image_id)
+            && exclude_job_id != Some(job_id.as_str())
+        {
+            jobs.push((job_id, state));
         }
     }
     drop(stmt);
-    for job_id in job_ids {
-        conn.execute(
-            r#"
+    for (job_id, previous_state) in jobs {
+        let changed = conn
+            .execute(
+                r#"
             UPDATE jobs
             SET state = 'canceled',
                 finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE id = ?1 AND state IN ('queued', 'running')
             "#,
-            params![job_id],
-        )
-        .map_err(|e| format!("cancel sqlite image job {job_id}: {e}"))?;
+                params![job_id],
+            )
+            .map_err(|e| format!("cancel sqlite image job {job_id}: {e}"))?;
+        if changed > 0 {
+            if previous_state == "running" {
+                set_latest_attempt_state(conn, &job_id, "canceled", None)?;
+            }
+            insert_job_event(
+                conn,
+                &job_id,
+                "canceled",
+                json!({"reason": "image_unavailable"}),
+            )?;
+        }
     }
     Ok(())
 }
 
 pub fn cancel_sqlite_active_image_jobs(conn: &Connection, image_id: &str) -> Result<(), String> {
     with_immediate_tx(conn, || cancel_active_image_jobs_in_tx(conn, image_id))
+}
+
+pub fn cancel_sqlite_active_image_jobs_except(
+    conn: &Connection,
+    image_id: &str,
+    exclude_job_id: &str,
+) -> Result<(), String> {
+    with_immediate_tx(conn, || {
+        cancel_active_image_jobs_except_in_tx(conn, image_id, Some(exclude_job_id))
+    })
 }
 
 pub fn get_sqlite_image_api_value(
@@ -2119,18 +2206,29 @@ pub fn touch_sqlite_job_progress(
 }
 
 pub fn cancel_sqlite_job(conn: &Connection, job_id: &str) -> Result<bool, String> {
-    conn.execute(
-        r#"
-        UPDATE jobs
-        SET state = 'canceled',
-            finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-        WHERE id = ?1 AND state IN ('queued', 'running')
-        "#,
-        params![job_id],
-    )
-    .map(|count| count > 0)
-    .map_err(|e| format!("cancel sqlite job {job_id}: {e}"))
+    with_immediate_tx(conn, || {
+        let previous_state = get_sqlite_job(conn, job_id)?.map(|job| job.state);
+        let changed = conn
+            .execute(
+                r#"
+                UPDATE jobs
+                SET state = 'canceled',
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1 AND state IN ('queued', 'running')
+                "#,
+                params![job_id],
+            )
+            .map_err(|e| format!("cancel sqlite job {job_id}: {e}"))?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        if previous_state.as_deref() == Some("running") {
+            set_latest_attempt_state(conn, job_id, "canceled", None)?;
+        }
+        insert_job_event(conn, job_id, "canceled", json!({"reason": "requested"}))?;
+        Ok(true)
+    })
 }
 
 pub fn cleanup_sqlite_old_jobs(
@@ -2255,6 +2353,7 @@ pub fn enqueue_sqlite_thumb_job(
     priority: i32,
     max_attempts: i32,
 ) -> Result<(JsonValue, bool), String> {
+    ensure_sqlite_image_job_allowed(conn, image_id, root_path, path)?;
     let mut result = enqueue_sqlite_job(
         conn,
         "thumb",
@@ -2297,6 +2396,7 @@ pub fn enqueue_sqlite_metadata_job(
     priority: i32,
     max_attempts: i32,
 ) -> Result<(JsonValue, bool), String> {
+    ensure_sqlite_image_job_allowed(conn, image_id, root_path, path)?;
     let dedupe_key = if let Some(mtime) = mtime {
         format!("metadata:{image_id}:{mtime}")
     } else {
@@ -2315,6 +2415,21 @@ pub fn enqueue_sqlite_metadata_job(
         Some(&dedupe_key),
     )?;
     Ok((serialize_sqlite_job(&result.job), result.deduped))
+}
+
+fn ensure_sqlite_image_job_allowed(
+    conn: &Connection,
+    image_id: &str,
+    root_path: &str,
+    path: &str,
+) -> Result<(), String> {
+    if expected_format_for_path(Path::new(path)).is_none() {
+        return Err(format!("unsupported image job path: {path}"));
+    }
+    if sqlite_image_has_error_issue(conn, image_id, root_path, path)? {
+        return Err(format!("image unavailable: {image_id}"));
+    }
+    Ok(())
 }
 
 pub fn list_sqlite_thumb_rebuild_rows(
@@ -2410,7 +2525,7 @@ pub fn mark_sqlite_metadata_succeeded(
     job: &crate::ClaimedJob,
     metadata_json: JsonValue,
     authoritative: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let event_data = json!({
         "attempt": job.attempt,
         "completed_at": now_unix(),
@@ -2418,7 +2533,7 @@ pub fn mark_sqlite_metadata_succeeded(
         "authoritative": authoritative,
         "shadow": !authoritative,
     });
-    mark_sqlite_job_succeeded(conn, &job.id, Some(1), Some(event_data))
+    mark_sqlite_claimed_job_succeeded(conn, job, Some(1), Some(event_data))
 }
 
 pub fn mark_sqlite_metadata_failed(
@@ -2427,17 +2542,17 @@ pub fn mark_sqlite_metadata_failed(
     error: &str,
     total_ms: Option<u128>,
     max_backoff_sec: i64,
-) -> Result<(), String> {
-    mark_sqlite_job_failed(conn, &job.id, error, max_backoff_sec, total_ms)
+) -> Result<bool, String> {
+    mark_sqlite_claimed_job_failed(conn, job, error, max_backoff_sec, total_ms)
 }
 
 pub fn mark_sqlite_thumb_succeeded(
     conn: &Connection,
-    job_id: &str,
+    job: &crate::ClaimedJob,
     metrics: Option<JsonValue>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let mut event_data = json!({
-        "attempt": get_sqlite_job(conn, job_id)?.map(|job| job.attempt).unwrap_or(0),
+        "attempt": job.attempt,
         "completed_at": now_unix(),
     });
     if let Some(metrics) = metrics {
@@ -2445,17 +2560,58 @@ pub fn mark_sqlite_thumb_succeeded(
             object.insert("metrics".to_string(), metrics);
         }
     }
-    mark_sqlite_job_succeeded(conn, job_id, Some(1), Some(event_data))
+    mark_sqlite_claimed_job_succeeded(conn, job, Some(1), Some(event_data))
 }
 
 pub fn mark_sqlite_thumb_failed(
     conn: &Connection,
-    job_id: &str,
+    job: &crate::ClaimedJob,
     error: &str,
     max_backoff_sec: i64,
     total_ms: Option<u128>,
-) -> Result<(), String> {
-    mark_sqlite_job_failed(conn, job_id, error, max_backoff_sec, total_ms)
+) -> Result<bool, String> {
+    mark_sqlite_claimed_job_failed(conn, job, error, max_backoff_sec, total_ms)
+}
+
+pub fn mark_sqlite_image_job_terminal_failed(
+    conn: &Connection,
+    job: &crate::ClaimedJob,
+    image_id: &str,
+    error: &str,
+    total_ms: Option<u128>,
+) -> Result<bool, String> {
+    with_immediate_tx(conn, || {
+        if !claimed_job_is_running(conn, job)? {
+            return Ok(false);
+        }
+        cancel_active_image_jobs_except_in_tx(conn, image_id, Some(&job.id))?;
+        mark_sqlite_job_terminal_failed_in_tx(conn, &job.id, Some(&job.worker_id), error, total_ms)
+    })
+}
+
+pub fn record_sqlite_permanent_image_job_failure(
+    conn: &Connection,
+    job: &crate::ClaimedJob,
+    image_id: &str,
+    issue: &SqliteFileIssueUpsert,
+    error: &str,
+    total_ms: Option<u128>,
+) -> Result<bool, String> {
+    with_immediate_tx(conn, || {
+        if !claimed_job_is_running(conn, job)? {
+            return Ok(false);
+        }
+        upsert_sqlite_file_issue(conn, issue)?;
+        cancel_active_image_jobs_except_in_tx(conn, image_id, Some(&job.id))?;
+        mark_sqlite_job_terminal_failed_in_tx(conn, &job.id, Some(&job.worker_id), error, total_ms)
+    })
+}
+
+fn claimed_job_is_running(conn: &Connection, claimed: &crate::ClaimedJob) -> Result<bool, String> {
+    let Some(job) = get_sqlite_job(conn, &claimed.id)? else {
+        return Ok(false);
+    };
+    Ok(job.state == "running" && job.worker_id.as_deref() == Some(&claimed.worker_id))
 }
 
 fn verify_sqlite_tables(conn: &Connection, expected: &[&str]) -> Result<(), String> {
@@ -3423,6 +3579,143 @@ mod tests {
     }
 
     #[test]
+    fn worker_terminal_issue_cancels_siblings_blocks_enqueue_and_recovers() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let root = "/photos";
+        upsert_fixture(&conn, "img-a", root, "folder/a.jpg", 10, 20);
+        replace_sqlite_image_tags(&conn, "img-a", &["Favorite".to_string()], "user")
+            .expect("user tag");
+        let (thumb, _) = enqueue_sqlite_thumb_job(
+            &conn,
+            "img-a",
+            root,
+            "folder/a.jpg",
+            ".imgindex/thumbs/img-a.jpg",
+            10,
+            30,
+            5,
+        )
+        .expect("thumb enqueue");
+        let (metadata, _) =
+            enqueue_sqlite_metadata_job(&conn, "img-a", root, "folder/a.jpg", Some(10), 10, 5)
+                .expect("metadata enqueue");
+        let claimed = claim_next_sqlite_thumb_job(&conn, "thumb-worker")
+            .expect("claim")
+            .expect("claimed");
+        assert_eq!(claimed.id, thumb["id"]);
+
+        let issue = SqliteFileIssueUpsert {
+            image_id: Some("img-a".to_string()),
+            root_path: root.to_string(),
+            path: "folder/a.jpg".to_string(),
+            severity: FileIssueSeverity::Error,
+            kind: FileIssueKind::DecodeError,
+            expected_format: Some(SupportedImageFormat::Jpeg),
+            detected_format: Some("jpeg".to_string()),
+            size: 20,
+            mtime_ns: 100,
+            detail: Some("full decode failed".to_string()),
+        };
+        assert!(record_sqlite_permanent_image_job_failure(
+            &conn,
+            &claimed,
+            "img-a",
+            &issue,
+            "full decode failed",
+            Some(12),
+        )
+        .expect("record permanent failure"));
+
+        assert_eq!(
+            get_sqlite_job(&conn, &claimed.id).unwrap().unwrap().state,
+            "failed"
+        );
+        assert_eq!(
+            get_sqlite_job(&conn, metadata["id"].as_str().unwrap())
+                .unwrap()
+                .unwrap()
+                .state,
+            "canceled"
+        );
+        assert!(list_sqlite_job_events(&conn, &claimed.id)
+            .unwrap()
+            .iter()
+            .any(|event| event.event == "terminal_failed"));
+        assert!(get_sqlite_image_by_id(&conn, "img-a").unwrap().is_none());
+        assert_eq!(
+            count_sqlite_images(&conn, &[root.to_string()], false).unwrap(),
+            0
+        );
+        assert!(
+            query_sqlite_images_page(&conn, &[root.to_string()], SqliteImagesQuery::default())
+                .unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(list_sqlite_images_by_tag(&conn, "Favorite")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            tag_sqlite_summary_by_norm(&conn, "favorite")
+                .unwrap()
+                .unwrap()["image_count"],
+            0
+        );
+        assert!(folder_sqlite_tree_rows(&conn, &[root.to_string()])
+            .unwrap()
+            .is_empty());
+        assert!(
+            list_sqlite_thumb_rebuild_rows(&conn, &[root.to_string()], None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(list_sqlite_metadata_source_rows(&conn, None)
+            .unwrap()
+            .is_empty());
+
+        let jobs_before = count_sqlite_jobs(&conn, None, None).unwrap();
+        assert!(enqueue_sqlite_thumb_job(
+            &conn,
+            "img-a",
+            root,
+            "folder/a.jpg",
+            ".imgindex/thumbs/img-a.jpg",
+            10,
+            30,
+            5,
+        )
+        .is_err());
+        assert!(
+            enqueue_sqlite_metadata_job(&conn, "img-a", root, "folder/a.jpg", Some(10), 10, 5,)
+                .is_err()
+        );
+        assert_eq!(count_sqlite_jobs(&conn, None, None).unwrap(), jobs_before);
+
+        assert!(delete_sqlite_file_issue(&conn, root, "folder/a.jpg").unwrap());
+        let restored = get_sqlite_image_by_id(&conn, "img-a")
+            .unwrap()
+            .expect("restored image");
+        assert_eq!(restored.id, "img-a");
+        assert_eq!(
+            list_sqlite_tags_for_image(&conn, "img-a").unwrap().1,
+            vec!["Favorite"]
+        );
+        assert!(enqueue_sqlite_thumb_job(
+            &conn,
+            "img-a",
+            root,
+            "folder/a.jpg",
+            ".imgindex/thumbs/img-a.jpg",
+            11,
+            30,
+            5,
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn file_deactivation_hides_image_cancels_jobs_and_deletes_issue_atomically() {
         let (_dir, db_path) = temp_db_path();
         let conn = init_sqlite_db(&db_path).expect("init");
@@ -3444,18 +3737,23 @@ mod tests {
             },
         )
         .unwrap();
-        let (job, _) = enqueue_sqlite_thumb_job(
+        let job = enqueue_sqlite_job(
             &conn,
-            "img-a",
-            root,
-            "bad.jpg",
-            ".imgindex/thumbs/img-a.jpg",
-            10,
+            "thumb",
+            json!({
+                "image_id": "img-a",
+                "root_path": root,
+                "path": "bad.jpg",
+                "thumb": ".imgindex/thumbs/img-a.jpg",
+                "mtime": 10,
+                "max_size": [640, 640],
+            }),
             20,
             3,
+            Some("thumb:img-a:10"),
         )
         .unwrap();
-        let job_id = job["id"].as_str().unwrap();
+        let job_id = &job.job.id;
 
         conn.execute_batch(
             r#"
@@ -3916,5 +4214,32 @@ mod tests {
             enqueue_sqlite_metadata_job(&conn, "img-a", "/photos", "a.jpg", Some(100), 10, 3)
                 .expect("metadata dedupe");
         assert!(deduped);
+
+        let jobs_before = count_sqlite_jobs(&conn, None, None).expect("job count");
+        assert!(enqueue_sqlite_thumb_job(
+            &conn,
+            "img-a",
+            "/photos",
+            "extensionless",
+            ".imgindex/thumbs/img-a.jpg",
+            100,
+            10,
+            3,
+        )
+        .is_err());
+        assert!(enqueue_sqlite_metadata_job(
+            &conn,
+            "img-a",
+            "/photos",
+            "image.gif",
+            Some(100),
+            10,
+            3,
+        )
+        .is_err());
+        assert_eq!(
+            count_sqlite_jobs(&conn, None, None).expect("job count after invalid paths"),
+            jobs_before
+        );
     }
 }

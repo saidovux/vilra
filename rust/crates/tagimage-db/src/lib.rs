@@ -9,5 +9,6 @@ pub struct ClaimedJob {
     pub id: String,
     pub attempt: i32,
     pub max_attempts: i32,
+    pub worker_id: String,
     pub payload: Value,
 }
