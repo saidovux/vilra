@@ -47,6 +47,15 @@
             <button class="btn btn-ghost btn-sm folder-open-btn" type="button" data-action="pick-folder">Добавить</button>
           </div>
           <div id="folder-tree"></div>
+          <nav class="sidebar-view-nav" aria-label="Разделы библиотеки">
+            <button id="gallery-nav" class="sidebar-view-row active" type="button" data-action="show-gallery-view">
+              <span>Галерея</span>
+            </button>
+            <button id="problems-nav" class="sidebar-view-row" type="button" data-action="show-problems-view">
+              <span>Проблемы</span>
+              <span id="problems-badge" class="problems-badge muted">0</span>
+            </button>
+          </nav>
         </section>
       </div>
     </aside>
@@ -190,6 +199,29 @@
           <div class="label">Изображения не найдены</div>
           <div>Измените фильтр или анти-список</div>
         </div>
+      </div>
+    </main>
+
+    <main id="problems-wrap" aria-hidden="true">
+      <header class="problems-head">
+        <div>
+          <div class="problems-kicker">Диагностика библиотеки</div>
+          <h1>Проблемы файлов</h1>
+        </div>
+        <button id="problems-recheck-all" class="btn btn-primary" type="button" data-action="recheck-all-problems">Проверить все</button>
+      </header>
+      <div class="problems-toolbar">
+        <div class="problems-filters" role="group" aria-label="Фильтр проблем">
+          <button class="problems-filter active" type="button" data-action="set-problems-filter" data-severity="all">Все <span id="problems-total">0</span></button>
+          <button class="problems-filter" type="button" data-action="set-problems-filter" data-severity="error">Ошибки <span id="problems-errors">0</span></button>
+          <button class="problems-filter" type="button" data-action="set-problems-filter" data-severity="warning">Предупреждения <span id="problems-warnings">0</span></button>
+        </div>
+        <input id="problems-search" type="search" placeholder="Поиск по имени или пути" autocomplete="off">
+      </div>
+      <div id="problems-feedback" class="problems-feedback" aria-live="polite"></div>
+      <div id="problems-list"></div>
+      <div class="problems-footer">
+        <button id="problems-load-more" class="btn btn-ghost" type="button" data-action="load-more-problems" hidden>Загрузить ещё</button>
       </div>
     </main>
 

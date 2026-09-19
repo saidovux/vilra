@@ -64,6 +64,33 @@ interface ImagePage {
   has_more?: boolean;
 }
 
+type ProblemSeverity = 'all' | 'error' | 'warning';
+
+interface ProblemSummary {
+  total: number;
+  errors: number;
+  warnings: number;
+  latestUpdatedAt: string | null;
+}
+
+interface ProblemItem {
+  id: number;
+  imageId: string | null;
+  rootPath: string;
+  path: string;
+  absolutePath: string;
+  fileName: string;
+  severity: 'error' | 'warning';
+  kind: string;
+  expectedFormat: string | null;
+  detectedFormat: string | null;
+  size: number;
+  mtimeNs: number;
+  technicalDetail: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 interface LiveEventEnvelope {
   sequence?: number;
   type: string;
@@ -149,6 +176,12 @@ interface PreviewModalOptions {
 interface FishController {
   suggestion: string;
   update?: () => void;
+}
+
+class TerminalImageUnavailableError extends Error {
+  constructor(readonly imageId: string) {
+    super('Изображение исключено из галереи из-за ошибки файла.');
+  }
 }
 
 interface TagChipOptions {
@@ -298,6 +331,30 @@ function statusResponse(value: JsonRecord): StatusResponse {
     done: optionalNumber(value.done),
     total: optionalNumber(value.total),
     error: typeof value.error === 'string' ? value.error : undefined
+  };
+}
+
+function normalizeProblemItem(value: unknown): ProblemItem | null {
+  if (!isRecord(value)) return null;
+  const id = Number(value.id);
+  const severity = value.severity === 'warning' ? 'warning' : value.severity === 'error' ? 'error' : null;
+  if (!Number.isInteger(id) || !severity) return null;
+  return {
+    id,
+    imageId: typeof value.image_id === 'string' ? value.image_id : null,
+    rootPath: String(value.root_path || ''),
+    path: String(value.path || ''),
+    absolutePath: String(value.absolute_path || ''),
+    fileName: String(value.file_name || fileName(value.path)),
+    severity,
+    kind: String(value.kind || ''),
+    expectedFormat: typeof value.expected_format === 'string' ? value.expected_format : null,
+    detectedFormat: typeof value.detected_format === 'string' ? value.detected_format : null,
+    size: Number(value.size || 0),
+    mtimeNs: Number(value.mtime_ns || 0),
+    technicalDetail: typeof value.technical_detail === 'string' ? value.technical_detail : null,
+    createdAt: String(value.created_at || ''),
+    updatedAt: String(value.updated_at || '')
   };
 }
 
@@ -569,6 +626,24 @@ let lastLiveSequence = 0;
 let liveRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
 let liveFolderRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let liveTagRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let activeView: 'gallery' | 'problems' = 'gallery';
+let problemsSummary: ProblemSummary = {total: 0, errors: 0, warnings: 0, latestUpdatedAt: null};
+let problemsSeverity: ProblemSeverity = 'all';
+let problemsItems: ProblemItem[] = [];
+let problemsTotal = 0;
+let problemsLoading = false;
+let problemsLoadError = '';
+let problemsRecheckAllRunning = false;
+let problemsRefreshRunning = false;
+let problemsRefreshQueued = false;
+let problemsListRefreshQueued = false;
+let problemsSearchTimer: ReturnType<typeof setTimeout> | null = null;
+let problemsRequestToken = 0;
+let problemsPollTimer: ReturnType<typeof setInterval> | null = null;
+const problemRowRechecks = new Set<number>();
+const terminalThumbIds = new Set<string>();
+const thumbRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+let terminalGalleryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 const PAGE = 48;
 const MASONRY_COL_MIN = 230;
 const canvasCache = new Map<string, Promise<HTMLCanvasElement>>();
@@ -963,6 +1038,14 @@ function handleLiveEvent(event: LiveEventEnvelope): void {
     case 'root_offline':
       void pollStatus();
       break;
+    case 'problems_changed':
+      scheduleProblemsRefresh();
+      break;
+    case 'problems_recheck_finished':
+      problemsRecheckAllRunning = false;
+      renderProblems();
+      scheduleProblemsRefresh();
+      break;
     case 'resync_required':
       scheduleLiveRecovery(String(event.data.reason || 'backend_requested'));
       break;
@@ -994,6 +1077,7 @@ function compareLiveImages(left: ImageItem, right: ImageItem): number {
 }
 
 function applyLiveImage(image: ImageItem, operation: 'created' | 'updated'): void {
+  acceptActiveImage(image.id);
   const existingIndex = allImages.findIndex(item => item.id === image.id);
   const existingWasVisible = existingIndex >= 0;
   if (existingIndex >= 0) allImages.splice(existingIndex, 1);
@@ -1086,6 +1170,230 @@ function setDbStatus(ok: boolean, text: string): void {
   db.classList.toggle('bad', !ok);
 }
 
+function problemHumanMessage(problem: ProblemItem): string {
+  switch (problem.kind) {
+    case 'decode_error': return 'Файл изображения не удалось декодировать.';
+    case 'format_mismatch': return `Расширение не соответствует содержимому${problem.detectedFormat ? ` (${problem.detectedFormat})` : ''}.`;
+    case 'unsupported_content': return 'Содержимое файла не относится к поддерживаемому формату изображения.';
+    case 'unreadable': return 'Файл недоступен для чтения.';
+    default: return 'Файл требует проверки.';
+  }
+}
+
+function renderProblemsSummary(): void {
+  requiredHtml('problems-total').textContent = String(problemsSummary.total);
+  requiredHtml('problems-errors').textContent = String(problemsSummary.errors);
+  requiredHtml('problems-warnings').textContent = String(problemsSummary.warnings);
+  const badge = requiredHtml('problems-badge');
+  badge.textContent = String(problemsSummary.errors);
+  badge.classList.toggle('muted', problemsSummary.errors === 0);
+}
+
+function renderProblems(): void {
+  document.querySelectorAll<HTMLElement>('.problems-filter').forEach(button => {
+    button.classList.toggle('active', button.dataset.severity === problemsSeverity);
+  });
+  const list = requiredHtml('problems-list');
+  list.innerHTML = problemsItems.map(problem => `
+    <article class="problem-row" data-problem-id="${problem.id}">
+      <span class="problem-severity ${problem.severity}">${problem.severity === 'error' ? 'Ошибка' : 'Внимание'}</span>
+      <div>
+        <div class="problem-file">${escHtml(problem.fileName)}</div>
+        <div class="problem-path">${escHtml(problem.path)}</div>
+        <div class="problem-message">${escHtml(problemHumanMessage(problem))}</div>
+        <div class="problem-meta">${escHtml(fmtSize(problem.size))} · ${escHtml(problem.expectedFormat || 'неизвестно')} → ${escHtml(problem.detectedFormat || 'не определён')}</div>
+        ${problem.technicalDetail ? `<details class="problem-detail"><summary>Технические детали</summary>${escHtml(problem.technicalDetail)}</details>` : ''}
+        <div class="problem-inline-error" data-problem-error="${problem.id}"></div>
+      </div>
+      <div class="problem-actions">
+        <button class="btn btn-ghost btn-sm" type="button" data-action="reveal-problem" data-problem-id="${problem.id}">${isTauriRuntime() ? 'Показать в папке' : 'Копировать путь'}</button>
+        <button class="btn btn-primary btn-sm" type="button" data-action="recheck-problem" data-problem-id="${problem.id}" ${problemRowRechecks.has(problem.id) ? 'disabled' : ''}>${problemRowRechecks.has(problem.id) ? 'Проверка…' : 'Проверить'}</button>
+      </div>
+    </article>
+  `).join('');
+  const feedback = requiredHtml('problems-feedback');
+  feedback.classList.toggle('error', Boolean(problemsLoadError));
+  if (problemsLoadError) feedback.innerHTML = `${escHtml(problemsLoadError)} <button class="btn btn-ghost btn-sm" type="button" data-action="retry-problems">Повторить</button>`;
+  else if (problemsLoading && !problemsItems.length) feedback.textContent = 'Загрузка…';
+  else if (!problemsItems.length) feedback.textContent = 'Проблем не найдено.';
+  else feedback.textContent = `Показано ${problemsItems.length} из ${problemsTotal}`;
+  const more = requireElement('problems-load-more', HTMLButtonElement, 'Problems load button is missing');
+  more.hidden = problemsItems.length >= problemsTotal;
+  more.disabled = problemsLoading;
+  const all = requireElement('problems-recheck-all', HTMLButtonElement, 'Problems recheck button is missing');
+  all.disabled = problemsRecheckAllRunning || problemsSummary.total === 0;
+  all.textContent = problemsRecheckAllRunning ? 'Проверка…' : 'Проверить все';
+}
+
+async function refreshProblemsSummary(): Promise<void> {
+  const response = await fetch('/api/problems/summary');
+  if (!response.ok) throw new Error(await readError(response));
+  const data = await readJsonRecord(response);
+  problemsSummary = {
+    total: Number(data.total || 0),
+    errors: Number(data.errors || 0),
+    warnings: Number(data.warnings || 0),
+    latestUpdatedAt: typeof data.latest_updated_at === 'string' ? data.latest_updated_at : null
+  };
+  renderProblemsSummary();
+}
+
+async function loadProblems(reset = true): Promise<void> {
+  const token = ++problemsRequestToken;
+  const offset = reset ? 0 : problemsItems.length;
+  const search = requiredInput('problems-search').value.trim();
+  problemsLoading = true;
+  problemsLoadError = '';
+  renderProblems();
+  const params = new URLSearchParams({
+    severity: problemsSeverity,
+    search,
+    limit: '100',
+    offset: String(offset)
+  });
+  try {
+    const response = await fetch(`/api/problems?${params}`);
+    if (!response.ok) throw new Error(await readError(response));
+    const data = await readJsonRecord(response);
+    if (token !== problemsRequestToken) return;
+    const items = Array.isArray(data.items)
+      ? data.items.map(normalizeProblemItem).filter((item): item is ProblemItem => Boolean(item))
+      : [];
+    problemsItems = reset ? items : [...problemsItems, ...items];
+    const page = isRecord(data.page) ? data.page : {};
+    problemsTotal = Number(page.total || problemsItems.length);
+  } catch (error) {
+    if (token !== problemsRequestToken) return;
+    problemsLoadError = errorMessage(error);
+  } finally {
+    if (token === problemsRequestToken) {
+      problemsLoading = false;
+      renderProblems();
+    }
+  }
+}
+
+function scheduleProblemsRefresh(includeList = true): void {
+  if (problemsRefreshRunning) {
+    problemsRefreshQueued = true;
+    problemsListRefreshQueued ||= includeList;
+    return;
+  }
+  problemsRefreshRunning = true;
+  problemsListRefreshQueued = includeList;
+  void (async () => {
+    do {
+      problemsRefreshQueued = false;
+      const refreshList = problemsListRefreshQueued;
+      problemsListRefreshQueued = false;
+      try {
+        await refreshProblemsSummary();
+        if (refreshList && activeView === 'problems') await loadProblems(true);
+      } catch (error) {
+        console.warn('Problems refresh failed', error);
+      }
+    } while (problemsRefreshQueued);
+    problemsRefreshRunning = false;
+  })();
+}
+
+function showProblemsView(): void {
+  if (activeView === 'problems') return;
+  saveActiveScroll();
+  showChrome();
+  closePreview(false);
+  closeGraph();
+  toggleSettings(false);
+  activeView = 'problems';
+  document.body.classList.add('problems-view');
+  requiredHtml('problems-wrap').setAttribute('aria-hidden', 'false');
+  requiredHtml('gallery-nav').classList.remove('active');
+  requiredHtml('problems-nav').classList.add('active');
+  window.scrollTo({top: 0});
+  scheduleProblemsRefresh();
+}
+
+function showGalleryView(): void {
+  if (activeView === 'gallery') return;
+  activeView = 'gallery';
+  document.body.classList.remove('problems-view');
+  requiredHtml('problems-wrap').setAttribute('aria-hidden', 'true');
+  requiredHtml('gallery-nav').classList.add('active');
+  requiredHtml('problems-nav').classList.remove('active');
+  setTimeout(() => window.scrollTo({top: activeTab().scrollTop || 0}), 0);
+}
+
+function setProblemsFilter(value: string | undefined): void {
+  problemsSeverity = value === 'error' || value === 'warning' ? value : 'all';
+  void loadProblems(true);
+}
+
+async function recheckProblem(issueId: number): Promise<void> {
+  if (!Number.isInteger(issueId) || problemRowRechecks.has(issueId)) return;
+  problemRowRechecks.add(issueId);
+  renderProblems();
+  try {
+    const response = await fetch(`/api/problems/${issueId}/recheck`, {method: 'POST'});
+    if (!response.ok) throw new Error(await readError(response));
+    scheduleProblemsRefresh();
+  } catch (error) {
+    const target = document.querySelector<HTMLElement>(`[data-problem-error="${issueId}"]`);
+    if (target) target.textContent = errorMessage(error);
+  } finally {
+    problemRowRechecks.delete(issueId);
+    renderProblems();
+  }
+}
+
+async function recheckAllProblems(): Promise<void> {
+  if (problemsRecheckAllRunning) return;
+  problemsRecheckAllRunning = true;
+  renderProblems();
+  try {
+    const response = await fetch('/api/problems/recheck-all', {method: 'POST'});
+    if (response.status === 409) return;
+    if (!response.ok) throw new Error(await readError(response));
+  } catch (error) {
+    problemsRecheckAllRunning = false;
+    const feedback = requiredHtml('problems-feedback');
+    feedback.classList.add('error');
+    feedback.textContent = errorMessage(error);
+    renderProblems();
+  }
+}
+
+function isTauriRuntime(): boolean {
+  return Boolean((window as Window & {__TAURI_INTERNALS__?: unknown}).__TAURI_INTERNALS__);
+}
+
+async function revealProblem(issueId: number): Promise<void> {
+  const problem = problemsItems.find(item => item.id === issueId);
+  if (!problem) return;
+  const errorTarget = document.querySelector<HTMLElement>(`[data-problem-error="${issueId}"]`);
+  if (errorTarget) errorTarget.textContent = '';
+  try {
+    if (isTauriRuntime()) {
+      const tauri = window as Window & {__TAURI__?: {core?: {invoke?: (command: string, args: JsonRecord) => Promise<unknown>}}};
+      const invoke = tauri.__TAURI__?.core?.invoke;
+      if (!invoke) throw new Error('Native file reveal is unavailable');
+      await invoke('reveal_problem', {issueId});
+    } else {
+      await navigator.clipboard.writeText(problem.absolutePath);
+      if (errorTarget) errorTarget.textContent = 'Путь скопирован.';
+    }
+  } catch (error) {
+    if (errorTarget) errorTarget.textContent = errorMessage(error);
+  }
+}
+
+function startProblemsPolling(): void {
+  scheduleProblemsRefresh(false);
+  if (problemsPollTimer) clearInterval(problemsPollTimer);
+  problemsPollTimer = setInterval(() => {
+    if (document.visibilityState === 'visible') scheduleProblemsRefresh(false);
+  }, 10_000);
+}
+
 function pageTotalValue(page: ImagePage | null | undefined): number | null {
   if (!page || page.total === null || page.total === undefined || page.total === '') return null;
   const total = Number(page.total);
@@ -1137,6 +1445,7 @@ async function refreshImages(clear = true): Promise<void> {
     const d = await readJsonRecord(r);
     if (requestId !== activeImagesRequest) return;
     const refreshedPage = imagesFromRecord(d);
+    refreshedPage.forEach(image => acceptActiveImage(image.id));
     allImages = clear
       ? refreshedPage
       : mergeRefreshedPageIntoLoadedImages(allImages, refreshedPage);
@@ -1190,6 +1499,7 @@ async function loadNextImagesPage(): Promise<void> {
     if (!r.ok) throw new Error(await readError(r));
     const d = await readJsonRecord(r);
     const items = imagesFromRecord(d);
+    items.forEach(image => acceptActiveImage(image.id));
     const seen = new Set(allImages.map(img => img.id));
     items.forEach(img => {
       if (!seen.has(img.id)) allImages.push(img);
@@ -1229,6 +1539,7 @@ function makeCard(img: ImageItem): HTMLElement {
   const name = fileName(img.path);
   const ph = document.createElement('img');
   ph.className = 'lazy';
+  ph.dataset.imageId = img.id;
   const version = Number(img.mtime || 0);
   ph.dataset.src = `${img.thumb_url || `/thumb-file/${img.id}.jpg`}?v=${version}`;
   ph.dataset.fallbackSrc = `/thumb/${img.id}?v=${version}`;
@@ -1331,9 +1642,13 @@ function setupLazyLoad(): void {
 }
 
 async function loadThumbWithRetry(img: HTMLImageElement, url: string, attempt = 0): Promise<void> {
+  const imageId = String(img.dataset.imageId || img.closest<HTMLElement>('.card[data-id]')?.dataset.id || '');
+  if (!imageId || terminalThumbIds.has(imageId)) return;
+  thumbRetryTimers.delete(imageId);
   const maxAttempts = 120;
   try {
     const r = await fetch(url, {cache: 'no-store'});
+    if (terminalThumbIds.has(imageId)) return;
     if (r.status === 200) {
       img.src = url;
       img.onload = () => img.classList.add('loaded');
@@ -1349,10 +1664,19 @@ async function loadThumbWithRetry(img: HTMLImageElement, url: string, attempt = 
         const p = await readJsonRecord(r);
         retryAfter = Math.min(1500, Math.max(80, Number(p.retry_after_ms || retryAfter)));
       } catch {}
-      setTimeout(() => {
-        if (img.isConnected) loadThumbWithRetry(img, url, attempt + 1);
+      const timer = setTimeout(() => {
+        thumbRetryTimers.delete(imageId);
+        if (img.isConnected && !terminalThumbIds.has(imageId)) void loadThumbWithRetry(img, url, attempt + 1);
       }, retryAfter);
+      thumbRetryTimers.set(imageId, timer);
       return;
+    }
+    if (r.status === 422) {
+      const payload = await readJsonRecord(r).catch((): JsonRecord => ({}));
+      if (payload.error === 'image_unavailable') {
+        handleTerminalImageUnavailable(imageId);
+        return;
+      }
     }
     console.warn('Thumbnail request failed', {url, status: r.status, attempt});
   } catch (error) {
@@ -1360,6 +1684,34 @@ async function loadThumbWithRetry(img: HTMLImageElement, url: string, attempt = 
   }
   img.classList.add('loaded');
   img.alt = 'Ошибка загрузки';
+}
+
+function acceptActiveImage(imageId: string): void {
+  terminalThumbIds.delete(imageId);
+  const timer = thumbRetryTimers.get(imageId);
+  if (timer) clearTimeout(timer);
+  thumbRetryTimers.delete(imageId);
+}
+
+function handleTerminalImageUnavailable(imageId: string): void {
+  if (!imageId || terminalThumbIds.has(imageId)) return;
+  terminalThumbIds.add(imageId);
+  const timer = thumbRetryTimers.get(imageId);
+  if (timer) clearTimeout(timer);
+  thumbRetryTimers.delete(imageId);
+  canvasCache.delete(imageId);
+  if (activeTab().lastImageId === imageId || lightboxImages[lbIndex]?.id === imageId) {
+    previewRequestToken += 1;
+    closePreview(true);
+  }
+  removeLiveImage(imageId, null);
+  scheduleProblemsRefresh();
+  if (!terminalGalleryRefreshTimer) {
+    terminalGalleryRefreshTimer = setTimeout(() => {
+      terminalGalleryRefreshTimer = null;
+      void refreshImages(true);
+    }, 100);
+  }
 }
 
 async function refreshTagPool() {
@@ -2491,6 +2843,7 @@ async function openLightbox(idx: number, persist = true, sourceList: ImageItem[]
     preloadPreviewNeighbors(idx);
   } catch (e) {
     console.error(e);
+    if (e instanceof TerminalImageUnavailableError) return;
     alert('Не удалось открыть изображение: ' + errorMessage(e));
   }
 }
@@ -2637,6 +2990,13 @@ function getOriginalCanvas(img: ImageItem): Promise<HTMLCanvasElement> {
   const promise = (async () => {
     const response = await fetch(originalUrl);
     if (!response.ok) {
+      if (response.status === 422) {
+        const payload = await readJsonRecord(response).catch((): JsonRecord => ({}));
+        if (payload.error === 'image_unavailable') {
+          handleTerminalImageUnavailable(img.id);
+          throw new TerminalImageUnavailableError(img.id);
+        }
+      }
       if (response.status === 404) {
         throw new Error(`Оригинал недоступен: ${img.path} (${originalUrl})`);
       }
@@ -3152,6 +3512,30 @@ function runAction(actionEl: HTMLElement): void {
     case 'open-tag-manager':
       openTagManager();
       break;
+    case 'show-gallery-view':
+      showGalleryView();
+      break;
+    case 'show-problems-view':
+      showProblemsView();
+      break;
+    case 'set-problems-filter':
+      setProblemsFilter(actionEl.dataset.severity);
+      break;
+    case 'load-more-problems':
+      void loadProblems(false);
+      break;
+    case 'retry-problems':
+      scheduleProblemsRefresh();
+      break;
+    case 'recheck-problem':
+      void recheckProblem(Number(actionEl.dataset.problemId));
+      break;
+    case 'recheck-all-problems':
+      void recheckAllProblems();
+      break;
+    case 'reveal-problem':
+      void revealProblem(Number(actionEl.dataset.problemId));
+      break;
     case 'pick-folder':
       pickFolder();
       break;
@@ -3238,6 +3622,13 @@ document.addEventListener('click', e => {
 
 requiredInput('tag-admin-search').addEventListener('input', renderTagAdmin);
 requiredInput('sidebar-tag-search').addEventListener('input', renderSidebarTags);
+requiredInput('problems-search').addEventListener('input', () => {
+  if (problemsSearchTimer) clearTimeout(problemsSearchTimer);
+  problemsSearchTimer = setTimeout(() => {
+    problemsSearchTimer = null;
+    void loadProblems(true);
+  }, 250);
+});
 requiredInput('tag-admin-create').addEventListener('keydown', e => {
   if (e.key === 'Enter') createTagFromSettings();
 });
@@ -3249,12 +3640,16 @@ window.addEventListener('resize', () => {
   layoutGallery();
   if (graphState && graphState.open) rebuildGraph();
 });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') scheduleProblemsRefresh(false);
+});
 
 initActionBindings();
 initPreview();
 initFilterInput();
 initFishInputs();
 startLiveEvents();
+startProblemsPolling();
 updateScrollTopButton();
 handleChromeScroll();
 loadSession();

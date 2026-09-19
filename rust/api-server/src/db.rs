@@ -10,17 +10,19 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::{atomic::AtomicBool, Arc},
 };
 use tagimage_db::sqlite::{
     self, clean_sqlite_tag_list, count_sqlite_jobs, count_sqlite_stale_running_jobs,
     create_sqlite_user_tag_entry, delete_sqlite_tag_definition, fetch_sqlite_tags_for_image_ids,
-    folder_sqlite_tree_rows, get_sqlite_file_issue_for_image, get_sqlite_image_by_id,
-    get_sqlite_image_by_id_including_hidden, get_sqlite_job_api_value, list_sqlite_jobs,
-    list_sqlite_thumb_rebuild_rows, load_sqlite_session, open_sqlite_runtime_db,
+    folder_sqlite_tree_rows, get_sqlite_file_issue_by_id, get_sqlite_file_issue_for_image,
+    get_sqlite_image_by_id, get_sqlite_image_by_id_including_hidden, get_sqlite_job_api_value,
+    list_sqlite_file_issue_recheck_targets, list_sqlite_jobs, list_sqlite_thumb_rebuild_rows,
+    load_sqlite_session, open_sqlite_runtime_db, query_sqlite_file_issues,
     query_sqlite_images_page, save_sqlite_session_value, set_sqlite_session_root,
-    sqlite_roots_from_session, tag_sqlite_summary_rows, update_sqlite_tag_definition,
-    SqliteAutoTagCleanupResult, SqliteFileIssue, SqliteImageRecord, SqliteImagesQuery,
-    SqliteSession,
+    sqlite_roots_from_session, summarize_sqlite_file_issues, tag_sqlite_summary_rows,
+    update_sqlite_tag_definition, SqliteAutoTagCleanupResult, SqliteFileIssue,
+    SqliteFileIssueRecheckTarget, SqliteImageRecord, SqliteImagesQuery, SqliteSession,
 };
 
 const VALID_JOB_STATES: &[&str] = &["queued", "running", "succeeded", "failed", "canceled"];
@@ -28,7 +30,8 @@ const VALID_JOB_STATES: &[&str] = &["queued", "running", "succeeded", "failed", 
 pub struct AppState {
     pub config: AppConfig,
     pub live: LiveIndexer,
-    pub events: std::sync::Arc<EventHub>,
+    pub events: Arc<EventHub>,
+    pub problems_recheck_running: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,11 +98,12 @@ pub struct ThumbRebuildResult {
 }
 
 impl AppState {
-    pub fn new(config: AppConfig, live: LiveIndexer, events: std::sync::Arc<EventHub>) -> Self {
+    pub fn new(config: AppConfig, live: LiveIndexer, events: Arc<EventHub>) -> Self {
         Self {
             config,
             live,
             events,
+            problems_recheck_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -176,6 +180,71 @@ fn map_db_error(error: String) -> ApiError {
         }
         _ => ApiError::internal(format!("Database error: {error}")),
     }
+}
+
+pub fn file_issue_api_value(issue: &SqliteFileIssue) -> Value {
+    let absolute_path = Path::new(&issue.root_path).join(&issue.path);
+    let file_name = Path::new(&issue.path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| issue.path.clone());
+    json!({
+        "id": issue.id,
+        "image_id": issue.image_id,
+        "root_path": issue.root_path,
+        "path": issue.path,
+        "absolute_path": absolute_path.to_string_lossy(),
+        "file_name": file_name,
+        "severity": issue.severity.as_str(),
+        "kind": issue.kind.as_str(),
+        "expected_format": issue.expected_format.map(|format| format.as_str()),
+        "detected_format": issue.detected_format,
+        "size": issue.size,
+        "mtime_ns": issue.mtime_ns,
+        "technical_detail": issue.detail,
+        "created_at": issue.created_at,
+        "updated_at": issue.updated_at,
+    })
+}
+
+pub fn problems_summary(conn: &Connection) -> Result<Value, ApiError> {
+    let summary = summarize_sqlite_file_issues(conn).map_err(map_db_error)?;
+    Ok(json!({
+        "total": summary.total,
+        "errors": summary.errors,
+        "warnings": summary.warnings,
+        "latest_updated_at": summary.latest_updated_at,
+    }))
+}
+
+pub fn problems_page(
+    conn: &Connection,
+    severity: &str,
+    search: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Value, ApiError> {
+    let page =
+        query_sqlite_file_issues(conn, severity, search, limit, offset).map_err(map_db_error)?;
+    Ok(json!({
+        "items": page.items.iter().map(file_issue_api_value).collect::<Vec<_>>(),
+        "page": {
+            "total": page.total,
+            "limit": page.limit,
+            "offset": page.offset,
+            "has_more": page.offset.saturating_add(page.items.len() as i64) < page.total,
+        }
+    }))
+}
+
+pub fn get_problem(conn: &Connection, issue_id: i64) -> Result<Option<SqliteFileIssue>, ApiError> {
+    get_sqlite_file_issue_by_id(conn, issue_id).map_err(map_db_error)
+}
+
+pub fn problem_recheck_targets(
+    conn: &Connection,
+) -> Result<Vec<SqliteFileIssueRecheckTarget>, ApiError> {
+    list_sqlite_file_issue_recheck_targets(conn).map_err(map_db_error)
 }
 
 fn session_from_sqlite(session: SqliteSession) -> Session {

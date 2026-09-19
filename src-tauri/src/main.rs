@@ -2,13 +2,14 @@ use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
-use tauri::{path::BaseDirectory, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{path::BaseDirectory, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_opener::OpenerExt;
 
 const API_SIDECAR: &str = "imgviewer-api-server";
 const THUMB_SIDECAR: &str = "imgviewer-thumb-worker";
@@ -17,6 +18,10 @@ const METADATA_SIDECAR: &str = "imgviewer-metadata-worker";
 #[derive(Default)]
 struct RuntimeProcesses {
     children: Mutex<Vec<ManagedSidecar>>,
+}
+
+struct RuntimeDatabase {
+    sqlite_path: PathBuf,
 }
 
 struct ManagedSidecar {
@@ -189,6 +194,44 @@ fn stop_runtime(app: &tauri::AppHandle) {
     }
 }
 
+fn validated_problem_path(issue: &tagimage_db::sqlite::SqliteFileIssue) -> Result<PathBuf, String> {
+    let relative = Path::new(&issue.path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err("invalid_problem_path".to_string());
+    }
+    let path = Path::new(&issue.root_path).join(relative);
+    if !path.is_file() {
+        return Err("file_missing".to_string());
+    }
+    Ok(path)
+}
+
+fn resolve_problem_path(db_path: &Path, issue_id: i64) -> Result<PathBuf, String> {
+    let conn = tagimage_db::sqlite::open_sqlite_runtime_db(db_path)?;
+    let issue = tagimage_db::sqlite::get_sqlite_file_issue_by_id(&conn, issue_id)?
+        .ok_or_else(|| "problem_not_found".to_string())?;
+    validated_problem_path(&issue)
+}
+
+#[tauri::command]
+fn reveal_problem(
+    app: tauri::AppHandle,
+    database: State<'_, RuntimeDatabase>,
+    issue_id: i64,
+) -> Result<(), String> {
+    let path = resolve_problem_path(&database.sqlite_path, issue_id)?;
+    app.opener()
+        .reveal_item_in_dir(path)
+        .map_err(|error| format!("reveal_problem_failed: {error}"))
+}
+
 fn watch_runtime(app: tauri::AppHandle) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(1));
@@ -220,13 +263,18 @@ fn watch_runtime(app: tauri::AppHandle) {
 fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(RuntimeProcesses::default())
+        .invoke_handler(tauri::generate_handler![reveal_problem])
         .setup(|app| {
             let sqlite_path = sqlite_path(app)?;
             if let Some(parent) = sqlite_path.parent() {
                 fs::create_dir_all(parent)?;
             }
             tagimage_db::sqlite::init_sqlite_db(&sqlite_path).map_err(io_error)?;
+            app.manage(RuntimeDatabase {
+                sqlite_path: sqlite_path.clone(),
+            });
 
             let static_dir = bundled_static_dir(app)?;
             if !static_dir.join("index.html").is_file() {
@@ -307,4 +355,64 @@ fn main() {
             stop_runtime(app);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn issue_fixture(path: &str, create_file: bool) -> (tempfile::TempDir, PathBuf, i64) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("vilra.sqlite");
+        let conn = tagimage_db::sqlite::init_sqlite_db(&db_path).expect("init db");
+        if create_file {
+            let absolute = dir.path().join(path);
+            if let Some(parent) = absolute.parent() {
+                fs::create_dir_all(parent).expect("parent");
+            }
+            fs::write(absolute, b"fixture").expect("fixture file");
+        }
+        let root_path = dir.path().to_string_lossy().into_owned();
+        conn.execute(
+            r#"
+            INSERT INTO file_issues (
+                root_path, path, severity, kind, expected_format, size, mtime_ns, detail
+            ) VALUES (?1, ?2, 'error', 'decode_error', 'jpeg', 7, 1, 'fixture')
+            "#,
+            (&root_path, path),
+        )
+        .expect("insert issue");
+        let issue_id = conn.last_insert_rowid();
+        (dir, db_path, issue_id)
+    }
+
+    #[test]
+    fn resolves_valid_problem_path() {
+        let (dir, db_path, issue_id) = issue_fixture("nested/broken.jpg", true);
+        assert_eq!(
+            resolve_problem_path(&db_path, issue_id).expect("resolve"),
+            dir.path().join("nested/broken.jpg")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_traversal_absolute_and_missing_problem_paths() {
+        let (_dir, db_path, issue_id) = issue_fixture("missing.jpg", false);
+        assert_eq!(
+            resolve_problem_path(&db_path, issue_id).unwrap_err(),
+            "file_missing"
+        );
+        assert_eq!(
+            resolve_problem_path(&db_path, issue_id + 1).unwrap_err(),
+            "problem_not_found"
+        );
+
+        for path in ["../outside.jpg", "/tmp/outside.jpg"] {
+            let (_dir, db_path, issue_id) = issue_fixture(path, false);
+            assert_eq!(
+                resolve_problem_path(&db_path, issue_id).unwrap_err(),
+                "invalid_problem_path"
+            );
+        }
+    }
 }

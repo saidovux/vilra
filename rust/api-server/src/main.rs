@@ -51,6 +51,16 @@ async fn run() -> Result<(), String> {
         .nest_service("/static", ServeDir::new(static_dir))
         .route("/api/status", get(handlers::get_status))
         .route("/api/events", get(handlers::events))
+        .route("/api/problems/summary", get(handlers::get_problems_summary))
+        .route(
+            "/api/problems/recheck-all",
+            post(handlers::recheck_all_problems),
+        )
+        .route("/api/problems", get(handlers::list_problems))
+        .route(
+            "/api/problems/:issue_id/recheck",
+            post(handlers::recheck_problem),
+        )
         .route("/api/images", get(handlers::list_images))
         .route(
             "/api/tags",

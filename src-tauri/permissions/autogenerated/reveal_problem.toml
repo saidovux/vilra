@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-reveal-problem"
+description = "Enables the reveal_problem command without any pre-configured scope."
+commands.allow = ["reveal_problem"]
+
+[[permission]]
+identifier = "deny-reveal-problem"
+description = "Denies the reveal_problem command without any pre-configured scope."
+commands.deny = ["reveal_problem"]

@@ -107,6 +107,29 @@ pub struct SqliteFileIssue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteFileIssueSummary {
+    pub total: i64,
+    pub errors: i64,
+    pub warnings: i64,
+    pub latest_updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteFileIssuePage {
+    pub items: Vec<SqliteFileIssue>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteFileIssueRecheckTarget {
+    pub id: i64,
+    pub root_path: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqliteFileIssueUpsert {
     pub image_id: Option<String>,
     pub root_path: String,
@@ -341,6 +364,115 @@ pub fn get_sqlite_file_issue(
         .optional()
         .map_err(|e| format!("get sqlite file issue {root_path}/{path}: {e}"))?;
     issue.map(SqliteFileIssue::try_from).transpose()
+}
+
+pub fn get_sqlite_file_issue_by_id(
+    conn: &Connection,
+    issue_id: i64,
+) -> Result<Option<SqliteFileIssue>, String> {
+    let issue = conn
+        .query_row(
+            "SELECT * FROM file_issues WHERE id = ?1",
+            params![issue_id],
+            raw_sqlite_file_issue_from_row,
+        )
+        .optional()
+        .map_err(|e| format!("get sqlite file issue {issue_id}: {e}"))?;
+    issue.map(SqliteFileIssue::try_from).transpose()
+}
+
+pub fn summarize_sqlite_file_issues(conn: &Connection) -> Result<SqliteFileIssueSummary, String> {
+    conn.query_row(
+        r#"
+        SELECT
+            count(*) AS total,
+            count(*) FILTER (WHERE severity = 'error') AS errors,
+            count(*) FILTER (WHERE severity = 'warning') AS warnings,
+            max(updated_at) AS latest_updated_at
+        FROM file_issues
+        "#,
+        [],
+        |row| {
+            Ok(SqliteFileIssueSummary {
+                total: row.get("total")?,
+                errors: row.get("errors")?,
+                warnings: row.get("warnings")?,
+                latest_updated_at: row.get("latest_updated_at")?,
+            })
+        },
+    )
+    .map_err(|e| format!("summarize sqlite file issues: {e}"))
+}
+
+pub fn query_sqlite_file_issues(
+    conn: &Connection,
+    severity: &str,
+    search: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<SqliteFileIssuePage, String> {
+    let total = conn
+        .query_row(
+            r#"
+            SELECT count(*)
+            FROM file_issues
+            WHERE (?1 = 'all' OR severity = ?1)
+              AND (?2 = '' OR instr(lower(path), lower(?2)) > 0)
+            "#,
+            params![severity, search],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("count sqlite file issues: {e}"))?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT *
+            FROM file_issues
+            WHERE (?1 = 'all' OR severity = ?1)
+              AND (?2 = '' OR instr(lower(path), lower(?2)) > 0)
+            ORDER BY CASE severity WHEN 'error' THEN 0 ELSE 1 END,
+                     lower(path), path, id
+            LIMIT ?3 OFFSET ?4
+            "#,
+        )
+        .map_err(|e| format!("prepare sqlite file issue page: {e}"))?;
+    let rows = stmt
+        .query_map(
+            params![severity, search, limit, offset],
+            raw_sqlite_file_issue_from_row,
+        )
+        .map_err(|e| format!("query sqlite file issue page: {e}"))?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(SqliteFileIssue::try_from(
+            row.map_err(|e| format!("read sqlite file issue page: {e}"))?,
+        )?);
+    }
+    Ok(SqliteFileIssuePage {
+        items,
+        total,
+        limit,
+        offset,
+    })
+}
+
+pub fn list_sqlite_file_issue_recheck_targets(
+    conn: &Connection,
+) -> Result<Vec<SqliteFileIssueRecheckTarget>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, root_path, path FROM file_issues ORDER BY id")
+        .map_err(|e| format!("prepare sqlite file issue recheck targets: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(SqliteFileIssueRecheckTarget {
+                id: row.get(0)?,
+                root_path: row.get(1)?,
+                path: row.get(2)?,
+            })
+        })
+        .map_err(|e| format!("query sqlite file issue recheck targets: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read sqlite file issue recheck targets: {e}"))
 }
 
 pub fn get_sqlite_file_issue_for_image(
@@ -4588,5 +4720,68 @@ mod tests {
             count_sqlite_jobs(&conn, None, None).expect("job count after invalid paths"),
             jobs_before
         );
+    }
+
+    #[test]
+    fn file_issue_summary_query_search_pagination_and_ordering() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        for (path, severity, kind) in [
+            (
+                "zeta/broken.jpg",
+                FileIssueSeverity::Error,
+                FileIssueKind::DecodeError,
+            ),
+            (
+                "Alpha/mismatch.jpg",
+                FileIssueSeverity::Warning,
+                FileIssueKind::FormatMismatch,
+            ),
+            (
+                "beta/unsupported.png",
+                FileIssueSeverity::Error,
+                FileIssueKind::UnsupportedContent,
+            ),
+        ] {
+            upsert_sqlite_file_issue(
+                &conn,
+                &SqliteFileIssueUpsert {
+                    image_id: None,
+                    root_path: "/photos".to_string(),
+                    path: path.to_string(),
+                    severity,
+                    kind,
+                    expected_format: expected_format_for_path(Path::new(path)),
+                    detected_format: None,
+                    size: 10,
+                    mtime_ns: 20,
+                    detail: Some("fixture".to_string()),
+                },
+            )
+            .expect("insert issue");
+        }
+
+        let summary = summarize_sqlite_file_issues(&conn).expect("summary");
+        assert_eq!((summary.total, summary.errors, summary.warnings), (3, 2, 1));
+        assert!(summary.latest_updated_at.is_some());
+
+        let first = query_sqlite_file_issues(&conn, "all", "", 2, 0).expect("first page");
+        assert_eq!(first.total, 3);
+        assert_eq!(first.items.len(), 2);
+        assert_eq!(first.items[0].path, "beta/unsupported.png");
+        assert_eq!(first.items[1].path, "zeta/broken.jpg");
+        let second = query_sqlite_file_issues(&conn, "all", "", 2, 2).expect("second page");
+        assert_eq!(second.items[0].path, "Alpha/mismatch.jpg");
+
+        let searched =
+            query_sqlite_file_issues(&conn, "warning", "MISMATCH", 10, 0).expect("search");
+        assert_eq!(searched.total, 1);
+        let issue = get_sqlite_file_issue_by_id(&conn, searched.items[0].id)
+            .expect("get by id")
+            .expect("issue");
+        assert_eq!(issue.path, "Alpha/mismatch.jpg");
+
+        let targets = list_sqlite_file_issue_recheck_targets(&conn).expect("targets");
+        assert_eq!(targets.len(), 3);
     }
 }

@@ -16,9 +16,14 @@ use axum::{
 };
 use serde::{de, Deserialize, Deserializer};
 use serde_json::{json, Value};
-use std::{convert::Infallible, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    convert::Infallible,
+    path::PathBuf,
+    sync::{atomic::Ordering, Arc},
+    time::Instant,
+};
 use tagimage_core::FileIssueSeverity;
-use tagimage_db::sqlite::SqliteFileIssue;
+use tagimage_db::sqlite::{get_sqlite_file_issue, SqliteFileIssue};
 use tokio::time::{sleep, Duration};
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +72,14 @@ pub struct EventsRequest {
     since: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ProblemsRequest {
+    severity: Option<String>,
+    search: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
 fn json_response(value: Value) -> Json<Value> {
     Json(value)
 }
@@ -91,6 +104,134 @@ pub async fn serve_index(State(state): State<Arc<AppState>>) -> Result<Response,
 pub async fn get_status(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let client = state.connect()?;
     Ok(json_response(db::status_payload(&state, &client)?))
+}
+
+pub async fn get_problems_summary(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, ApiError> {
+    let conn = state.connect()?;
+    Ok(json_response(db::problems_summary(&conn)?))
+}
+
+pub async fn list_problems(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ProblemsRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let severity = query
+        .severity
+        .unwrap_or_else(|| "all".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(severity.as_str(), "all" | "error" | "warning") {
+        return Err(ApiError::bad_request("invalid problem severity"));
+    }
+    let limit = query.limit.unwrap_or(100);
+    let offset = query.offset.unwrap_or(0);
+    if limit <= 0 || offset < 0 {
+        return Err(ApiError::bad_request("invalid problems pagination"));
+    }
+    let conn = state.connect()?;
+    Ok(json_response(db::problems_page(
+        &conn,
+        &severity,
+        query.search.as_deref().unwrap_or("").trim(),
+        limit.min(200),
+        offset,
+    )?))
+}
+
+pub async fn recheck_problem(
+    State(state): State<Arc<AppState>>,
+    Path(issue_id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let issue = db::get_problem(&state.connect()?, issue_id)?
+        .ok_or_else(|| ApiError::not_found("Problem not found"))?;
+    let root_path = issue.root_path.clone();
+    let relative_path = issue.path.clone();
+    let live = state.live.clone();
+    let recheck_root = PathBuf::from(&root_path);
+    let recheck_path = PathBuf::from(&relative_path);
+    tokio::task::spawn_blocking(move || live.recheck_path(&recheck_root, &recheck_path))
+        .await
+        .map_err(|error| ApiError::internal(format!("Problem recheck task failed: {error}")))?
+        .map_err(|error| ApiError::internal(format!("Problem recheck failed: {error}")))?;
+
+    let current = get_sqlite_file_issue(&state.connect()?, &root_path, &relative_path)
+        .map_err(|error| ApiError::internal(format!("Database error: {error}")))?;
+    let status = current
+        .as_ref()
+        .map(|issue| issue.severity.as_str())
+        .unwrap_or("resolved");
+    Ok(json_response(json!({
+        "ok": true,
+        "status": status,
+        "issue": current.as_ref().map(db::file_issue_api_value),
+    })))
+}
+
+pub async fn recheck_all_problems(
+    State(state): State<Arc<AppState>>,
+) -> Result<Response, ApiError> {
+    if state
+        .problems_recheck_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "problems_recheck_already_running"})),
+        )
+            .into_response());
+    }
+
+    let targets = match db::problem_recheck_targets(&state.connect()?) {
+        Ok(targets) => targets,
+        Err(error) => {
+            state
+                .problems_recheck_running
+                .store(false, Ordering::Release);
+            return Err(error);
+        }
+    };
+    let scheduled = targets.len();
+    let live = state.live.clone();
+    let events = state.events.clone();
+    let running = state.problems_recheck_running.clone();
+    tokio::spawn(async move {
+        let requested = targets.len();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut failed = 0usize;
+            for target in targets {
+                if live
+                    .recheck_path(
+                        std::path::Path::new(&target.root_path),
+                        std::path::Path::new(&target.path),
+                    )
+                    .is_err()
+                {
+                    failed += 1;
+                }
+            }
+            (requested, failed)
+        })
+        .await;
+        let (processed, failed) = result.unwrap_or((0, requested));
+        running.store(false, Ordering::Release);
+        events.publish(
+            "problems_recheck_finished",
+            json!({
+                "requested": requested,
+                "processed": processed,
+                "failed": failed,
+            }),
+        );
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({"ok": true, "scheduled": scheduled})),
+    )
+        .into_response())
 }
 
 pub async fn events(
@@ -710,8 +851,16 @@ mod tests {
     }
 
     fn test_state(repo_root: &std::path::Path, db_path: PathBuf) -> Arc<AppState> {
+        test_state_with_roots(repo_root, db_path, Vec::new())
+    }
+
+    fn test_state_with_roots(
+        repo_root: &std::path::Path,
+        db_path: PathBuf,
+        roots: Vec<PathBuf>,
+    ) -> Arc<AppState> {
         let events = EventHub::new();
-        let live = LiveIndexer::start(db_path.clone(), events.clone(), Vec::new()).unwrap();
+        let live = LiveIndexer::start(db_path.clone(), events.clone(), roots).unwrap();
         Arc::new(AppState::new(
             AppConfig {
                 sqlite_path: db_path,
@@ -733,6 +882,44 @@ mod tests {
             live,
             events,
         ))
+    }
+
+    fn insert_problem(
+        conn: &rusqlite::Connection,
+        root: &std::path::Path,
+        path: &str,
+        severity: FileIssueSeverity,
+    ) -> i64 {
+        let absolute = root.join(path);
+        if let Some(parent) = absolute.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&absolute, b"not an image").unwrap();
+        let fingerprint = file_fingerprint(&absolute).unwrap();
+        upsert_sqlite_file_issue(
+            conn,
+            &SqliteFileIssueUpsert {
+                image_id: None,
+                root_path: root.to_string_lossy().into_owned(),
+                path: path.to_string(),
+                severity,
+                kind: if severity == FileIssueSeverity::Error {
+                    FileIssueKind::DecodeError
+                } else {
+                    FileIssueKind::FormatMismatch
+                },
+                expected_format: Some(SupportedImageFormat::Jpeg),
+                detected_format: None,
+                size: fingerprint.size,
+                mtime_ns: fingerprint.mtime_ns,
+                detail: Some("fixture".to_string()),
+            },
+        )
+        .unwrap();
+        tagimage_db::sqlite::get_sqlite_file_issue(conn, &root.to_string_lossy(), path)
+            .unwrap()
+            .unwrap()
+            .id
     }
 
     fn insert_delivery_image(
@@ -862,5 +1049,114 @@ mod tests {
                 mime
             );
         }
+    }
+
+    #[tokio::test]
+    async fn problems_summary_list_search_pagination_and_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        insert_problem(&conn, dir.path(), "zeta.jpg", FileIssueSeverity::Error);
+        insert_problem(&conn, dir.path(), "Alpha.jpg", FileIssueSeverity::Warning);
+        insert_problem(&conn, dir.path(), "beta.jpg", FileIssueSeverity::Error);
+        drop(conn);
+        let state = test_state(dir.path(), db_path);
+
+        let summary = get_problems_summary(State(state.clone())).await.unwrap().0;
+        assert_eq!(summary["total"], 3);
+        assert_eq!(summary["errors"], 2);
+        assert_eq!(summary["warnings"], 1);
+
+        let first = list_problems(
+            State(state.clone()),
+            Query(ProblemsRequest {
+                severity: Some("all".to_string()),
+                search: None,
+                limit: Some(2),
+                offset: Some(0),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(first["page"]["total"], 3);
+        assert_eq!(first["page"]["has_more"], true);
+        assert_eq!(first["items"][0]["path"], "beta.jpg");
+        assert_eq!(first["items"][1]["path"], "zeta.jpg");
+        assert_eq!(
+            first["items"][0]["absolute_path"],
+            dir.path().join("beta.jpg").to_string_lossy().as_ref()
+        );
+
+        let searched = list_problems(
+            State(state.clone()),
+            Query(ProblemsRequest {
+                severity: Some("warning".to_string()),
+                search: Some("ALPHA".to_string()),
+                limit: Some(100),
+                offset: Some(0),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(searched["items"].as_array().unwrap().len(), 1);
+
+        let error = list_problems(
+            State(state),
+            Query(ProblemsRequest {
+                severity: Some("fatal".to_string()),
+                search: None,
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn single_and_all_problem_rechecks_use_stored_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        let first = insert_problem(&conn, dir.path(), "first.jpg", FileIssueSeverity::Error);
+        insert_problem(&conn, dir.path(), "second.jpg", FileIssueSeverity::Error);
+        drop(conn);
+        let state = test_state_with_roots(dir.path(), db_path, vec![dir.path().to_path_buf()]);
+
+        let single = recheck_problem(State(state.clone()), Path(first))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(single["ok"], true);
+        assert_eq!(single["status"], "error");
+
+        let mut events = state.events.subscribe();
+        let response = recheck_all_problems(State(state.clone())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let finished = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.kind == "problems_recheck_finished" {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(finished.data["requested"], 2);
+        assert_eq!(finished.data["processed"], 2);
+        assert_eq!(finished.data["failed"], 0);
+
+        state
+            .problems_recheck_running
+            .store(true, Ordering::Release);
+        let conflict = recheck_all_problems(State(state.clone())).await.unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        state
+            .problems_recheck_running
+            .store(false, Ordering::Release);
     }
 }

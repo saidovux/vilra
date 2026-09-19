@@ -367,3 +367,75 @@ test('folder tag setting pauses sync and destructive cleanup preserves user tags
     fs.rmSync(newDir, {recursive: true, force: true});
   }
 });
+
+test('Problems view lists live file issues and rechecks one stored path', async ({ page }) => {
+  await page.setViewportSize({width: 1366, height: 768});
+  const root = fixtureRoot();
+  const broken = path.join(root, 'e2e-broken.jpg');
+  fs.rmSync(broken, {force: true});
+  try {
+    fs.writeFileSync(broken, Buffer.from('not a jpeg'));
+    await expect.poll(async () => {
+      const response = await page.request.get('/api/problems/summary');
+      const data = await response.json();
+      return Number(data.errors || 0);
+    }, {timeout: 15_000}).toBeGreaterThan(0);
+
+    await waitForGallery(page);
+    await page.locator('#folder-sidebar-toggle').click();
+    await page.locator('#problems-nav').click();
+    await expect(page.locator('#problems-wrap')).toBeVisible();
+    expect((await page.locator('.problems-head').boundingBox())?.height).toBeLessThan(150);
+    const row = page.locator('.problem-row').filter({hasText: 'e2e-broken.jpg'});
+    await expect(row).toBeVisible({timeout: 15_000});
+    await expect(row.locator('.problem-severity')).toContainText('Ошибка');
+
+    await page.locator('#problems-search').fill('E2E-BROKEN');
+    await expect(row).toBeVisible();
+    await row.locator('[data-action="recheck-problem"]').click();
+    await expect(row).toBeVisible();
+    fs.rmSync(broken, {force: true});
+    await expect(row).toHaveCount(0, {timeout: 15_000});
+
+    await page.locator('#gallery-nav').click();
+    await expect(page.locator('#gallery-wrap')).toBeVisible();
+  } finally {
+    fs.rmSync(broken, {force: true});
+  }
+});
+
+test('terminal thumbnail 422 removes the card and does not retry', async ({ page }) => {
+  let terminalSeen = false;
+  let terminalRequests = 0;
+  let targetId = '';
+
+  await page.route('**/api/images?**', async route => {
+    const response = await route.fetch();
+    const data = await response.json();
+    if (terminalSeen && Array.isArray(data.items)) {
+      data.items = data.items.filter((item: ImageItem) => item.id !== targetId);
+      if (data.page && typeof data.page.total === 'number') data.page.total -= 1;
+    }
+    await route.fulfill({response, json: data});
+  });
+
+  await waitForGallery(page);
+  const firstCard = page.locator('.card[data-id]').first();
+  targetId = String(await firstCard.getAttribute('data-id'));
+  expect(targetId).toBeTruthy();
+  await page.route(`**/thumb/${targetId}*`, async route => {
+    terminalSeen = true;
+    terminalRequests += 1;
+    await route.fulfill({
+      status: 422,
+      contentType: 'application/json',
+      body: JSON.stringify({error: 'image_unavailable'}),
+    });
+  });
+  await firstCard.locator('img').evaluate(image => image.dispatchEvent(new Event('error')));
+
+  const card = page.locator(`.card[data-id="${targetId}"]`);
+  await expect(card).toHaveCount(0, {timeout: 15_000});
+  await page.waitForTimeout(700);
+  expect(terminalRequests).toBe(1);
+});
