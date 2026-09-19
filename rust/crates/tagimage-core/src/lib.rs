@@ -119,6 +119,14 @@ pub struct ImageInspection {
     pub height: u32,
 }
 
+#[derive(Debug)]
+pub struct DecodedImage {
+    pub image: DynamicImage,
+    pub expected_format: SupportedImageFormat,
+    pub detected_format: SupportedImageFormat,
+    pub fingerprint: FileFingerprint,
+}
+
 impl ImageInspection {
     pub fn is_format_mismatch(&self) -> bool {
         self.expected_format != self.detected_format
@@ -359,7 +367,7 @@ fn classify_inspection_error_stability(
     }
 }
 
-pub fn decode_supported_image(path: &Path) -> Result<DynamicImage, ImageInspectionError> {
+pub fn decode_supported_image(path: &Path) -> Result<DecodedImage, ImageInspectionError> {
     let Some(expected_format) = expected_format_for_path(path) else {
         return Err(ImageInspectionError {
             kind: ImageInspectionErrorKind::UnsupportedPath,
@@ -441,13 +449,18 @@ pub fn decode_supported_image(path: &Path) -> Result<DynamicImage, ImageInspecti
             },
         )
     })?;
-    verify_unchanged(
+    let fingerprint = verify_unchanged(
         path,
         fingerprint,
         Some(expected_format),
         Some(detected_format.as_str().to_string()),
     )?;
-    Ok(decoded)
+    Ok(DecodedImage {
+        image: decoded,
+        expected_format,
+        detected_format,
+        fingerprint,
+    })
 }
 
 fn system_time_seconds(value: SystemTime) -> i64 {
@@ -581,7 +594,7 @@ mod tests {
             assert_eq!(inspection.expected_format, SupportedImageFormat::Jpeg);
             assert_eq!(inspection.detected_format, detected);
             assert!(inspection.is_format_mismatch());
-            assert_eq!(decode_supported_image(&path).unwrap().width(), 3);
+            assert_eq!(decode_supported_image(&path).unwrap().image.width(), 3);
         }
     }
 

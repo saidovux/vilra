@@ -9,9 +9,8 @@ use tagimage_core::{
 use tagimage_db::sqlite::{
     claim_next_sqlite_metadata_job, get_sqlite_file_issue_for_image,
     mark_sqlite_claimed_job_terminal_failed, mark_sqlite_image_job_terminal_failed,
-    mark_sqlite_metadata_failed, mark_sqlite_metadata_succeeded, open_sqlite_runtime_db,
-    record_sqlite_permanent_image_job_failure, resolve_sqlite_runtime_path,
-    upsert_sqlite_file_issue, SqliteFileIssueUpsert,
+    mark_sqlite_metadata_failed, mark_sqlite_metadata_succeeded_with_issue, open_sqlite_runtime_db,
+    record_sqlite_permanent_image_job_failure, resolve_sqlite_runtime_path, SqliteFileIssueUpsert,
 };
 use tagimage_db::ClaimedJob;
 use tokio::time::sleep;
@@ -147,6 +146,21 @@ enum MetadataExecution {
         error: String,
         total_ms: u128,
     },
+    Discarded {
+        reason: String,
+        total_ms: u128,
+    },
+}
+
+fn failed_or_discarded(applied: bool, error: String, total_ms: u128) -> MetadataExecution {
+    if applied {
+        MetadataExecution::Failed { error, total_ms }
+    } else {
+        MetadataExecution::Discarded {
+            reason: error,
+            total_ms,
+        }
+    }
 }
 
 fn execute_metadata_job(
@@ -171,48 +185,42 @@ where
         Ok(parsed) => parsed,
         Err(error) => {
             let error = format!("invalid metadata payload: {error}");
-            mark_sqlite_claimed_job_terminal_failed(
+            let applied = mark_sqlite_claimed_job_terminal_failed(
                 conn,
                 job,
                 &error,
                 Some(started.elapsed().as_millis()),
             )?;
-            return Ok(MetadataExecution::Failed {
-                error,
-                total_ms: started.elapsed().as_millis(),
-            });
+            let total_ms = started.elapsed().as_millis();
+            return Ok(failed_or_discarded(applied, error, total_ms));
         }
     };
     let source = PathBuf::from(&parsed.root_path).join(&parsed.path);
     if expected_format_for_path(&source).is_none() {
         let error = format!("unsupported image job path: {}", source.display());
-        mark_sqlite_claimed_job_terminal_failed(
+        let applied = mark_sqlite_claimed_job_terminal_failed(
             conn,
             job,
             &error,
             Some(started.elapsed().as_millis()),
         )?;
-        return Ok(MetadataExecution::Failed {
-            error,
-            total_ms: started.elapsed().as_millis(),
-        });
+        let total_ms = started.elapsed().as_millis();
+        return Ok(failed_or_discarded(applied, error, total_ms));
     }
 
     let fingerprint = match file_fingerprint(&source) {
         Ok(fingerprint) => fingerprint,
         Err(error) => {
             let total_ms = started.elapsed().as_millis();
-            mark_sqlite_metadata_failed(
+            let detail = error.detail;
+            let applied = mark_sqlite_metadata_failed(
                 conn,
                 job,
-                &error.detail,
+                &detail,
                 Some(total_ms),
                 METADATA_MAX_BACKOFF_SEC,
             )?;
-            return Ok(MetadataExecution::Failed {
-                error: error.detail,
-                total_ms,
-            });
+            return Ok(failed_or_discarded(applied, detail, total_ms));
         }
     };
     let existing_issue =
@@ -224,14 +232,14 @@ where
         {
             let error = format!("image unavailable: {}", issue.kind.as_str());
             let total_ms = started.elapsed().as_millis();
-            mark_sqlite_image_job_terminal_failed(
+            let applied = mark_sqlite_image_job_terminal_failed(
                 conn,
                 job,
                 &parsed.image_id,
                 &error,
                 Some(total_ms),
             )?;
-            return Ok(MetadataExecution::Failed { error, total_ms });
+            return Ok(failed_or_discarded(applied, error, total_ms));
         }
     }
 
@@ -239,7 +247,7 @@ where
         Ok(inspection) => inspection,
         Err(error) => {
             let total_ms = started.elapsed().as_millis();
-            match error.kind {
+            let applied = match error.kind {
                 ImageInspectionErrorKind::DecodeError
                 | ImageInspectionErrorKind::UnsupportedContent => {
                     let issue = permanent_issue_from_error(&parsed, &error)?;
@@ -250,7 +258,7 @@ where
                         &issue,
                         &error.detail,
                         Some(total_ms),
-                    )?;
+                    )?
                 }
                 ImageInspectionErrorKind::UnsupportedPath => {
                     mark_sqlite_claimed_job_terminal_failed(
@@ -258,51 +266,58 @@ where
                         job,
                         &error.detail,
                         Some(total_ms),
-                    )?;
+                    )?
                 }
-                ImageInspectionErrorKind::ChangedDuringInspection
-                | ImageInspectionErrorKind::Unreadable => {
-                    mark_sqlite_metadata_failed(
+                ImageInspectionErrorKind::Unreadable
+                    if job.attempt >= job.max_attempts && error.fingerprint.is_some() =>
+                {
+                    let issue = permanent_issue_from_error(&parsed, &error)?;
+                    record_sqlite_permanent_image_job_failure(
                         conn,
                         job,
+                        &parsed.image_id,
+                        &issue,
                         &error.detail,
                         Some(total_ms),
-                        METADATA_MAX_BACKOFF_SEC,
-                    )?;
+                    )?
                 }
-            }
-            return Ok(MetadataExecution::Failed {
-                error: error.detail,
-                total_ms,
-            });
+                ImageInspectionErrorKind::ChangedDuringInspection
+                | ImageInspectionErrorKind::Unreadable => mark_sqlite_metadata_failed(
+                    conn,
+                    job,
+                    &error.detail,
+                    Some(total_ms),
+                    METADATA_MAX_BACKOFF_SEC,
+                )?,
+            };
+            return Ok(failed_or_discarded(applied, error.detail, total_ms));
         }
     };
 
-    if inspection.is_format_mismatch()
+    let mismatch_issue = if inspection.is_format_mismatch()
         && !existing_issue
             .as_ref()
             .is_some_and(|issue| issue.severity == FileIssueSeverity::Error)
     {
-        upsert_sqlite_file_issue(
-            conn,
-            &SqliteFileIssueUpsert {
-                image_id: Some(parsed.image_id.clone()),
-                root_path: parsed.root_path.clone(),
-                path: parsed.path.clone(),
-                severity: FileIssueSeverity::Warning,
-                kind: FileIssueKind::FormatMismatch,
-                expected_format: Some(inspection.expected_format),
-                detected_format: Some(inspection.detected_format.as_str().to_string()),
-                size: inspection.fingerprint.size,
-                mtime_ns: inspection.fingerprint.mtime_ns,
-                detail: Some(format!(
-                    "expected {} from extension, detected {} from content",
-                    inspection.expected_format.as_str(),
-                    inspection.detected_format.as_str()
-                )),
-            },
-        )?;
-    }
+        Some(SqliteFileIssueUpsert {
+            image_id: Some(parsed.image_id.clone()),
+            root_path: parsed.root_path.clone(),
+            path: parsed.path.clone(),
+            severity: FileIssueSeverity::Warning,
+            kind: FileIssueKind::FormatMismatch,
+            expected_format: Some(inspection.expected_format),
+            detected_format: Some(inspection.detected_format.as_str().to_string()),
+            size: inspection.fingerprint.size,
+            mtime_ns: inspection.fingerprint.mtime_ns,
+            detail: Some(format!(
+                "expected {} from extension, detected {} from content",
+                inspection.expected_format.as_str(),
+                inspection.detected_format.as_str()
+            )),
+        })
+    } else {
+        None
+    };
 
     let extracted = MetadataExtracted {
         payload: parsed,
@@ -322,7 +337,19 @@ where
         "width": extracted.width,
         "height": extracted.height,
     });
-    mark_sqlite_metadata_succeeded(conn, job, metadata_json, authoritative)?;
+    let applied = mark_sqlite_metadata_succeeded_with_issue(
+        conn,
+        job,
+        metadata_json,
+        authoritative,
+        mismatch_issue.as_ref(),
+    )?;
+    if !applied {
+        return Ok(MetadataExecution::Discarded {
+            reason: "metadata attempt is no longer current".to_string(),
+            total_ms: started.elapsed().as_millis(),
+        });
+    }
     Ok(MetadataExecution::Succeeded {
         extracted,
         total_ms: started.elapsed().as_millis(),
@@ -414,6 +441,12 @@ async fn run_worker_loop(
                 metrics.record_failure(total_ms);
                 metrics.maybe_log_summary(metrics_interval_sec, &worker_id);
             }
+            MetadataExecution::Discarded { reason, total_ms } => {
+                eprintln!(
+                    "[rust-metadata-worker] job_discarded worker={} job={} total_ms={} reason={}",
+                    worker_id, job.id, total_ms, reason
+                );
+            }
         }
     }
 }
@@ -483,8 +516,9 @@ mod tests {
     use std::io::Cursor;
     use tagimage_core::{file_fingerprint, FileIssueKind, SupportedImageFormat};
     use tagimage_db::sqlite::{
-        enqueue_sqlite_job, enqueue_sqlite_metadata_job, get_sqlite_file_issue, get_sqlite_job,
-        init_sqlite_db, upsert_sqlite_file_issue, upsert_sqlite_image, SqliteImageUpsert,
+        cancel_sqlite_job, enqueue_sqlite_job, enqueue_sqlite_metadata_job, get_sqlite_file_issue,
+        get_sqlite_job, init_sqlite_db, list_sqlite_job_events, upsert_sqlite_file_issue,
+        upsert_sqlite_image, SqliteImageUpsert,
     };
 
     fn encoded(format: ImageFormat) -> Vec<u8> {
@@ -662,6 +696,76 @@ mod tests {
                 .unwrap()
                 .kind,
             FileIssueKind::UnsupportedContent
+        );
+    }
+
+    #[test]
+    fn exhausted_stable_unreadable_metadata_becomes_terminal_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = init_sqlite_db(&dir.path().join("db.sqlite")).unwrap();
+        let mut job = insert_image_and_claim(
+            &conn,
+            dir.path(),
+            "unreadable.jpg",
+            &encoded(ImageFormat::Jpeg),
+        );
+        conn.execute("UPDATE jobs SET max_attempts = 1 WHERE id = ?1", [&job.id])
+            .unwrap();
+        job.max_attempts = 1;
+        let fingerprint = file_fingerprint(&dir.path().join("unreadable.jpg")).unwrap();
+
+        let result = execute_metadata_job_with_inspector(&conn, &job, true, |_| {
+            Err(ImageInspectionError {
+                kind: ImageInspectionErrorKind::Unreadable,
+                expected_format: Some(SupportedImageFormat::Jpeg),
+                detected_format: None,
+                fingerprint: Some(fingerprint),
+                detail: "stable permission failure".to_string(),
+            })
+        })
+        .unwrap();
+        assert!(matches!(result, MetadataExecution::Failed { .. }));
+        assert_eq!(
+            get_sqlite_job(&conn, &job.id).unwrap().unwrap().state,
+            "failed"
+        );
+        assert_eq!(
+            get_sqlite_file_issue(&conn, &dir.path().to_string_lossy(), "unreadable.jpg")
+                .unwrap()
+                .unwrap()
+                .kind,
+            FileIssueKind::Unreadable
+        );
+    }
+
+    #[test]
+    fn canceled_metadata_attempt_is_discarded_without_success_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = init_sqlite_db(&dir.path().join("db.sqlite")).unwrap();
+        let job = insert_image_and_claim(
+            &conn,
+            dir.path(),
+            "canceled.jpg",
+            &encoded(ImageFormat::Png),
+        );
+        assert!(cancel_sqlite_job(&conn, &job.id).unwrap());
+
+        assert!(matches!(
+            execute_metadata_job(&conn, &job, true).unwrap(),
+            MetadataExecution::Discarded { .. }
+        ));
+        assert_eq!(
+            get_sqlite_job(&conn, &job.id).unwrap().unwrap().state,
+            "canceled"
+        );
+        assert!(!list_sqlite_job_events(&conn, &job.id)
+            .unwrap()
+            .iter()
+            .any(|event| event.event == "succeeded"));
+        assert!(
+            get_sqlite_file_issue(&conn, &dir.path().to_string_lossy(), "canceled.jpg")
+                .unwrap()
+                .is_none()
         );
     }
 }

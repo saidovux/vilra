@@ -1,7 +1,8 @@
 use crate::sqlite::{
-    claim_next_sqlite_job, enqueue_sqlite_job, get_sqlite_job, insert_job_event,
+    claim_next_sqlite_job, enqueue_sqlite_job_in_tx, get_sqlite_job, insert_job_event,
     mark_sqlite_claimed_job_failed, mark_sqlite_claimed_job_succeeded,
-    mark_sqlite_job_terminal_failed_in_tx, set_latest_attempt_state, SqliteJob,
+    mark_sqlite_job_succeeded_in_tx, mark_sqlite_job_terminal_failed_in_tx,
+    set_latest_attempt_state, SqliteJob,
 };
 use crate::sqlite_schema::SQLITE_SCHEMA_VERSION;
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
@@ -13,7 +14,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tagimage_core::{
-    expected_format_for_path, FileIssueKind, FileIssueSeverity, SupportedImageFormat,
+    expected_format_for_path, FileFingerprint, FileIssueKind, FileIssueSeverity,
+    SupportedImageFormat,
 };
 use uuid::Uuid;
 
@@ -116,6 +118,16 @@ pub struct SqliteFileIssueUpsert {
     pub size: i64,
     pub mtime_ns: i64,
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteDecodedImageRecovery {
+    pub image_id: String,
+    pub root_path: String,
+    pub path: String,
+    pub expected_format: SupportedImageFormat,
+    pub detected_format: SupportedImageFormat,
+    pub fingerprint: FileFingerprint,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2353,38 +2365,26 @@ pub fn enqueue_sqlite_thumb_job(
     priority: i32,
     max_attempts: i32,
 ) -> Result<(JsonValue, bool), String> {
-    ensure_sqlite_image_job_allowed(conn, image_id, root_path, path)?;
-    let mut result = enqueue_sqlite_job(
-        conn,
-        "thumb",
-        json!({
-            "image_id": image_id,
-            "root_path": root_path,
-            "path": path,
-            "thumb": thumb,
-            "mtime": mtime,
-            "max_size": [640, 640],
-        }),
-        priority,
-        max_attempts,
-        Some(&format!("thumb:{image_id}:{mtime}")),
-    )?;
-    if result.deduped && result.job.state == "queued" && result.job.priority < priority {
-        conn.execute(
-            r#"
-            UPDATE jobs
-            SET priority = max(priority, ?2),
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE id = ?1 AND state = 'queued'
-            "#,
-            params![result.job.id, priority],
-        )
-        .map_err(|e| format!("promote queued sqlite thumbnail job: {e}"))?;
-        if let Some(job) = get_sqlite_job(conn, &result.job.id)? {
-            result.job = job;
-        }
-    }
-    Ok((serialize_sqlite_job(&result.job), result.deduped))
+    with_immediate_tx(conn, || {
+        ensure_sqlite_image_job_allowed(conn, image_id, root_path, path)?;
+        let mut result = enqueue_sqlite_job_in_tx(
+            conn,
+            "thumb",
+            json!({
+                "image_id": image_id,
+                "root_path": root_path,
+                "path": path,
+                "thumb": thumb,
+                "mtime": mtime,
+                "max_size": [640, 640],
+            }),
+            priority,
+            max_attempts,
+            Some(&format!("thumb:{image_id}:{mtime}")),
+        )?;
+        promote_queued_image_job_in_tx(conn, &mut result, priority, "thumbnail")?;
+        Ok((serialize_sqlite_job(&result.job), result.deduped))
+    })
 }
 
 pub fn enqueue_sqlite_metadata_job(
@@ -2396,25 +2396,52 @@ pub fn enqueue_sqlite_metadata_job(
     priority: i32,
     max_attempts: i32,
 ) -> Result<(JsonValue, bool), String> {
-    ensure_sqlite_image_job_allowed(conn, image_id, root_path, path)?;
     let dedupe_key = if let Some(mtime) = mtime {
         format!("metadata:{image_id}:{mtime}")
     } else {
         format!("metadata:{image_id}")
     };
-    let result = enqueue_sqlite_job(
-        conn,
-        "metadata",
-        json!({
-            "image_id": image_id,
-            "root_path": root_path,
-            "path": path,
-        }),
-        priority,
-        max_attempts,
-        Some(&dedupe_key),
-    )?;
-    Ok((serialize_sqlite_job(&result.job), result.deduped))
+    with_immediate_tx(conn, || {
+        ensure_sqlite_image_job_allowed(conn, image_id, root_path, path)?;
+        let mut result = enqueue_sqlite_job_in_tx(
+            conn,
+            "metadata",
+            json!({
+                "image_id": image_id,
+                "root_path": root_path,
+                "path": path,
+            }),
+            priority,
+            max_attempts,
+            Some(&dedupe_key),
+        )?;
+        promote_queued_image_job_in_tx(conn, &mut result, priority, "metadata")?;
+        Ok((serialize_sqlite_job(&result.job), result.deduped))
+    })
+}
+
+fn promote_queued_image_job_in_tx(
+    conn: &Connection,
+    result: &mut crate::sqlite::SqliteEnqueueResult,
+    priority: i32,
+    label: &str,
+) -> Result<(), String> {
+    if result.deduped && result.job.state == "queued" && result.job.priority < priority {
+        conn.execute(
+            r#"
+            UPDATE jobs
+            SET priority = max(priority, ?2),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1 AND state = 'queued'
+            "#,
+            params![result.job.id, priority],
+        )
+        .map_err(|e| format!("promote queued sqlite {label} job: {e}"))?;
+        if let Some(job) = get_sqlite_job(conn, &result.job.id)? {
+            result.job = job;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_sqlite_image_job_allowed(
@@ -2526,6 +2553,16 @@ pub fn mark_sqlite_metadata_succeeded(
     metadata_json: JsonValue,
     authoritative: bool,
 ) -> Result<bool, String> {
+    mark_sqlite_metadata_succeeded_with_issue(conn, job, metadata_json, authoritative, None)
+}
+
+pub fn mark_sqlite_metadata_succeeded_with_issue(
+    conn: &Connection,
+    job: &crate::ClaimedJob,
+    metadata_json: JsonValue,
+    authoritative: bool,
+    issue: Option<&SqliteFileIssueUpsert>,
+) -> Result<bool, String> {
     let event_data = json!({
         "attempt": job.attempt,
         "completed_at": now_unix(),
@@ -2533,7 +2570,21 @@ pub fn mark_sqlite_metadata_succeeded(
         "authoritative": authoritative,
         "shadow": !authoritative,
     });
-    mark_sqlite_claimed_job_succeeded(conn, job, Some(1), Some(event_data))
+    with_immediate_tx(conn, || {
+        if !claimed_job_is_running(conn, job)? {
+            return Ok(false);
+        }
+        if let Some(issue) = issue {
+            upsert_sqlite_file_issue(conn, issue)?;
+        }
+        mark_sqlite_job_succeeded_in_tx(
+            conn,
+            &job.id,
+            Some((&job.worker_id, job.attempt)),
+            Some(1),
+            Some(event_data),
+        )
+    })
 }
 
 pub fn mark_sqlite_metadata_failed(
@@ -2563,6 +2614,126 @@ pub fn mark_sqlite_thumb_succeeded(
     mark_sqlite_claimed_job_succeeded(conn, job, Some(1), Some(event_data))
 }
 
+pub fn mark_sqlite_thumb_succeeded_after_decode(
+    conn: &Connection,
+    job: &crate::ClaimedJob,
+    metrics: Option<JsonValue>,
+    recovery: Option<&SqliteDecodedImageRecovery>,
+) -> Result<bool, String> {
+    finalize_sqlite_thumb_success(conn, job, metrics, recovery, || Ok(()))
+}
+
+pub fn finalize_sqlite_thumb_success<F>(
+    conn: &Connection,
+    job: &crate::ClaimedJob,
+    metrics: Option<JsonValue>,
+    recovery: Option<&SqliteDecodedImageRecovery>,
+    publish_thumbnail: F,
+) -> Result<bool, String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    let mut event_data = json!({
+        "attempt": job.attempt,
+        "completed_at": now_unix(),
+    });
+    if let Some(metrics) = metrics {
+        if let Some(object) = event_data.as_object_mut() {
+            object.insert("metrics".to_string(), metrics);
+        }
+    }
+    with_immediate_tx(conn, || {
+        if !claimed_job_is_running(conn, job)? {
+            return Ok(false);
+        }
+        publish_thumbnail()?;
+        if let Some(recovery) = recovery {
+            recover_sqlite_file_issue_after_decode_in_tx(conn, recovery)?;
+        }
+        mark_sqlite_job_succeeded_in_tx(
+            conn,
+            &job.id,
+            Some((&job.worker_id, job.attempt)),
+            Some(1),
+            Some(event_data),
+        )
+    })
+}
+
+fn recover_sqlite_file_issue_after_decode_in_tx(
+    conn: &Connection,
+    recovery: &SqliteDecodedImageRecovery,
+) -> Result<(), String> {
+    let Some(issue) = get_sqlite_file_issue_for_image(
+        conn,
+        &recovery.image_id,
+        &recovery.root_path,
+        &recovery.path,
+    )?
+    else {
+        return Ok(());
+    };
+    if issue.severity != FileIssueSeverity::Error
+        || (issue.size == recovery.fingerprint.size
+            && issue.mtime_ns == recovery.fingerprint.mtime_ns)
+    {
+        return Ok(());
+    }
+
+    conn.execute(
+        r#"
+        UPDATE images
+        SET hidden = 0,
+            size = max(0, ?2),
+            mtime = ?3,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ?1 AND root_path = ?4 AND path = ?5
+        "#,
+        params![
+            recovery.image_id,
+            recovery.fingerprint.size,
+            recovery.fingerprint.mtime,
+            recovery.root_path,
+            recovery.path,
+        ],
+    )
+    .map_err(|e| format!("restore recovered sqlite image {}: {e}", recovery.image_id))?;
+
+    if recovery.expected_format == recovery.detected_format {
+        conn.execute(
+            "DELETE FROM file_issues WHERE id = ?1 AND severity = 'error'",
+            params![issue.id],
+        )
+        .map_err(|e| format!("delete recovered sqlite file issue {}: {e}", issue.id))?;
+    } else {
+        conn.execute(
+            "DELETE FROM file_issues WHERE id = ?1 AND severity = 'error'",
+            params![issue.id],
+        )
+        .map_err(|e| format!("replace recovered sqlite file issue {}: {e}", issue.id))?;
+        upsert_sqlite_file_issue(
+            conn,
+            &SqliteFileIssueUpsert {
+                image_id: Some(recovery.image_id.clone()),
+                root_path: recovery.root_path.clone(),
+                path: recovery.path.clone(),
+                severity: FileIssueSeverity::Warning,
+                kind: FileIssueKind::FormatMismatch,
+                expected_format: Some(recovery.expected_format),
+                detected_format: Some(recovery.detected_format.as_str().to_string()),
+                size: recovery.fingerprint.size,
+                mtime_ns: recovery.fingerprint.mtime_ns,
+                detail: Some(format!(
+                    "expected {} from extension, detected {} from content",
+                    recovery.expected_format.as_str(),
+                    recovery.detected_format.as_str()
+                )),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 pub fn mark_sqlite_thumb_failed(
     conn: &Connection,
     job: &crate::ClaimedJob,
@@ -2585,7 +2756,13 @@ pub fn mark_sqlite_image_job_terminal_failed(
             return Ok(false);
         }
         cancel_active_image_jobs_except_in_tx(conn, image_id, Some(&job.id))?;
-        mark_sqlite_job_terminal_failed_in_tx(conn, &job.id, Some(&job.worker_id), error, total_ms)
+        mark_sqlite_job_terminal_failed_in_tx(
+            conn,
+            &job.id,
+            Some((&job.worker_id, job.attempt)),
+            error,
+            total_ms,
+        )
     })
 }
 
@@ -2603,7 +2780,13 @@ pub fn record_sqlite_permanent_image_job_failure(
         }
         upsert_sqlite_file_issue(conn, issue)?;
         cancel_active_image_jobs_except_in_tx(conn, image_id, Some(&job.id))?;
-        mark_sqlite_job_terminal_failed_in_tx(conn, &job.id, Some(&job.worker_id), error, total_ms)
+        mark_sqlite_job_terminal_failed_in_tx(
+            conn,
+            &job.id,
+            Some((&job.worker_id, job.attempt)),
+            error,
+            total_ms,
+        )
     })
 }
 
@@ -2611,7 +2794,9 @@ fn claimed_job_is_running(conn: &Connection, claimed: &crate::ClaimedJob) -> Res
     let Some(job) = get_sqlite_job(conn, &claimed.id)? else {
         return Ok(false);
     };
-    Ok(job.state == "running" && job.worker_id.as_deref() == Some(&claimed.worker_id))
+    Ok(job.state == "running"
+        && job.worker_id.as_deref() == Some(&claimed.worker_id)
+        && job.attempt == claimed.attempt)
 }
 
 fn verify_sqlite_tables(conn: &Connection, expected: &[&str]) -> Result<(), String> {
@@ -3266,7 +3451,9 @@ fn collect_rows<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sqlite::{init_sqlite_db, list_sqlite_job_events, mark_sqlite_job_succeeded};
+    use crate::sqlite::{
+        enqueue_sqlite_job, init_sqlite_db, list_sqlite_job_events, mark_sqlite_job_succeeded,
+    };
 
     fn temp_db_path() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3713,6 +3900,160 @@ mod tests {
             5,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn image_job_enqueue_validates_issue_and_writes_job_atomically() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let root = "/photos";
+        upsert_fixture(&conn, "img-a", root, "a.jpg", 10, 20);
+        let issue = SqliteFileIssueUpsert {
+            image_id: Some("img-a".to_string()),
+            root_path: root.to_string(),
+            path: "a.jpg".to_string(),
+            severity: FileIssueSeverity::Error,
+            kind: FileIssueKind::DecodeError,
+            expected_format: Some(SupportedImageFormat::Jpeg),
+            detected_format: Some("jpeg".to_string()),
+            size: 20,
+            mtime_ns: 10,
+            detail: Some("broken".to_string()),
+        };
+        upsert_sqlite_file_issue(&conn, &issue).expect("issue");
+        let jobs_before = count_sqlite_jobs(&conn, None, None).expect("jobs before");
+
+        assert!(enqueue_sqlite_thumb_job(
+            &conn,
+            "img-a",
+            root,
+            "a.jpg",
+            ".imgindex/thumbs/img-a.jpg",
+            10,
+            20,
+            3,
+        )
+        .is_err());
+        assert!(
+            enqueue_sqlite_metadata_job(&conn, "img-a", root, "a.jpg", Some(10), 20, 3,).is_err()
+        );
+        assert_eq!(
+            count_sqlite_jobs(&conn, None, None).expect("jobs after"),
+            jobs_before
+        );
+    }
+
+    #[test]
+    fn image_job_validation_holds_writer_lock_against_concurrent_error_issue() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        upsert_fixture(&conn, "img-a", "/photos", "a.jpg", 10, 20);
+        let other = open_sqlite_runtime_db(&db_path).expect("second connection");
+        other
+            .busy_timeout(Duration::ZERO)
+            .expect("disable wait for deterministic lock check");
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .expect("begin image enqueue transaction");
+        ensure_sqlite_image_job_allowed(&conn, "img-a", "/photos", "a.jpg")
+            .expect("validate while write lock is held");
+        let concurrent_issue = upsert_sqlite_file_issue(
+            &other,
+            &SqliteFileIssueUpsert {
+                image_id: Some("img-a".to_string()),
+                root_path: "/photos".to_string(),
+                path: "a.jpg".to_string(),
+                severity: FileIssueSeverity::Error,
+                kind: FileIssueKind::DecodeError,
+                expected_format: Some(SupportedImageFormat::Jpeg),
+                detected_format: Some("jpeg".to_string()),
+                size: 20,
+                mtime_ns: 10,
+                detail: Some("concurrent failure".to_string()),
+            },
+        )
+        .expect_err("concurrent issue writer must be blocked");
+        assert!(
+            concurrent_issue.contains("locked") || concurrent_issue.contains("busy"),
+            "unexpected sqlite lock error: {concurrent_issue}"
+        );
+        conn.execute_batch("ROLLBACK")
+            .expect("rollback image enqueue transaction");
+    }
+
+    #[test]
+    fn stale_attempt_cannot_record_permanent_issue_or_cancel_new_attempt() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let root = "/photos";
+        upsert_fixture(&conn, "img-a", root, "a.jpg", 10, 20);
+        enqueue_sqlite_thumb_job(
+            &conn,
+            "img-a",
+            root,
+            "a.jpg",
+            ".imgindex/thumbs/img-a.jpg",
+            10,
+            20,
+            3,
+        )
+        .expect("enqueue thumb");
+        let attempt_one = claim_next_sqlite_thumb_job(&conn, "same-worker")
+            .expect("claim one")
+            .expect("attempt one");
+        conn.execute(
+            "UPDATE jobs SET started_at = '2000-01-01T00:00:00.000Z', updated_at = '2000-01-01T00:00:00.000Z' WHERE id = ?1",
+            params![attempt_one.id],
+        )
+        .expect("age attempt one");
+        assert_eq!(
+            recover_sqlite_stale_running_jobs(&conn, 1, 10)
+                .expect("recover")
+                .requeued,
+            1
+        );
+        let attempt_two = claim_next_sqlite_thumb_job(&conn, "same-worker")
+            .expect("claim two")
+            .expect("attempt two");
+        let events_before = list_sqlite_job_events(&conn, &attempt_one.id)
+            .expect("events before")
+            .len();
+        let issue = SqliteFileIssueUpsert {
+            image_id: Some("img-a".to_string()),
+            root_path: root.to_string(),
+            path: "a.jpg".to_string(),
+            severity: FileIssueSeverity::Error,
+            kind: FileIssueKind::DecodeError,
+            expected_format: Some(SupportedImageFormat::Jpeg),
+            detected_format: Some("jpeg".to_string()),
+            size: 20,
+            mtime_ns: 10,
+            detail: Some("late error".to_string()),
+        };
+
+        assert!(!record_sqlite_permanent_image_job_failure(
+            &conn,
+            &attempt_one,
+            "img-a",
+            &issue,
+            "late error",
+            Some(9),
+        )
+        .expect("late permanent failure"));
+        assert!(get_sqlite_file_issue(&conn, root, "a.jpg")
+            .expect("issue lookup")
+            .is_none());
+        let current = get_sqlite_job(&conn, &attempt_two.id)
+            .expect("job")
+            .expect("job row");
+        assert_eq!(current.state, "running");
+        assert_eq!(current.attempt, 2);
+        assert_eq!(current.worker_id.as_deref(), Some("same-worker"));
+        assert_eq!(
+            list_sqlite_job_events(&conn, &attempt_one.id)
+                .expect("events after")
+                .len(),
+            events_before
+        );
     }
 
     #[test]
