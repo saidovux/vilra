@@ -278,6 +278,20 @@ fn execute_thumb_job_with_decoder<F>(
 where
     F: FnOnce(&Path) -> Result<DecodedImage, ImageInspectionError>,
 {
+    execute_thumb_job_with_decoder_and_publisher(conn, job, max_backoff_sec, decoder, publish_thumb)
+}
+
+fn execute_thumb_job_with_decoder_and_publisher<F, P>(
+    conn: &rusqlite::Connection,
+    job: &ClaimedJob,
+    max_backoff_sec: i64,
+    decoder: F,
+    publisher: P,
+) -> Result<ThumbExecution, String>
+where
+    F: FnOnce(&Path) -> Result<DecodedImage, ImageInspectionError>,
+    P: FnOnce(&Path, &Path) -> Result<(), String>,
+{
     let started = Instant::now();
     let (payload, source, target, max_size) = match process_payload(job.payload.clone()) {
         Ok(value) => value,
@@ -391,6 +405,8 @@ where
         }
     };
 
+    let decoded_width = decoded.image.width().min(i32::MAX as u32) as i32;
+    let decoded_height = decoded.image.height().min(i32::MAX as u32) as i32;
     let recovery = existing_issue.as_ref().and_then(|issue| {
         (issue.severity == FileIssueSeverity::Error
             && (issue.size != decoded.fingerprint.size
@@ -402,6 +418,8 @@ where
                 expected_format: decoded.expected_format,
                 detected_format: decoded.detected_format,
                 fingerprint: decoded.fingerprint,
+                width: decoded_width,
+                height: decoded_height,
             })
     });
     let source_mtime = payload.mtime.unwrap_or(decoded.fingerprint.mtime);
@@ -454,13 +472,33 @@ where
         "skipped_existing": metrics.skipped_existing,
         "ext": &metrics.ext,
     });
-    let applied =
+    let mut publish_failure = None;
+    let finalize_result =
         finalize_sqlite_thumb_success(conn, job, Some(event_data), recovery.as_ref(), || {
             if let Some(temp_target) = &temp_target {
-                publish_thumb(temp_target, &target)?;
+                if let Err(error) = publisher(temp_target, &target) {
+                    publish_failure = Some(error.clone());
+                    return Err(error);
+                }
             }
             Ok(())
-        })?;
+        });
+    let applied = match finalize_result {
+        Ok(applied) => applied,
+        Err(error) => {
+            let Some(publish_error) = publish_failure else {
+                return Err(error);
+            };
+            if let Some(temp_target) = &temp_target {
+                let _ = fs::remove_file(temp_target);
+            }
+            let total_ms = started.elapsed().as_millis();
+            let error = format!("publish thumbnail: {publish_error}");
+            let applied =
+                mark_sqlite_thumb_failed(conn, job, &error, max_backoff_sec, Some(total_ms))?;
+            return Ok(failed_or_discarded(applied, error, total_ms));
+        }
+    };
     if !applied {
         if let Some(temp_target) = &temp_target {
             let _ = fs::remove_file(temp_target);
@@ -687,7 +725,11 @@ mod tests {
     };
 
     fn encoded(format: ImageFormat) -> Vec<u8> {
-        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(8, 6, Rgb([20, 40, 60])));
+        encoded_with_dimensions(format, 8, 6)
+    }
+
+    fn encoded_with_dimensions(format: ImageFormat, width: u32, height: u32) -> Vec<u8> {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(width, height, Rgb([20, 40, 60])));
         let mut bytes = Cursor::new(Vec::new());
         image.write_to(&mut bytes, format).unwrap();
         bytes.into_inner()
@@ -764,6 +806,7 @@ mod tests {
         root: &Path,
         conn: &rusqlite::Connection,
         replacement_format: ImageFormat,
+        replacement_dimensions: (u32, u32),
     ) -> (ClaimedJob, PathBuf, Vec<u8>) {
         let image_id = "image-recovery";
         let path = "recover.jpg";
@@ -806,7 +849,11 @@ mod tests {
             },
         )
         .unwrap();
-        let replacement = encoded(replacement_format);
+        let replacement = encoded_with_dimensions(
+            replacement_format,
+            replacement_dimensions.0,
+            replacement_dimensions.1,
+        );
         fs::write(&source, &replacement).unwrap();
         let target = root.join(&thumb);
         fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -996,7 +1043,7 @@ mod tests {
     fn successful_matching_decode_recovers_stale_error_and_forces_fresh_thumbnail() {
         let dir = tempfile::tempdir().unwrap();
         let conn = init_sqlite_db(&dir.path().join("db.sqlite")).unwrap();
-        let (job, target, _) = setup_recovery_job(dir.path(), &conn, ImageFormat::Jpeg);
+        let (job, target, _) = setup_recovery_job(dir.path(), &conn, ImageFormat::Jpeg, (20, 5));
 
         assert!(matches!(
             execute_thumb_job(&conn, &job, 120).unwrap(),
@@ -1007,13 +1054,12 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(
-            get_sqlite_image_by_id(&conn, "image-recovery")
-                .unwrap()
-                .unwrap()
-                .id,
-            "image-recovery"
-        );
+        let recovered = get_sqlite_image_by_id(&conn, "image-recovery")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.id, "image-recovery");
+        assert!(!recovered.hidden);
+        assert_eq!((recovered.width, recovered.height), (20, 5));
         assert_eq!(
             list_sqlite_tags_for_image(&conn, "image-recovery").unwrap(),
             (vec!["Folder".to_string()], vec!["Favorite".to_string()])
@@ -1029,7 +1075,7 @@ mod tests {
     fn successful_mismatched_decode_replaces_stale_error_with_warning() {
         let dir = tempfile::tempdir().unwrap();
         let conn = init_sqlite_db(&dir.path().join("db.sqlite")).unwrap();
-        let (job, target, _) = setup_recovery_job(dir.path(), &conn, ImageFormat::Png);
+        let (job, target, _) = setup_recovery_job(dir.path(), &conn, ImageFormat::Png, (8, 6));
 
         assert!(matches!(
             execute_thumb_job(&conn, &job, 120).unwrap(),
@@ -1091,6 +1137,45 @@ mod tests {
     }
 
     #[test]
+    fn thumbnail_publish_failure_is_retryable_and_does_not_create_file_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = init_sqlite_db(&dir.path().join("db.sqlite")).unwrap();
+        let (job, target) = setup_claimed_thumb(
+            dir.path(),
+            &conn,
+            "image-1",
+            "publish-failure.jpg",
+            &encoded(ImageFormat::Jpeg),
+        );
+        let temp_target = thumb_attempt_temp_path(&target, &job);
+
+        let outcome = execute_thumb_job_with_decoder_and_publisher(
+            &conn,
+            &job,
+            120,
+            decode_supported_image,
+            |temp, _| {
+                assert!(temp.exists());
+                Err("injected publish failure".to_string())
+            },
+        )
+        .expect("publish failure must not escape worker execution");
+
+        assert!(matches!(outcome, ThumbExecution::Failed { .. }));
+        assert_eq!(
+            get_sqlite_job(&conn, &job.id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert!(!temp_target.exists());
+        assert!(!target.exists());
+        assert!(
+            get_sqlite_file_issue(&conn, &dir.path().to_string_lossy(), "publish-failure.jpg")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn canceled_attempt_is_discarded_without_publishing_thumbnail_or_success_event() {
         let dir = tempfile::tempdir().unwrap();
         let conn = init_sqlite_db(&dir.path().join("db.sqlite")).unwrap();
@@ -1101,12 +1186,21 @@ mod tests {
             "canceled.jpg",
             &encoded(ImageFormat::Jpeg),
         );
+        let temp_target = thumb_attempt_temp_path(&target, &job);
         assert!(cancel_sqlite_job(&conn, &job.id).unwrap());
 
         assert!(matches!(
-            execute_thumb_job(&conn, &job, 120).unwrap(),
+            execute_thumb_job_with_decoder_and_publisher(
+                &conn,
+                &job,
+                120,
+                decode_supported_image,
+                |_, _| Err("injected stale publish failure".to_string()),
+            )
+            .unwrap(),
             ThumbExecution::Discarded { .. }
         ));
+        assert!(!temp_target.exists());
         assert!(!target.exists());
         assert_eq!(
             get_sqlite_job(&conn, &job.id).unwrap().unwrap().state,
@@ -1116,6 +1210,11 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event.event == "succeeded"));
+        assert!(
+            get_sqlite_file_issue(&conn, &dir.path().to_string_lossy(), "canceled.jpg")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

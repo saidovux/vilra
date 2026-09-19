@@ -128,6 +128,8 @@ pub struct SqliteDecodedImageRecovery {
     pub expected_format: SupportedImageFormat,
     pub detected_format: SupportedImageFormat,
     pub fingerprint: FileFingerprint,
+    pub width: i32,
+    pub height: i32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2686,13 +2688,17 @@ fn recover_sqlite_file_issue_after_decode_in_tx(
         SET hidden = 0,
             size = max(0, ?2),
             mtime = ?3,
+            width = max(0, ?4),
+            height = max(0, ?5),
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-        WHERE id = ?1 AND root_path = ?4 AND path = ?5
+        WHERE id = ?1 AND root_path = ?6 AND path = ?7
         "#,
         params![
             recovery.image_id,
             recovery.fingerprint.size,
             recovery.fingerprint.mtime,
+            recovery.width,
+            recovery.height,
             recovery.root_path,
             recovery.path,
         ],
