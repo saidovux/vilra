@@ -20,6 +20,24 @@ type TagItem = {
   sources: Array<'auto' | 'user'>;
 };
 
+type ProblemApiItem = {
+  id: number;
+  image_id: string | null;
+  root_path: string;
+  path: string;
+  absolute_path: string;
+  file_name: string;
+  severity: 'error' | 'warning';
+  kind: string;
+  expected_format: string | null;
+  detected_format: string | null;
+  size: number;
+  mtime_ns: number;
+  technical_detail: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 const fatalMessages = [
   /Uncaught/i,
   /Unhandled/i,
@@ -31,6 +49,35 @@ function fixtureRoot(): string {
     fs.readFileSync(path.resolve(__dirname, '..', '.run', 'e2e-state.json'), 'utf8'),
   ) as {fixtureDir: string};
   return state.fixtureDir;
+}
+
+function problemFixture(id: number, severity: 'error' | 'warning' = 'error', name = `problem-${id}.jpg`): ProblemApiItem {
+  return {
+    id,
+    image_id: `problem-image-${id}`,
+    root_path: fixtureRoot(),
+    path: name,
+    absolute_path: path.join(fixtureRoot(), name),
+    file_name: name,
+    severity,
+    kind: severity === 'warning' ? 'format_mismatch' : 'decode_error',
+    expected_format: 'jpeg',
+    detected_format: severity === 'warning' ? 'png' : null,
+    size: 100,
+    mtime_ns: 1,
+    technical_detail: 'fixture',
+    created_at: '2026-01-01T00:00:00.000Z',
+    updated_at: '2026-01-01T00:00:00.000Z',
+  };
+}
+
+async function openProblems(page: Page): Promise<void> {
+  const sidebar = page.locator('#folder-sidebar');
+  if (await sidebar.evaluate(element => element.classList.contains('collapsed'))) {
+    await page.locator('#folder-sidebar-toggle').click();
+  }
+  await page.locator('#problems-nav').click();
+  await expect(page.locator('#problems-wrap')).toBeVisible();
 }
 
 async function visibleCards(page: Page) {
@@ -406,13 +453,15 @@ test('Problems view lists live file issues and rechecks one stored path', async 
 
 test('terminal thumbnail 422 removes the card and does not retry', async ({ page }) => {
   let terminalSeen = false;
+  let repaired = false;
   let terminalRequests = 0;
   let targetId = '';
+  const thumbnail = fs.readFileSync(path.join(fixtureRoot(), 'batch-a', 'fixture-001.png'));
 
   await page.route('**/api/images?**', async route => {
     const response = await route.fetch();
     const data = await response.json();
-    if (terminalSeen && Array.isArray(data.items)) {
+    if (terminalSeen && !repaired && Array.isArray(data.items)) {
       data.items = data.items.filter((item: ImageItem) => item.id !== targetId);
       if (data.page && typeof data.page.total === 'number') data.page.total -= 1;
     }
@@ -424,8 +473,11 @@ test('terminal thumbnail 422 removes the card and does not retry', async ({ page
   targetId = String(await firstCard.getAttribute('data-id'));
   expect(targetId).toBeTruthy();
   await page.route(`**/thumb/${targetId}*`, async route => {
-    terminalSeen = true;
     terminalRequests += 1;
+    if (repaired) {
+      return route.fulfill({status: 200, contentType: 'image/png', body: thumbnail});
+    }
+    terminalSeen = true;
     await route.fulfill({
       status: 422,
       contentType: 'application/json',
@@ -438,4 +490,236 @@ test('terminal thumbnail 422 removes the card and does not retry', async ({ page
   await expect(card).toHaveCount(0, {timeout: 15_000});
   await page.waitForTimeout(700);
   expect(terminalRequests).toBe(1);
+
+  repaired = true;
+  const refreshed = page.waitForResponse(response => response.url().includes('/api/images?'));
+  await page.locator('#sort-select').dispatchEvent('change');
+  await refreshed;
+  const repairedCard = page.locator(`.card[data-id="${targetId}"]`);
+  await expect(repairedCard).toBeVisible();
+  await repairedCard.locator('img').evaluate(image => image.dispatchEvent(new Event('error')));
+  await expect.poll(() => terminalRequests).toBeGreaterThan(1);
+  await expect(repairedCard.locator('img')).toHaveClass(/loaded/);
+});
+
+test('Problems summary and list failures are independent', async ({ page }) => {
+  const issue = problemFixture(101);
+  let summaryFails = true;
+  let listFails = false;
+  await page.route('**/api/problems/summary', route => {
+    if (summaryFails) return route.fulfill({status: 500, json: {detail: 'summary unavailable'}});
+    return route.fulfill({json: {total: 2, errors: 2, warnings: 0, latest_updated_at: 'changed'}});
+  });
+  await page.route('**/api/problems?**', route => {
+    if (listFails) return route.fulfill({status: 500, json: {detail: 'list unavailable'}});
+    return route.fulfill({json: {items: [issue], page: {total: 1, limit: 100, offset: 0, has_more: false}}});
+  });
+
+  await waitForGallery(page);
+  await openProblems(page);
+  await expect(page.locator('.problem-row').filter({hasText: issue.file_name})).toBeVisible();
+
+  summaryFails = false;
+  listFails = true;
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await expect(page.locator('#problems-badge')).toHaveText('2');
+  await expect(page.locator('#problems-feedback')).toContainText('list unavailable');
+});
+
+test('changed safety-poll summary refreshes an open Problems list', async ({ page }) => {
+  const first = problemFixture(111);
+  const second = problemFixture(112, 'warning');
+  let changed = false;
+  let listRequests = 0;
+  await page.route('**/api/problems/summary', route => route.fulfill({json: {
+    total: changed ? 2 : 1,
+    errors: 1,
+    warnings: changed ? 1 : 0,
+    latest_updated_at: changed ? 'version-b' : 'version-a',
+  }}));
+  await page.route('**/api/problems?**', route => {
+    listRequests += 1;
+    const items = changed ? [first, second] : [first];
+    return route.fulfill({json: {items, page: {total: items.length, limit: 100, offset: 0, has_more: false}}});
+  });
+
+  await waitForGallery(page);
+  await openProblems(page);
+  await expect(page.locator('.problem-row')).toHaveCount(1);
+  const requestsBeforeChange = listRequests;
+  changed = true;
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await expect(page.locator('.problem-row')).toHaveCount(2);
+  expect(listRequests).toBeGreaterThan(requestsBeforeChange);
+});
+
+test('Problems refresh does not restore a preview closed by view navigation', async ({ page }) => {
+  await waitForGallery(page);
+  await clickCardAndExpectPreview(page, 0);
+  await page.evaluate(() => (document.querySelector('#problems-nav') as HTMLElement).click());
+  await expect(page.locator('#problems-wrap')).toBeVisible();
+  await expect(page.locator('#preview-modal')).not.toBeVisible();
+
+  const refreshed = page.waitForResponse(response => response.url().includes('/api/images?'));
+  await page.locator('#sort-select').selectOption('path_asc', {force: true});
+  await refreshed;
+  await expect(page.locator('#preview-modal')).not.toBeVisible();
+
+  await page.evaluate(() => (document.querySelector('#gallery-nav') as HTMLElement).click());
+  await expect(page.locator('#gallery-wrap')).toBeVisible();
+  await expect(page.locator('#sort-select')).toHaveValue('path_asc');
+  await expect(page.locator('#preview-modal')).not.toBeVisible();
+});
+
+test('format mismatch is a warning, stays in gallery, and does not increment error badge', async ({ page }) => {
+  await waitForGallery(page);
+  const root = fixtureRoot();
+  const mismatch = path.join(root, 'warning-content.jpg');
+  const source = path.join(root, 'batch-a', 'fixture-001.png');
+  fs.rmSync(mismatch, {force: true});
+  const before = await (await page.request.get('/api/problems/summary')).json();
+  try {
+    fs.copyFileSync(source, mismatch);
+    await expect(page.locator('.card[data-id]').filter({hasText: 'warning-content.jpg'})).toBeVisible({timeout: 15_000});
+    await expect.poll(async () => {
+      const summary = await (await page.request.get('/api/problems/summary')).json();
+      return Number(summary.warnings || 0);
+    }, {timeout: 15_000}).toBeGreaterThan(Number(before.warnings || 0));
+    await page.route('**/api/problems/summary', route => route.fulfill({json: {
+      total: 3, errors: 2, warnings: 1, latest_updated_at: 'warning-semantics',
+    }}));
+
+    await openProblems(page);
+    const row = page.locator('.problem-row').filter({hasText: 'warning-content.jpg'});
+    await expect(row).toBeVisible();
+    await expect(row.locator('.problem-severity')).toContainText('Внимание');
+    await expect(page.locator('#problems-badge')).toHaveText('2');
+    await page.locator('#gallery-nav').click();
+    await expect(page.locator('.card[data-id]').filter({hasText: 'warning-content.jpg'})).toBeVisible();
+  } finally {
+    fs.rmSync(mismatch, {force: true});
+  }
+});
+
+test('pending thumbnail 202 retries until a thumbnail is available', async ({ page }) => {
+  await waitForGallery(page);
+  const card = page.locator('.card[data-id]').first();
+  const imageId = String(await card.getAttribute('data-id'));
+  const thumbnail = fs.readFileSync(path.join(fixtureRoot(), 'batch-a', 'fixture-001.png'));
+  let requests = 0;
+  await page.route(`**/thumb/${imageId}*`, route => {
+    requests += 1;
+    if (requests <= 2) {
+      return route.fulfill({status: 202, json: {retry_after_ms: 10}});
+    }
+    return route.fulfill({status: 200, contentType: 'image/png', body: thumbnail});
+  });
+
+  const image = card.locator('img');
+  await image.evaluate(element => element.dispatchEvent(new Event('error')));
+  await expect.poll(() => requests).toBeGreaterThanOrEqual(3);
+  await expect(image).toHaveClass(/loaded/);
+});
+
+test('/file 422 closes preview flow without a generic alert and removes the image', async ({ page }) => {
+  await waitForGallery(page);
+  const card = page.locator('.card[data-id]').first();
+  const imageId = String(await card.getAttribute('data-id'));
+  let dialogSeen = false;
+  page.on('dialog', dialog => {
+    dialogSeen = true;
+    void dialog.dismiss();
+  });
+  await page.route(`**/file/${imageId}`, route => route.fulfill({
+    status: 422,
+    contentType: 'application/json',
+    body: JSON.stringify({error: 'image_unavailable'}),
+  }));
+  await page.route('**/api/images?**', route => route.fulfill({json: {
+    items: [],
+    page: {total: 0, next_cursor: null, has_more: false},
+  }}));
+
+  await card.click();
+  await expect(page.locator(`.card[data-id="${imageId}"]`)).toHaveCount(0);
+  await expect(page.locator('#preview-modal')).not.toBeVisible();
+  expect(dialogSeen).toBe(false);
+});
+
+test('single recheck applies warning response before canonical refresh', async ({ page }) => {
+  let issue = problemFixture(121);
+  let failCanonicalRefresh = false;
+  await page.route('**/api/problems/summary', route => route.fulfill({json: {
+    total: 1,
+    errors: issue.severity === 'error' ? 1 : 0,
+    warnings: issue.severity === 'warning' ? 1 : 0,
+    latest_updated_at: issue.updated_at,
+  }}));
+  await page.route('**/api/problems?**', async route => {
+    if (failCanonicalRefresh) {
+      await route.fulfill({status: 500, json: {error: 'canonical refresh unavailable'}});
+      return;
+    }
+    const severity = new URL(route.request().url()).searchParams.get('severity');
+    const items = severity === 'all' || severity === issue.severity ? [issue] : [];
+    await route.fulfill({json: {items, page: {total: items.length, limit: 100, offset: 0, has_more: false}}});
+  });
+  await page.route('**/api/problems/121/recheck', route => {
+    issue = {...issue, severity: 'warning', kind: 'format_mismatch', detected_format: 'png', updated_at: 'updated'};
+    failCanonicalRefresh = true;
+    return route.fulfill({json: {ok: true, status: 'warning', issue}});
+  });
+
+  await waitForGallery(page);
+  await openProblems(page);
+  const row = page.locator('.problem-row').filter({hasText: issue.file_name});
+  await expect(row).toBeVisible();
+  await row.locator('[data-action="recheck-problem"]').click();
+  await expect(row.locator('.problem-severity')).toContainText('Внимание');
+  await expect(page.locator('#problems-feedback')).toContainText('canonical refresh unavailable');
+  failCanonicalRefresh = false;
+  await page.locator('[data-action="set-problems-filter"][data-severity="warning"]').click({force: true});
+  await expect(page.locator('.problem-row').filter({hasText: issue.file_name})).toBeVisible();
+});
+
+test('recheck-all keeps rows, completes by SSE, and recovers from 409', async ({ page }) => {
+  const issue = problemFixture(131);
+  let postStatus = 202;
+  let releaseSse: (() => void) | null = null;
+  const sseGate = new Promise<void>(resolve => { releaseSse = resolve; });
+  await page.route('**/api/events*', async route => {
+    await sseGate;
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: 'id: 9001\ndata: {"sequence":9001,"type":"problems_recheck_finished","data":{"requested":1,"processed":1,"failed":0}}\n\n',
+    });
+  });
+  await page.route('**/api/problems/summary', route => route.fulfill({json: {
+    total: 1, errors: 1, warnings: 0, latest_updated_at: 'same',
+  }}));
+  await page.route('**/api/problems?**', route => route.fulfill({json: {
+    items: [issue], page: {total: 1, limit: 100, offset: 0, has_more: false},
+  }}));
+  await page.route('**/api/problems/recheck-all', route => route.fulfill({
+    status: postStatus,
+    json: postStatus === 202 ? {ok: true, scheduled: 1} : {error: 'problems_recheck_already_running'},
+  }));
+
+  await waitForGallery(page);
+  await openProblems(page);
+  const row = page.locator('.problem-row').filter({hasText: issue.file_name});
+  const button = page.locator('#problems-recheck-all');
+  await expect(row).toBeVisible();
+  await button.click();
+  await expect(button).toBeDisabled();
+  await expect(row).toBeVisible();
+  releaseSse?.();
+  await expect(button).toBeEnabled();
+  await expect(row).toBeVisible();
+
+  postStatus = 409;
+  await button.click();
+  await expect(button).toBeEnabled();
+  await expect(page.locator('#problems-feedback')).toContainText('Проверка уже выполняется');
 });

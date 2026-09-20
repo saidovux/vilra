@@ -17,6 +17,7 @@ use tagimage_core::{
     expected_format_for_path, FileFingerprint, FileIssueKind, FileIssueSeverity,
     SupportedImageFormat,
 };
+use unicase::UniCase;
 use uuid::Uuid;
 
 const DEFAULT_PAGE_LIMIT: i64 = 120;
@@ -411,49 +412,90 @@ pub fn query_sqlite_file_issues(
     limit: i64,
     offset: i64,
 ) -> Result<SqliteFileIssuePage, String> {
-    let total = conn
-        .query_row(
-            r#"
-            SELECT count(*)
-            FROM file_issues
-            WHERE (?1 = 'all' OR severity = ?1)
-              AND (?2 = '' OR instr(lower(path), lower(?2)) > 0)
-            "#,
-            params![severity, search],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("count sqlite file issues: {e}"))?;
-    let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT *
-            FROM file_issues
-            WHERE (?1 = 'all' OR severity = ?1)
-              AND (?2 = '' OR instr(lower(path), lower(?2)) > 0)
-            ORDER BY CASE severity WHEN 'error' THEN 0 ELSE 1 END,
-                     lower(path), path, id
-            LIMIT ?3 OFFSET ?4
-            "#,
-        )
-        .map_err(|e| format!("prepare sqlite file issue page: {e}"))?;
-    let rows = stmt
-        .query_map(
-            params![severity, search, limit, offset],
-            raw_sqlite_file_issue_from_row,
-        )
-        .map_err(|e| format!("query sqlite file issue page: {e}"))?;
-    let mut items = Vec::new();
-    for row in rows {
-        items.push(SqliteFileIssue::try_from(
-            row.map_err(|e| format!("read sqlite file issue page: {e}"))?,
-        )?);
+    if search.is_empty() {
+        let total = conn
+            .query_row(
+                "SELECT count(*) FROM file_issues WHERE (?1 = 'all' OR severity = ?1)",
+                params![severity],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("count sqlite file issues: {e}"))?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT *
+                FROM file_issues
+                WHERE (?1 = 'all' OR severity = ?1)
+                ORDER BY CASE severity WHEN 'error' THEN 0 ELSE 1 END,
+                         lower(path), path, id
+                LIMIT ?2 OFFSET ?3
+                "#,
+            )
+            .map_err(|e| format!("prepare sqlite file issue page: {e}"))?;
+        let rows = stmt
+            .query_map(
+                params![severity, limit, offset],
+                raw_sqlite_file_issue_from_row,
+            )
+            .map_err(|e| format!("query sqlite file issue page: {e}"))?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(SqliteFileIssue::try_from(
+                row.map_err(|e| format!("read sqlite file issue page: {e}"))?,
+            )?);
+        }
+        return Ok(SqliteFileIssuePage {
+            items,
+            total,
+            limit,
+            offset,
+        });
     }
+
+    let mut stmt = conn
+        .prepare("SELECT * FROM file_issues WHERE (?1 = 'all' OR severity = ?1)")
+        .map_err(|e| format!("prepare sqlite Unicode file issue search: {e}"))?;
+    let rows = stmt
+        .query_map(params![severity], raw_sqlite_file_issue_from_row)
+        .map_err(|e| format!("query sqlite Unicode file issue search: {e}"))?;
+    let search_key = unicode_search_key(search);
+    let mut matches = Vec::new();
+    for row in rows {
+        let issue = SqliteFileIssue::try_from(
+            row.map_err(|e| format!("read sqlite Unicode file issue search: {e}"))?,
+        )?;
+        if unicode_search_key(&issue.path).contains(&search_key) {
+            matches.push(issue);
+        }
+    }
+    matches.sort_by(|left, right| {
+        file_issue_severity_rank(left.severity)
+            .cmp(&file_issue_severity_rank(right.severity))
+            .then_with(|| unicode_search_key(&left.path).cmp(&unicode_search_key(&right.path)))
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let total = matches.len() as i64;
+    let start = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
+    let take = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+    let items = matches.into_iter().skip(start).take(take).collect();
     Ok(SqliteFileIssuePage {
         items,
         total,
         limit,
         offset,
     })
+}
+
+fn unicode_search_key(value: &str) -> String {
+    UniCase::new(value).to_folded_case()
+}
+
+fn file_issue_severity_rank(severity: FileIssueSeverity) -> u8 {
+    match severity {
+        FileIssueSeverity::Error => 0,
+        FileIssueSeverity::Warning => 1,
+    }
 }
 
 pub fn list_sqlite_file_issue_recheck_targets(
@@ -4783,5 +4825,54 @@ mod tests {
 
         let targets = list_sqlite_file_issue_recheck_targets(&conn).expect("targets");
         assert_eq!(targets.len(), 3);
+    }
+
+    #[test]
+    fn file_issue_search_uses_unicode_case_folding_before_pagination() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        for path in [
+            "Фото/Космос.jpg",
+            "Maße.jpg",
+            "folder/masse-two.jpg",
+            "unrelated-one.jpg",
+            "unrelated-two.jpg",
+        ] {
+            upsert_sqlite_file_issue(
+                &conn,
+                &SqliteFileIssueUpsert {
+                    image_id: None,
+                    root_path: "/photos".to_string(),
+                    path: path.to_string(),
+                    severity: FileIssueSeverity::Error,
+                    kind: FileIssueKind::DecodeError,
+                    expected_format: Some(SupportedImageFormat::Jpeg),
+                    detected_format: None,
+                    size: 10,
+                    mtime_ns: 20,
+                    detail: None,
+                },
+            )
+            .expect("insert issue");
+        }
+
+        for search in ["ФОТО", "фото", "КОСМОС", "космос"] {
+            let page =
+                query_sqlite_file_issues(&conn, "all", search, 10, 0).expect("Cyrillic search");
+            assert_eq!(page.total, 1, "search={search}");
+            assert_eq!(page.items[0].path, "Фото/Космос.jpg");
+        }
+
+        let first =
+            query_sqlite_file_issues(&conn, "error", "MASSE", 1, 0).expect("first folded page");
+        assert_eq!(first.total, 2);
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].path, "folder/masse-two.jpg");
+
+        let second =
+            query_sqlite_file_issues(&conn, "error", "MASSE", 1, 1).expect("second folded page");
+        assert_eq!(second.total, 2);
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].path, "Maße.jpg");
     }
 }

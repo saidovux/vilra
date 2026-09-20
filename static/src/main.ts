@@ -614,6 +614,7 @@ let previewModal: PreviewModal | null = null;
 let lightboxImages: ImageItem[] = [];
 let previewRequestToken = 0;
 let suppressPreviewCloseClear = false;
+let suppressedPreviewRestoreId: string | null = null;
 let tagManagerSelection: Pick<GalleryTab, 'includeTags' | 'excludeTags'> = {includeTags: [], excludeTags: []};
 let latestStatus: StatusResponse | null = null;
 let filterSuggestionOpen = false;
@@ -633,12 +634,15 @@ let problemsItems: ProblemItem[] = [];
 let problemsTotal = 0;
 let problemsLoading = false;
 let problemsLoadError = '';
+let problemsNotice = '';
+let problemsNoticeIsError = false;
 let problemsRecheckAllRunning = false;
 let problemsRefreshRunning = false;
 let problemsRefreshQueued = false;
 let problemsListRefreshQueued = false;
 let problemsSearchTimer: ReturnType<typeof setTimeout> | null = null;
 let problemsRequestToken = 0;
+let problemsListReloadQueued = false;
 let problemsPollTimer: ReturnType<typeof setInterval> | null = null;
 const problemRowRechecks = new Set<number>();
 const terminalThumbIds = new Set<string>();
@@ -1043,6 +1047,10 @@ function handleLiveEvent(event: LiveEventEnvelope): void {
       break;
     case 'problems_recheck_finished':
       problemsRecheckAllRunning = false;
+      problemsNotice = Number(event.data.failed || 0) > 0
+        ? `Проверка завершена, ошибок выполнения: ${Number(event.data.failed || 0)}.`
+        : 'Проверка завершена.';
+      problemsNoticeIsError = Number(event.data.failed || 0) > 0;
       renderProblems();
       scheduleProblemsRefresh();
       break;
@@ -1172,11 +1180,25 @@ function setDbStatus(ok: boolean, text: string): void {
 
 function problemHumanMessage(problem: ProblemItem): string {
   switch (problem.kind) {
-    case 'decode_error': return 'Файл изображения не удалось декодировать.';
-    case 'format_mismatch': return `Расширение не соответствует содержимому${problem.detectedFormat ? ` (${problem.detectedFormat})` : ''}.`;
-    case 'unsupported_content': return 'Содержимое файла не относится к поддерживаемому формату изображения.';
-    case 'unreadable': return 'Файл недоступен для чтения.';
+    case 'decode_error': return 'Файл не удаётся прочитать. Возможно, он повреждён или обрезан.';
+    case 'format_mismatch':
+      if (problem.expectedFormat && problem.detectedFormat) {
+        return `Содержимое: ${formatDisplayName(problem.detectedFormat)} · расширение: ${formatDisplayName(problem.expectedFormat)}`;
+      }
+      return 'Расширение файла не соответствует его содержимому.';
+    case 'unsupported_content': return 'Содержимое файла имеет формат, который Vilra не поддерживает.';
+    case 'unreadable': return 'Vilra не может прочитать этот файл.';
     default: return 'Файл требует проверки.';
+  }
+}
+
+function formatDisplayName(format: string | null): string {
+  switch (String(format || '').toLowerCase()) {
+    case 'jpeg':
+    case 'jpg': return 'JPEG';
+    case 'png': return 'PNG';
+    case 'webp': return 'WebP';
+    default: return format || 'не определён';
   }
 }
 
@@ -1201,19 +1223,20 @@ function renderProblems(): void {
         <div class="problem-file">${escHtml(problem.fileName)}</div>
         <div class="problem-path">${escHtml(problem.path)}</div>
         <div class="problem-message">${escHtml(problemHumanMessage(problem))}</div>
-        <div class="problem-meta">${escHtml(fmtSize(problem.size))} · ${escHtml(problem.expectedFormat || 'неизвестно')} → ${escHtml(problem.detectedFormat || 'не определён')}</div>
+        <div class="problem-meta">${escHtml(fmtSize(problem.size))} · расширение: ${escHtml(formatDisplayName(problem.expectedFormat))} · содержимое: ${escHtml(formatDisplayName(problem.detectedFormat))}</div>
         ${problem.technicalDetail ? `<details class="problem-detail"><summary>Технические детали</summary>${escHtml(problem.technicalDetail)}</details>` : ''}
         <div class="problem-inline-error" data-problem-error="${problem.id}"></div>
       </div>
       <div class="problem-actions">
         <button class="btn btn-ghost btn-sm" type="button" data-action="reveal-problem" data-problem-id="${problem.id}">${isTauriRuntime() ? 'Показать в папке' : 'Копировать путь'}</button>
-        <button class="btn btn-primary btn-sm" type="button" data-action="recheck-problem" data-problem-id="${problem.id}" ${problemRowRechecks.has(problem.id) ? 'disabled' : ''}>${problemRowRechecks.has(problem.id) ? 'Проверка…' : 'Проверить'}</button>
+        <button class="btn btn-ghost btn-sm" type="button" data-action="recheck-problem" data-problem-id="${problem.id}" ${problemRowRechecks.has(problem.id) ? 'disabled' : ''}>${problemRowRechecks.has(problem.id) ? 'Проверка…' : 'Проверить'}</button>
       </div>
     </article>
   `).join('');
   const feedback = requiredHtml('problems-feedback');
-  feedback.classList.toggle('error', Boolean(problemsLoadError));
+  feedback.classList.toggle('error', Boolean(problemsLoadError || (problemsNotice && problemsNoticeIsError)));
   if (problemsLoadError) feedback.innerHTML = `${escHtml(problemsLoadError)} <button class="btn btn-ghost btn-sm" type="button" data-action="retry-problems">Повторить</button>`;
+  else if (problemsNotice) feedback.textContent = problemsNotice;
   else if (problemsLoading && !problemsItems.length) feedback.textContent = 'Загрузка…';
   else if (!problemsItems.length) feedback.textContent = 'Проблем не найдено.';
   else feedback.textContent = `Показано ${problemsItems.length} из ${problemsTotal}`;
@@ -1225,20 +1248,31 @@ function renderProblems(): void {
   all.textContent = problemsRecheckAllRunning ? 'Проверка…' : 'Проверить все';
 }
 
-async function refreshProblemsSummary(): Promise<void> {
+async function refreshProblemsSummary(): Promise<boolean> {
+  const previous = problemsSummary;
   const response = await fetch('/api/problems/summary');
   if (!response.ok) throw new Error(await readError(response));
   const data = await readJsonRecord(response);
-  problemsSummary = {
+  const next: ProblemSummary = {
     total: Number(data.total || 0),
     errors: Number(data.errors || 0),
     warnings: Number(data.warnings || 0),
     latestUpdatedAt: typeof data.latest_updated_at === 'string' ? data.latest_updated_at : null
   };
+  const changed = previous.total !== next.total
+    || previous.errors !== next.errors
+    || previous.warnings !== next.warnings
+    || previous.latestUpdatedAt !== next.latestUpdatedAt;
+  problemsSummary = next;
   renderProblemsSummary();
+  return changed;
 }
 
 async function loadProblems(reset = true): Promise<void> {
+  if (problemsLoading) {
+    problemsListReloadQueued ||= reset;
+    return;
+  }
   const token = ++problemsRequestToken;
   const offset = reset ? 0 : problemsItems.length;
   const search = requiredInput('problems-search').value.trim();
@@ -1269,6 +1303,10 @@ async function loadProblems(reset = true): Promise<void> {
     if (token === problemsRequestToken) {
       problemsLoading = false;
       renderProblems();
+      if (problemsListReloadQueued) {
+        problemsListReloadQueued = false;
+        void loadProblems(true);
+      }
     }
   }
 }
@@ -1286,11 +1324,14 @@ function scheduleProblemsRefresh(includeList = true): void {
       problemsRefreshQueued = false;
       const refreshList = problemsListRefreshQueued;
       problemsListRefreshQueued = false;
+      let summaryChanged = false;
       try {
-        await refreshProblemsSummary();
-        if (refreshList && activeView === 'problems') await loadProblems(true);
+        summaryChanged = await refreshProblemsSummary();
       } catch (error) {
-        console.warn('Problems refresh failed', error);
+        console.warn('Problems summary refresh failed', error);
+      }
+      if ((refreshList || summaryChanged) && activeView === 'problems') {
+        await loadProblems(true);
       }
     } while (problemsRefreshQueued);
     problemsRefreshRunning = false;
@@ -1301,6 +1342,7 @@ function showProblemsView(): void {
   if (activeView === 'problems') return;
   saveActiveScroll();
   showChrome();
+  suppressedPreviewRestoreId = activeTab().lastImageId;
   closePreview(false);
   closeGraph();
   toggleSettings(false);
@@ -1335,29 +1377,60 @@ async function recheckProblem(issueId: number): Promise<void> {
   try {
     const response = await fetch(`/api/problems/${issueId}/recheck`, {method: 'POST'});
     if (!response.ok) throw new Error(await readError(response));
+    const result = await readJsonRecord(response);
+    applyProblemRecheckResult(issueId, result);
     scheduleProblemsRefresh();
   } catch (error) {
-    const target = document.querySelector<HTMLElement>(`[data-problem-error="${issueId}"]`);
-    if (target) target.textContent = errorMessage(error);
+    problemsNotice = errorMessage(error);
+    problemsNoticeIsError = true;
   } finally {
     problemRowRechecks.delete(issueId);
     renderProblems();
   }
 }
 
+function applyProblemRecheckResult(issueId: number, result: JsonRecord): void {
+  const existingIndex = problemsItems.findIndex(problem => problem.id === issueId);
+  const issue = normalizeProblemItem(result.issue);
+  const status = String(result.status || '');
+  const keep = issue
+    && status !== 'resolved'
+    && (problemsSeverity === 'all' || issue.severity === problemsSeverity);
+  if (keep) {
+    if (existingIndex >= 0) problemsItems[existingIndex] = issue;
+    else problemsItems.push(issue);
+  } else if (existingIndex >= 0) {
+    problemsItems.splice(existingIndex, 1);
+    problemsTotal = Math.max(0, problemsTotal - 1);
+  }
+  problemsNotice = status === 'resolved'
+    ? 'Проблема устранена.'
+    : status === 'warning'
+      ? 'Файл доступен, предупреждение обновлено.'
+      : '';
+  problemsNoticeIsError = false;
+}
+
 async function recheckAllProblems(): Promise<void> {
   if (problemsRecheckAllRunning) return;
   problemsRecheckAllRunning = true;
+  problemsNotice = '';
+  problemsNoticeIsError = false;
   renderProblems();
   try {
     const response = await fetch('/api/problems/recheck-all', {method: 'POST'});
-    if (response.status === 409) return;
+    if (response.status === 409) {
+      problemsRecheckAllRunning = false;
+      problemsNotice = 'Проверка уже выполняется.';
+      problemsNoticeIsError = false;
+      renderProblems();
+      return;
+    }
     if (!response.ok) throw new Error(await readError(response));
   } catch (error) {
     problemsRecheckAllRunning = false;
-    const feedback = requiredHtml('problems-feedback');
-    feedback.classList.add('error');
-    feedback.textContent = errorMessage(error);
+    problemsNotice = errorMessage(error);
+    problemsNoticeIsError = true;
     renderProblems();
   }
 }
@@ -2826,6 +2899,7 @@ async function openLightbox(idx: number, persist = true, sourceList: ImageItem[]
     return;
   }
   lightboxImages = nextSource;
+  if (persist) suppressedPreviewRestoreId = null;
   togglePreviewTagDropdown(false);
   lbIndex = idx;
   const img = lightboxImages[lbIndex];
@@ -3052,8 +3126,10 @@ function preloadPreviewNeighbors(idx: number): void {
 }
 
 function restorePreviewIfNeeded(): void {
+  if (activeView !== 'gallery') return;
   const tab = activeTab();
   if (!tab.lastImageId) return;
+  if (tab.lastImageId === suppressedPreviewRestoreId) return;
   if (previewModal && !previewModal.isOpen) openLightboxById(tab.lastImageId, false);
 }
 

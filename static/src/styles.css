@@ -1520,17 +1520,18 @@ body.modal-open { overflow: hidden; }
 }
 .problems-badge {
   min-width: 22px;
-  height: 20px;
+  height: 18px;
   padding: 0 6px;
-  border-radius: 10px;
-  background: var(--danger);
-  color: #fff;
+  border: 1px solid rgba(216, 91, 85, .48);
+  border-radius: 9px;
+  background: rgba(216, 91, 85, .08);
+  color: #e9827c;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   font: 700 11px/1 var(--font-mono);
 }
-.problems-badge.muted { background: var(--panel-3); color: var(--faint); }
+.problems-badge.muted { border-color: var(--border); background: transparent; color: var(--faint); }
 
 #problems-wrap {
   display: none;
