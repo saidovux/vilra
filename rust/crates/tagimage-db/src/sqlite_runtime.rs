@@ -1381,6 +1381,7 @@ pub fn query_sqlite_images_page(
     let mut exclude_list = parse_csv_sqlite_tags(query.exclude_tags.as_deref());
     include_list.dedup();
     exclude_list.dedup();
+    let has_tag_filters = !include_list.is_empty() || !exclude_list.is_empty();
     let resolved_mode = if query.include_tags.is_some() {
         query.match_mode.as_deref().unwrap_or("any")
     } else {
@@ -1410,10 +1411,10 @@ pub fn query_sqlite_images_page(
         params.extend(cursor_values);
     }
 
-    let join_sql = if include_list.is_empty() && exclude_list.is_empty() {
-        ""
-    } else {
+    let join_sql = if has_tag_filters {
         "LEFT JOIN image_tags it ON it.image_id = i.id LEFT JOIN tags t ON t.id = it.tag_id"
+    } else {
+        ""
     };
     let mut having_clauses = Vec::new();
     let mut having_values = Vec::new();
@@ -1448,6 +1449,11 @@ pub fn query_sqlite_images_page(
     } else {
         format!("HAVING {}", having_clauses.join(" AND "))
     };
+    let group_sql = if has_tag_filters {
+        "GROUP BY i.id, i.path, i.thumb, i.size, i.mtime, i.width, i.height"
+    } else {
+        ""
+    };
     let order_sql = sort_order_sql(&sort_mode);
     params.push(SqlValue::Integer(limit + 1));
     let sql = format!(
@@ -1463,7 +1469,7 @@ pub fn query_sqlite_images_page(
             lower(i.path) AS lower_path
         FROM images i {join_sql}
         WHERE {where_sql}
-        GROUP BY i.id, i.path, i.thumb, i.size, i.mtime, i.width, i.height
+        {group_sql}
         {having_sql}
         ORDER BY {order_sql}
         LIMIT ?
@@ -1471,7 +1477,7 @@ pub fn query_sqlite_images_page(
     );
 
     let raw_rows = query_image_list_rows(conn, &sql, &params)?;
-    let total = if query.include_total {
+    let total = if query.include_total && has_tag_filters {
         let total_sql = format!(
             r#"
             WITH filtered AS (
@@ -1490,6 +1496,8 @@ pub fn query_sqlite_images_page(
             })
             .map_err(|e| format!("count sqlite image page total: {e}"))?,
         )
+    } else if query.include_total {
+        Some(count_sqlite_images(conn, roots, false)?)
     } else {
         None
     };
@@ -3856,6 +3864,380 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM image_tags", [], |row| row.get(0))
             .expect("tag count");
         assert_eq!(tag_count, 0);
+    }
+
+    #[test]
+    fn no_tag_cursor_chain_covers_every_sort_without_duplicates_or_omissions() {
+        #[derive(Clone)]
+        struct ExpectedImage {
+            id: &'static str,
+            root: &'static str,
+            path: &'static str,
+            mtime: i64,
+            size: i64,
+        }
+
+        fn path_cmp(left: &ExpectedImage, right: &ExpectedImage) -> std::cmp::Ordering {
+            left.path
+                .to_lowercase()
+                .cmp(&right.path.to_lowercase())
+                .then_with(|| left.path.cmp(right.path))
+                .then_with(|| left.id.cmp(right.id))
+        }
+
+        fn sorted_ids(images: &[ExpectedImage], sort_mode: &str) -> Vec<String> {
+            let mut expected = images.to_vec();
+            expected.sort_by(|left, right| match sort_mode {
+                "path_desc" => path_cmp(right, left),
+                "date_desc" => right
+                    .mtime
+                    .cmp(&left.mtime)
+                    .then_with(|| path_cmp(left, right)),
+                "date_asc" => left
+                    .mtime
+                    .cmp(&right.mtime)
+                    .then_with(|| path_cmp(left, right)),
+                "size_desc" => right
+                    .size
+                    .cmp(&left.size)
+                    .then_with(|| path_cmp(left, right)),
+                "size_asc" => left
+                    .size
+                    .cmp(&right.size)
+                    .then_with(|| path_cmp(left, right)),
+                _ => path_cmp(left, right),
+            });
+            expected
+                .into_iter()
+                .map(|image| image.id.to_string())
+                .collect()
+        }
+
+        fn item_ids(page: &JsonValue) -> Vec<String> {
+            page["items"]
+                .as_array()
+                .expect("page items")
+                .iter()
+                .map(|item| item["id"].as_str().expect("image id").to_string())
+                .collect()
+        }
+
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let root_a = "/photos-a";
+        let root_b = "/photos-b";
+        let active = vec![
+            ExpectedImage {
+                id: "a-01",
+                root: root_a,
+                path: "Album/Apple.jpg",
+                mtime: 100,
+                size: 500,
+            },
+            ExpectedImage {
+                id: "a-02",
+                root: root_a,
+                path: "album/apple.jpg",
+                mtime: 100,
+                size: 500,
+            },
+            ExpectedImage {
+                id: "a-03",
+                root: root_a,
+                path: "same/tie.jpg",
+                mtime: 200,
+                size: 300,
+            },
+            ExpectedImage {
+                id: "b-03",
+                root: root_b,
+                path: "same/tie.jpg",
+                mtime: 200,
+                size: 300,
+            },
+            ExpectedImage {
+                id: "a-04",
+                root: root_a,
+                path: "Mixed/Zebra.jpg",
+                mtime: 300,
+                size: 100,
+            },
+            ExpectedImage {
+                id: "b-04",
+                root: root_b,
+                path: "mixed/zebra.jpg",
+                mtime: 300,
+                size: 100,
+            },
+            ExpectedImage {
+                id: "a-05",
+                root: root_a,
+                path: "one/5.jpg",
+                mtime: 400,
+                size: 700,
+            },
+            ExpectedImage {
+                id: "b-05",
+                root: root_b,
+                path: "two/5.jpg",
+                mtime: 400,
+                size: 700,
+            },
+            ExpectedImage {
+                id: "a-06",
+                root: root_a,
+                path: "one/6.jpg",
+                mtime: 500,
+                size: 900,
+            },
+            ExpectedImage {
+                id: "b-06",
+                root: root_b,
+                path: "two/6.jpg",
+                mtime: 500,
+                size: 900,
+            },
+            ExpectedImage {
+                id: "warning",
+                root: root_b,
+                path: "warnings/visible.jpg",
+                mtime: 600,
+                size: 50,
+            },
+        ];
+        for image in &active {
+            upsert_fixture(
+                &conn,
+                image.id,
+                image.root,
+                image.path,
+                image.mtime,
+                image.size,
+            );
+        }
+        upsert_fixture(&conn, "hidden", root_a, "hidden/image.jpg", 1_000, 1_000);
+        conn.execute("UPDATE images SET hidden = 1 WHERE id = 'hidden'", [])
+            .expect("hide fixture");
+        upsert_fixture(&conn, "error", root_b, "errors/excluded.jpg", 1_100, 1_100);
+
+        upsert_sqlite_file_issue(
+            &conn,
+            &SqliteFileIssueUpsert {
+                image_id: Some("error".to_string()),
+                root_path: root_b.to_string(),
+                path: "errors/excluded.jpg".to_string(),
+                severity: FileIssueSeverity::Error,
+                kind: FileIssueKind::DecodeError,
+                expected_format: Some(SupportedImageFormat::Jpeg),
+                detected_format: None,
+                size: 1_100,
+                mtime_ns: 1_100,
+                detail: Some("excluded".to_string()),
+            },
+        )
+        .expect("error issue");
+        upsert_sqlite_file_issue(
+            &conn,
+            &SqliteFileIssueUpsert {
+                image_id: Some("warning".to_string()),
+                root_path: root_b.to_string(),
+                path: "warnings/visible.jpg".to_string(),
+                severity: FileIssueSeverity::Warning,
+                kind: FileIssueKind::FormatMismatch,
+                expected_format: Some(SupportedImageFormat::Jpeg),
+                detected_format: Some("png".to_string()),
+                size: 50,
+                mtime_ns: 600,
+                detail: Some("visible warning".to_string()),
+            },
+        )
+        .expect("warning issue");
+
+        let roots = vec![root_a.to_string(), root_b.to_string()];
+        for sort_mode in IMAGE_SORTS {
+            let expected = sorted_ids(&active, sort_mode);
+            let mut actual = Vec::new();
+            let mut cursor = None;
+            let mut page_number = 0;
+            loop {
+                page_number += 1;
+                let include_total = page_number == 1;
+                let page = query_sqlite_images_page(
+                    &conn,
+                    &roots,
+                    SqliteImagesQuery {
+                        include_tags: Some(" , ".to_string()),
+                        exclude_tags: Some("  ".to_string()),
+                        limit: Some(3),
+                        cursor: cursor.clone(),
+                        sort: Some((*sort_mode).to_string()),
+                        include_total,
+                        ..Default::default()
+                    },
+                )
+                .unwrap_or_else(|error| panic!("{sort_mode} page {page_number}: {error}"));
+                if include_total {
+                    assert_eq!(page["page"]["total"], json!(active.len()));
+                } else {
+                    assert_eq!(page["page"]["total"], JsonValue::Null);
+                }
+                actual.extend(item_ids(&page));
+                let has_more = page["page"]["has_more"].as_bool().expect("has_more");
+                cursor = page["page"]["next_cursor"]
+                    .as_str()
+                    .map(ToString::to_string);
+                if !has_more {
+                    assert!(cursor.is_none(), "{sort_mode} final cursor");
+                    break;
+                }
+                assert!(cursor.is_some(), "{sort_mode} continuation cursor");
+            }
+
+            assert_eq!(actual, expected, "{sort_mode} cursor chain");
+            assert_eq!(
+                actual
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                active.len(),
+                "{sort_mode} duplicate ids"
+            );
+
+            let first = query_sqlite_images_page(
+                &conn,
+                &roots,
+                SqliteImagesQuery {
+                    limit: Some(3),
+                    sort: Some((*sort_mode).to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("first page without total");
+            let cursor = first["page"]["next_cursor"].as_str().expect("first cursor");
+            let continued_with_total = query_sqlite_images_page(
+                &conn,
+                &roots,
+                SqliteImagesQuery {
+                    limit: Some(3),
+                    cursor: Some(cursor.to_string()),
+                    sort: Some((*sort_mode).to_string()),
+                    include_total: true,
+                    ..Default::default()
+                },
+            )
+            .expect("continued page with total");
+            assert_eq!(
+                continued_with_total["page"]["total"],
+                json!(active.len()),
+                "{sort_mode} total must ignore cursor"
+            );
+        }
+    }
+
+    #[test]
+    fn tag_filtered_query_semantics_and_pagination_remain_unchanged() {
+        fn ids(page: &JsonValue) -> std::collections::HashSet<String> {
+            page["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .map(|item| item["id"].as_str().expect("id").to_string())
+                .collect()
+        }
+
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let root = "/tag-photos";
+        for (id, mtime) in [("t1", 50), ("t2", 40), ("t3", 30), ("t4", 20), ("t5", 10)] {
+            upsert_fixture(&conn, id, root, &format!("{id}.jpg"), mtime, mtime);
+        }
+        replace_sqlite_image_tags(&conn, "t1", &["alpha".into(), "beta".into()], "user")
+            .expect("t1 tags");
+        replace_sqlite_image_tags(&conn, "t2", &["alpha".into()], "user").expect("t2 tags");
+        replace_sqlite_image_tags(&conn, "t3", &["beta".into(), "gamma".into()], "user")
+            .expect("t3 tags");
+        replace_sqlite_image_tags(&conn, "t4", &["alpha".into(), "gamma".into()], "user")
+            .expect("t4 tags");
+        let roots = vec![root.to_string()];
+
+        let cases = [
+            (Some("alpha"), None, "any", ["t1", "t2", "t4"].as_slice()),
+            (
+                Some("alpha,beta"),
+                None,
+                "any",
+                ["t1", "t2", "t3", "t4"].as_slice(),
+            ),
+            (Some("alpha,beta"), None, "all", ["t1"].as_slice()),
+            (None, Some("gamma"), "any", ["t1", "t2", "t5"].as_slice()),
+            (Some("alpha"), Some("gamma"), "any", ["t1", "t2"].as_slice()),
+        ];
+        for (include, exclude, mode, expected) in cases {
+            let page = query_sqlite_images_page(
+                &conn,
+                &roots,
+                SqliteImagesQuery {
+                    include_tags: include.map(str::to_string),
+                    exclude_tags: exclude.map(str::to_string),
+                    match_mode: Some(mode.to_string()),
+                    include_total: true,
+                    ..Default::default()
+                },
+            )
+            .expect("tag query");
+            assert_eq!(page["page"]["total"], json!(expected.len()));
+            assert_eq!(
+                ids(&page),
+                expected.iter().map(|id| (*id).to_string()).collect(),
+                "include={include:?} exclude={exclude:?} mode={mode}"
+            );
+        }
+
+        let legacy = query_sqlite_images_page(
+            &conn,
+            &roots,
+            SqliteImagesQuery {
+                tags: Some("alpha,beta".to_string()),
+                mode: Some("all".to_string()),
+                include_total: true,
+                ..Default::default()
+            },
+        )
+        .expect("legacy all query");
+        assert_eq!(ids(&legacy), ["t1".to_string()].into_iter().collect());
+
+        let mut cursor = None;
+        let mut paginated = Vec::new();
+        loop {
+            let page = query_sqlite_images_page(
+                &conn,
+                &roots,
+                SqliteImagesQuery {
+                    include_tags: Some("alpha".to_string()),
+                    limit: Some(1),
+                    cursor: cursor.clone(),
+                    sort: Some("date_desc".to_string()),
+                    include_total: cursor.is_none(),
+                    ..Default::default()
+                },
+            )
+            .expect("tag page");
+            paginated.extend(ids(&page));
+            if !page["page"]["has_more"].as_bool().expect("has_more") {
+                break;
+            }
+            cursor = page["page"]["next_cursor"]
+                .as_str()
+                .map(ToString::to_string);
+            assert!(cursor.is_some());
+        }
+        assert_eq!(
+            paginated,
+            ["t1", "t2", "t4"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
