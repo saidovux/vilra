@@ -155,6 +155,8 @@ test.beforeEach(async ({ page }) => {
       last_image_id: null,
       tabs: [],
       active_tab_id: null,
+      search_tags: [],
+      search_mode: 'any',
       folder_tag_sync: true,
     },
   }).catch(() => undefined);
@@ -181,18 +183,32 @@ test('gallery card opens original image through stable file id', async ({ page }
 
 test('lower batch cards stay openable after pagination', async ({ page }) => {
   await waitForGallery(page);
-  await expect(page.locator('.card[data-id]')).toHaveCount(48);
+  const initialIds = new Set(await page.locator('.card[data-id]').evaluateAll(cards =>
+    cards.map(card => String((card as HTMLElement).dataset.id || '')),
+  ));
+  expect(initialIds.size).toBeGreaterThan(0);
+  expect(initialIds.size).toBeLessThan(350);
 
+  await page.locator('html').evaluate(element => { element.style.scrollBehavior = 'auto'; });
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-  await expect(page.locator('.card[data-id]').nth(55)).toBeVisible({ timeout: 30_000 });
-
-  const lowerCard = page.locator('.card[data-id]').nth(55);
-  const imageId = await lowerCard.getAttribute('data-id');
+  let imageId = '';
+  await expect.poll(async () => {
+    const ids = await page.locator('.card[data-id]').evaluateAll(cards =>
+      cards.map(card => String((card as HTMLElement).dataset.id || '')),
+    );
+    imageId = ids.find(id => id && !initialIds.has(id)) || '';
+    return imageId;
+  }, {timeout: 30_000}).not.toBe('');
   expect(imageId).toBeTruthy();
 
-  await expect(page.locator(`.card[data-id="${imageId}"]`)).toBeVisible();
-
-  await clickCardAndExpectPreview(page, 55);
+  const lowerCard = page.locator(`.card[data-id="${imageId}"]`);
+  await expect(lowerCard).toBeVisible();
+  const fileResponse = page.waitForResponse(response =>
+    response.url().includes(`/file/${imageId}`) && response.status() === 200,
+  );
+  await lowerCard.click();
+  await fileResponse;
+  await expect(page.locator('#preview-open')).toHaveAttribute('href', `/file/${imageId}`);
   await closePreview(page);
 
   const items = await imageItems(page);

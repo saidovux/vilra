@@ -1,3 +1,12 @@
+import {
+  Virtualizer,
+  observeWindowOffset,
+  observeWindowRect,
+  windowScroll,
+  type VirtualItem,
+  type VirtualizerOptions,
+} from '@tanstack/virtual-core';
+
 type MatchMode = 'any' | 'all';
 type SortMode = 'path_asc' | 'path_desc' | 'date_desc' | 'date_asc' | 'size_desc' | 'size_asc';
 type SettingsTab = 'general' | 'tags' | 'graph';
@@ -62,6 +71,21 @@ interface ImagePage {
   total?: unknown;
   next_cursor?: string | null;
   has_more?: boolean;
+}
+
+interface GalleryGeometry {
+  width: number;
+  gap: number;
+  laneCount: number;
+  laneWidth: number;
+  borderWidth: number;
+  scrollMargin: number;
+}
+
+interface MountedGalleryCard {
+  slot: HTMLDivElement;
+  card: HTMLElement;
+  signature: string;
 }
 
 type ProblemSeverity = 'all' | 'error' | 'warning';
@@ -597,19 +621,21 @@ let tabs: GalleryTab[] = [];
 let activeTabId: string | null = null;
 let lbIndex = -1;
 let statusInterval: ReturnType<typeof setInterval> | null = null;
-let loadedIds = new Set<string>();
-let observer: IntersectionObserver | null = null;
 let sessionSaveTimer: ReturnType<typeof setTimeout> | null = null;
-let renderedCount = 0;
 let serverTotal = 0;
 let serverTotalKnown = false;
 let nextCursor: string | null = null;
 let hasMorePages = false;
 let isLoadingPage = false;
 let activeImagesRequest = 0;
-let masonryColumns: HTMLElement[] = [];
-let masonryHeights: number[] = [];
-let masonryColumnCount = 0;
+let galleryVirtualizer: Virtualizer<Window, HTMLDivElement> | null = null;
+let galleryVirtualizerCleanup: (() => void) | null = null;
+let galleryGeometry: GalleryGeometry | null = null;
+let galleryResizeFrame: number | null = null;
+let paginationPrefetchFrame: number | null = null;
+let pendingGalleryScrollTop: number | null = null;
+let activePageLoad: Promise<void> | null = null;
+const mountedGalleryCards = new Map<string, MountedGalleryCard>();
 let previewModal: PreviewModal | null = null;
 let lightboxImages: ImageItem[] = [];
 let previewRequestToken = 0;
@@ -650,6 +676,8 @@ const thumbRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let terminalGalleryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 const PAGE = 48;
 const MASONRY_COL_MIN = 230;
+const GALLERY_OVERSCAN = 20;
+const CARD_BORDER_WIDTH = 1;
 const canvasCache = new Map<string, Promise<HTMLCanvasElement>>();
 const MAX_CANVAS_CACHE = 9;
 const SORT_MODES: SortMode[] = ['path_asc', 'path_desc', 'date_desc', 'date_asc', 'size_desc', 'size_asc'];
@@ -1119,12 +1147,7 @@ function removeLiveImage(imageId: string, removedImage: ImageItem | null): void 
 }
 
 function renderLiveGalleryState(): void {
-  const targetCount = Math.min(
-    visibleImages.length,
-    Math.max(renderedCount, Math.min(PAGE, visibleImages.length)),
-  );
-  renderedCount = targetCount;
-  layoutGallery();
+  invalidateVirtualGallery({preserveAnchor: true, resetCards: false});
   updateImageCounter();
   requiredHtml('empty-state').style.display = visibleImages.length ? 'none' : 'flex';
   requestGraphRebuild();
@@ -1530,6 +1553,7 @@ async function refreshImages(clear = true): Promise<void> {
     isLoadingPage = false;
     await refreshTagPool();
     applyFilter(clear);
+    await restorePendingGalleryScroll();
     restorePreviewIfNeeded();
   } catch (e) {
     console.error(e);
@@ -1544,68 +1568,57 @@ function applyFilter(clear = true): void {
   updateTabTitle(tab);
   renderTabs();
   renderFilterControls();
-  if (clear) {
-    loadedIds.clear();
-    renderedCount = 0;
-    requiredHtml('gallery').innerHTML = '';
-    resetMasonryLayout();
-  }
-  renderBatch();
+  invalidateVirtualGallery({preserveAnchor: !clear, resetCards: clear});
   requiredHtml('empty-state').style.display = visibleImages.length ? 'none' : 'flex';
   requestGraphRebuild();
 }
 
-async function loadNextImagesPage(): Promise<void> {
-  if (!hasMorePages || !nextCursor || isLoadingPage) return;
+function loadNextImagesPage(): Promise<void> {
+  if (activePageLoad) return activePageLoad;
+  if (!hasMorePages || !nextCursor) return Promise.resolve();
   isLoadingPage = true;
-  const tab = activeTab();
-  const params = new URLSearchParams();
-  if (tab.includeTags && tab.includeTags.length) params.set('include_tags', tab.includeTags.join(','));
-  if (tab.excludeTags && tab.excludeTags.length) params.set('exclude_tags', tab.excludeTags.join(','));
-  params.set('match_mode', tab.matchMode === 'all' ? 'all' : 'any');
-  params.set('limit', String(PAGE));
-  params.set('sort', tab.sortMode || DEFAULT_SORT_MODE);
-  params.set('include_total', '0');
-  params.set('cursor', nextCursor);
-  try {
-    const r = await fetch('/api/images?' + params.toString());
-    if (!r.ok) throw new Error(await readError(r));
-    const d = await readJsonRecord(r);
-    const items = imagesFromRecord(d);
-    items.forEach(image => acceptActiveImage(image.id));
-    const seen = new Set(allImages.map(img => img.id));
-    items.forEach(img => {
-      if (!seen.has(img.id)) allImages.push(img);
-    });
-    visibleImages = allImages.slice();
-    const page = imagePage(d.page);
-    setServerTotalFromPage(page, visibleImages.length, false);
-    nextCursor = page ? page.next_cursor || null : null;
-    hasMorePages = Boolean(page && page.has_more);
-    updateImageCounter();
-    renderBatch();
-  } catch (e) {
-    console.error(e);
-  } finally {
-    isLoadingPage = false;
-  }
+  activePageLoad = (async () => {
+    const tab = activeTab();
+    const params = new URLSearchParams();
+    if (tab.includeTags && tab.includeTags.length) params.set('include_tags', tab.includeTags.join(','));
+    if (tab.excludeTags && tab.excludeTags.length) params.set('exclude_tags', tab.excludeTags.join(','));
+    params.set('match_mode', tab.matchMode === 'all' ? 'all' : 'any');
+    params.set('limit', String(PAGE));
+    params.set('sort', tab.sortMode || DEFAULT_SORT_MODE);
+    params.set('include_total', '0');
+    params.set('cursor', nextCursor);
+    try {
+      const r = await fetch('/api/images?' + params.toString());
+      if (!r.ok) throw new Error(await readError(r));
+      const d = await readJsonRecord(r);
+      const items = imagesFromRecord(d);
+      items.forEach(image => acceptActiveImage(image.id));
+      const seen = new Set(allImages.map(img => img.id));
+      items.forEach(img => {
+        if (!seen.has(img.id)) {
+          seen.add(img.id);
+          allImages.push(img);
+        }
+      });
+      visibleImages = allImages.slice();
+      const page = imagePage(d.page);
+      setServerTotalFromPage(page, visibleImages.length, false);
+      nextCursor = page ? page.next_cursor || null : null;
+      hasMorePages = Boolean(page && page.has_more);
+      updateImageCounter();
+      updateVirtualGalleryCount();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      isLoadingPage = false;
+      activePageLoad = null;
+      if (galleryVirtualizer) schedulePaginationPrefetch(galleryVirtualizer);
+    }
+  })();
+  return activePageLoad;
 }
 
-function renderBatch(): void {
-  ensureMasonryLayout(false);
-  const start = renderedCount;
-  const end = Math.min(start + PAGE, visibleImages.length);
-  for (let i = start; i < end; i++) {
-    const img = visibleImages[i];
-    if (loadedIds.has(img.id)) continue;
-    loadedIds.add(img.id);
-    placeMasonryCard(makeCard(img), img);
-  }
-  renderedCount = end;
-  setupLazyLoad();
-}
-
-function makeCard(img: ImageItem): HTMLElement {
+function makeCard(img: ImageItem, highPriority = false): HTMLElement {
   const card = document.createElement('article');
   card.className = 'card';
   card.dataset.id = img.id;
@@ -1614,11 +1627,12 @@ function makeCard(img: ImageItem): HTMLElement {
   ph.className = 'lazy';
   ph.dataset.imageId = img.id;
   const version = Number(img.mtime || 0);
-  ph.dataset.src = `${img.thumb_url || `/thumb-file/${img.id}.jpg`}?v=${version}`;
+  const source = `${img.thumb_url || `/thumb-file/${img.id}.jpg`}?v=${version}`;
   ph.dataset.fallbackSrc = `/thumb/${img.id}?v=${version}`;
   ph.alt = name;
   ph.decoding = 'async';
-  ph.loading = 'lazy';
+  ph.loading = 'eager';
+  if ('fetchPriority' in ph) ph.fetchPriority = highPriority ? 'high' : 'auto';
   ph.style.aspectRatio = aspectCss(img);
   const width = Number(img.width || 0);
   const height = Number(img.height || 0);
@@ -1635,6 +1649,17 @@ function makeCard(img: ImageItem): HTMLElement {
   card.appendChild(ph);
   card.appendChild(overlay);
   card.addEventListener('click', () => openLightboxById(img.id));
+  ph.onload = () => ph.classList.add('loaded');
+  ph.onerror = () => {
+    const fallback = ph.dataset.fallbackSrc;
+    if (fallback) {
+      void loadThumbWithRetry(ph, fallback);
+      return;
+    }
+    ph.classList.add('loaded');
+    ph.alt = 'Ошибка загрузки';
+  };
+  ph.src = source;
   return card;
 }
 
@@ -1648,70 +1673,11 @@ function renderTagChips(img: ImageItem): string {
 }
 
 function updateCardForImage(img: ImageItem): void {
-  const card = document.querySelector(`.card[data-id="${cssEscape(img.id)}"]`);
+  const mounted = mountedGalleryCards.get(img.id);
+  const card = mounted?.card;
   if (!card) return;
   const tags = card.querySelector('.card-tags');
   if (tags) tags.innerHTML = renderTagChips(img);
-}
-
-function setupLazyLoad(): void {
-  if (observer) observer.disconnect();
-  const lazyObserver = new IntersectionObserver(entries => {
-    entries.forEach(entry => {
-      if (!entry.isIntersecting) return;
-      const img = entry.target;
-      if (!(img instanceof HTMLImageElement)) return;
-      if (img.dataset.src) {
-        img.onload = () => img.classList.add('loaded');
-        img.onerror = () => {
-          const fallback = img.dataset.fallbackSrc;
-          if (fallback && img.src !== fallback) {
-            loadThumbWithRetry(img, fallback);
-            return;
-          }
-          img.classList.add('loaded');
-          img.alt = 'Ошибка загрузки';
-        };
-        img.src = img.dataset.src;
-        img.removeAttribute('data-src');
-        lazyObserver.unobserve(img);
-      }
-    });
-  }, {rootMargin: '320px'});
-  observer = lazyObserver;
-  document.querySelectorAll<HTMLImageElement>('img.lazy').forEach(img => lazyObserver.observe(img));
-  const galleryWrap = requiredHtml('gallery-wrap');
-  const old = galleryWrap.querySelector('.sentinel');
-  if (old) old.remove();
-  if (renderedCount < visibleImages.length) {
-    const sentinel = document.createElement('div');
-    sentinel.className = 'sentinel';
-    sentinel.style.height = '1px';
-    galleryWrap.appendChild(sentinel);
-    const sentinelObs = new IntersectionObserver(entries => {
-      if (entries[0].isIntersecting) {
-        sentinelObs.disconnect();
-        if (renderedCount < visibleImages.length) {
-          renderBatch();
-        } else if (hasMorePages) {
-          loadNextImagesPage();
-        }
-      }
-    }, {rootMargin: '620px'});
-    sentinelObs.observe(sentinel);
-  } else if (hasMorePages) {
-    const sentinel = document.createElement('div');
-    sentinel.className = 'sentinel';
-    sentinel.style.height = '1px';
-    galleryWrap.appendChild(sentinel);
-    const sentinelObs = new IntersectionObserver(entries => {
-      if (entries[0].isIntersecting) {
-        sentinelObs.disconnect();
-        loadNextImagesPage();
-      }
-    }, {rootMargin: '620px'});
-    sentinelObs.observe(sentinel);
-  }
 }
 
 async function loadThumbWithRetry(img: HTMLImageElement, url: string, attempt = 0): Promise<void> {
@@ -1721,14 +1687,26 @@ async function loadThumbWithRetry(img: HTMLImageElement, url: string, attempt = 
   const maxAttempts = 120;
   try {
     const r = await fetch(url, {cache: 'no-store'});
-    if (terminalThumbIds.has(imageId)) return;
+    if (!img.isConnected || terminalThumbIds.has(imageId)) return;
     if (r.status === 200) {
-      img.src = url;
-      img.onload = () => img.classList.add('loaded');
+      const objectUrl = URL.createObjectURL(await r.blob());
+      if (!img.isConnected || terminalThumbIds.has(imageId)) {
+        URL.revokeObjectURL(objectUrl);
+        return;
+      }
+      img.dataset.objectUrl = objectUrl;
+      img.onload = () => {
+        img.classList.add('loaded');
+        URL.revokeObjectURL(objectUrl);
+        delete img.dataset.objectUrl;
+      };
       img.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        delete img.dataset.objectUrl;
         img.classList.add('loaded');
         img.alt = 'Ошибка загрузки';
       };
+      img.src = objectUrl;
       return;
     }
     if (r.status === 202 && attempt < maxAttempts) {
@@ -1815,9 +1793,9 @@ function switchTab(id: string): void {
   saveActiveScroll();
   activeTabId = id;
   closePreview(false);
-  refreshImages(true);
   const tab = activeTab();
-  setTimeout(() => window.scrollTo({top: tab.scrollTop || 0}), 0);
+  pendingGalleryScrollTop = tab.scrollTop || 0;
+  void refreshImages(true);
   saveSessionSoon();
 }
 
@@ -3197,9 +3175,8 @@ async function loadSession(): Promise<void> {
       await refreshFolderTree();
       showGallery();
       startStatusPolling();
+      pendingGalleryScrollTop = activeTab().scrollTop || 0;
       await refreshImages(true);
-      const tab = activeTab();
-      setTimeout(() => window.scrollTo({top: tab.scrollTop || 0}), 0);
     } else {
       showSetup();
       pollStatus();
@@ -3260,78 +3237,232 @@ function imageAspectRatio(img: ImageItem): number {
   return Number.isFinite(ratio) && ratio > 0 ? ratio : 1;
 }
 
-function masonryColumnTarget(): number {
-  const gallery = optionalHtml('gallery');
-  if (!gallery) return 1;
-  const width = gallery.clientWidth || window.innerWidth || MASONRY_COL_MIN;
+function computeGalleryGeometry(): GalleryGeometry {
+  const gallery = requiredHtml('gallery');
+  const width = Math.max(1, gallery.clientWidth || window.innerWidth || MASONRY_COL_MIN);
   const styles = getComputedStyle(gallery);
-  const gap = Number.parseFloat(styles.gap || styles.columnGap || '') || 10;
-  if (width < 720) return 1;
-  return Math.max(1, Math.floor((width + gap) / (MASONRY_COL_MIN + gap)));
+  const gap = Number.parseFloat(styles.columnGap || styles.gap || '') || 10;
+  const laneCount = width < 720
+    ? 1
+    : Math.max(1, Math.floor((width + gap) / (MASONRY_COL_MIN + gap)));
+  const laneWidth = (width - gap * (laneCount - 1)) / laneCount;
+  const scrollMargin = gallery.getBoundingClientRect().top + window.scrollY;
+  return {width, gap, laneCount, laneWidth, borderWidth: CARD_BORDER_WIDTH, scrollMargin};
 }
 
-function resetMasonryLayout(): void {
-  masonryColumns = [];
-  masonryHeights = [];
-  masonryColumnCount = 0;
+function estimateVirtualCardSize(index: number, geometry: GalleryGeometry): number {
+  const image = visibleImages[index];
+  if (!image) return MASONRY_COL_MIN;
+  const contentWidth = Math.max(1, geometry.laneWidth - geometry.borderWidth * 2);
+  return contentWidth / imageAspectRatio(image) + geometry.borderWidth * 2;
 }
 
-function ensureMasonryLayout(force = false): void {
-  const gallery = optionalHtml('gallery');
-  if (!gallery) return;
-  const columnCount = masonryColumnTarget();
-  if (!force && masonryColumnCount === columnCount && masonryColumns.length === columnCount) return;
-  gallery.innerHTML = '';
-  masonryColumns = [];
-  masonryHeights = [];
-  masonryColumnCount = columnCount;
-  for (let i = 0; i < columnCount; i++) {
-    const column = document.createElement('div');
-    column.className = 'masonry-column';
-    gallery.appendChild(column);
-    masonryColumns.push(column);
-    masonryHeights.push(0);
+function galleryVirtualizerOptions(geometry: GalleryGeometry): VirtualizerOptions<Window, HTMLDivElement> {
+  return {
+    count: visibleImages.length,
+    getScrollElement: () => window,
+    estimateSize: index => estimateVirtualCardSize(index, geometry),
+    getItemKey: index => visibleImages[index]?.id || `missing-${index}`,
+    scrollToFn: windowScroll,
+    observeElementRect: observeWindowRect,
+    observeElementOffset: observeWindowOffset,
+    onChange: instance => {
+      renderVirtualGalleryRange(instance);
+      schedulePaginationPrefetch(instance);
+    },
+    lanes: geometry.laneCount,
+    laneAssignmentMode: 'estimate',
+    gap: geometry.gap,
+    overscan: GALLERY_OVERSCAN,
+    scrollMargin: geometry.scrollMargin,
+  };
+}
+
+function cardRenderSignature(image: ImageItem): string {
+  return JSON.stringify([
+    image.path,
+    image.thumb_url || '',
+    Number(image.mtime || 0),
+    Number(image.width || 0),
+    Number(image.height || 0),
+    image.auto_tags || image.folder_tags || [],
+    image.user_tags || [],
+  ]);
+}
+
+function clearThumbLifecycle(imageId: string, card: HTMLElement): void {
+  const timer = thumbRetryTimers.get(imageId);
+  if (timer) clearTimeout(timer);
+  thumbRetryTimers.delete(imageId);
+  const image = card.querySelector('img');
+  if (image instanceof HTMLImageElement) {
+    image.onload = null;
+    image.onerror = null;
+    const objectUrl = image.dataset.objectUrl;
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+    delete image.dataset.objectUrl;
   }
 }
 
-function estimateCardHeight(img: ImageItem): number {
-  const gallery = optionalHtml('gallery');
-  if (!gallery) return MASONRY_COL_MIN;
-  const gap = Number.parseFloat(getComputedStyle(gallery).gap || '') || 10;
-  const columnWidth = masonryColumns[0] ? masonryColumns[0].clientWidth : MASONRY_COL_MIN;
-  return Math.max(48, columnWidth / imageAspectRatio(img)) + gap;
+function unmountVirtualCard(imageId: string): void {
+  const mounted = mountedGalleryCards.get(imageId);
+  if (!mounted) return;
+  clearThumbLifecycle(imageId, mounted.card);
+  mounted.slot.remove();
+  mountedGalleryCards.delete(imageId);
 }
 
-function placeMasonryCard(card: HTMLElement, img: ImageItem): void {
-  ensureMasonryLayout(false);
-  if (!masonryColumns.length) return;
-  let bestIndex = 0;
-  for (let i = 1; i < masonryHeights.length; i++) {
-    if (masonryHeights[i] < masonryHeights[bestIndex]) bestIndex = i;
-  }
-  masonryColumns[bestIndex].appendChild(card);
-  masonryHeights[bestIndex] += estimateCardHeight(img);
+function clearMountedGalleryCards(): void {
+  [...mountedGalleryCards.keys()].forEach(unmountVirtualCard);
 }
 
-function layoutGallery(): void {
-  const count = renderedCount;
-  if (!count) {
-    resetMasonryLayout();
-    ensureMasonryLayout(true);
-    return;
+function virtualItemIsVisible(item: VirtualItem, geometry: GalleryGeometry): boolean {
+  const viewportStart = window.scrollY - geometry.scrollMargin;
+  const viewportEnd = viewportStart + window.innerHeight;
+  const itemStart = item.start - geometry.scrollMargin;
+  return item.end - geometry.scrollMargin >= viewportStart && itemStart <= viewportEnd;
+}
+
+function mountVirtualCard(item: VirtualItem, image: ImageItem, geometry: GalleryGeometry): MountedGalleryCard {
+  const slot = document.createElement('div');
+  slot.className = 'virtual-card-slot';
+  slot.dataset.id = image.id;
+  const card = makeCard(image, virtualItemIsVisible(item, geometry));
+  slot.appendChild(card);
+  requiredHtml('gallery').appendChild(slot);
+  const mounted = {slot, card, signature: cardRenderSignature(image)};
+  mountedGalleryCards.set(image.id, mounted);
+  return mounted;
+}
+
+function positionVirtualCard(mounted: MountedGalleryCard, item: VirtualItem, geometry: GalleryGeometry): void {
+  const x = item.lane * (geometry.laneWidth + geometry.gap);
+  const y = item.start - geometry.scrollMargin;
+  mounted.slot.dataset.index = String(item.index);
+  mounted.slot.dataset.lane = String(item.lane);
+  mounted.slot.style.width = `${geometry.laneWidth}px`;
+  mounted.slot.style.height = `${item.size}px`;
+  mounted.slot.style.transform = `translate3d(${x}px, ${y}px, 0)`;
+}
+
+function renderVirtualGalleryRange(instance = galleryVirtualizer): void {
+  if (!instance || !galleryGeometry) return;
+  const gallery = requiredHtml('gallery');
+  const virtualItems = instance.getVirtualItems();
+  const desiredIds = new Set<string>();
+  gallery.style.height = `${Math.max(0, instance.getTotalSize())}px`;
+
+  for (const item of virtualItems) {
+    const image = visibleImages[item.index];
+    if (!image) continue;
+    desiredIds.add(image.id);
+    const signature = cardRenderSignature(image);
+    let mounted = mountedGalleryCards.get(image.id);
+    if (!mounted) {
+      mounted = mountVirtualCard(item, image, galleryGeometry);
+    } else if (mounted.signature !== signature) {
+      clearThumbLifecycle(image.id, mounted.card);
+      const card = makeCard(image, virtualItemIsVisible(item, galleryGeometry));
+      mounted.slot.replaceChildren(card);
+      mounted.card = card;
+      mounted.signature = signature;
+    }
+    positionVirtualCard(mounted, item, galleryGeometry);
   }
-  const renderedImages = visibleImages.slice(0, count);
-  loadedIds.clear();
-  renderedCount = 0;
-  resetMasonryLayout();
-  ensureMasonryLayout(true);
-  renderedImages.forEach(img => {
-    if (loadedIds.has(img.id)) return;
-    loadedIds.add(img.id);
-    placeMasonryCard(makeCard(img), img);
-    renderedCount += 1;
+
+  for (const imageId of [...mountedGalleryCards.keys()]) {
+    if (!desiredIds.has(imageId)) unmountVirtualCard(imageId);
+  }
+  instance._willUpdate();
+}
+
+function ensureGalleryVirtualizer(): Virtualizer<Window, HTMLDivElement> {
+  galleryGeometry = computeGalleryGeometry();
+  if (!galleryVirtualizer) {
+    galleryVirtualizer = new Virtualizer<Window, HTMLDivElement>(galleryVirtualizerOptions(galleryGeometry));
+    galleryVirtualizerCleanup = galleryVirtualizer._didMount();
+  } else {
+    galleryVirtualizer.setOptions(galleryVirtualizerOptions(galleryGeometry));
+  }
+  galleryVirtualizer._willUpdate();
+  return galleryVirtualizer;
+}
+
+function captureGalleryAnchor(): {imageId: string; viewportTop: number} | null {
+  const candidates = [...mountedGalleryCards.entries()]
+    .map(([imageId, mounted]) => ({imageId, rect: mounted.slot.getBoundingClientRect()}))
+    .filter(item => item.rect.bottom > 0 && item.rect.top < window.innerHeight)
+    .sort((left, right) => Math.abs(left.rect.top) - Math.abs(right.rect.top));
+  const anchor = candidates[0];
+  return anchor ? {imageId: anchor.imageId, viewportTop: anchor.rect.top} : null;
+}
+
+function restoreGalleryAnchor(anchor: {imageId: string; viewportTop: number} | null): void {
+  if (!anchor || !galleryVirtualizer) return;
+  const index = visibleImages.findIndex(image => image.id === anchor.imageId);
+  if (index < 0) return;
+  const item = galleryVirtualizer.measurementsCache[index];
+  if (!item) return;
+  galleryVirtualizer.scrollToOffset(Math.max(0, item.start - anchor.viewportTop), {behavior: 'instant'});
+}
+
+function invalidateVirtualGallery(options: {preserveAnchor: boolean; resetCards: boolean}): void {
+  const anchor = options.preserveAnchor ? captureGalleryAnchor() : null;
+  if (options.resetCards) clearMountedGalleryCards();
+  const instance = ensureGalleryVirtualizer();
+  instance.measure();
+  renderVirtualGalleryRange(instance);
+  if (anchor) requestAnimationFrame(() => restoreGalleryAnchor(anchor));
+}
+
+function updateVirtualGalleryCount(): void {
+  const instance = ensureGalleryVirtualizer();
+  instance.setOptions(galleryVirtualizerOptions(galleryGeometry!));
+  instance._willUpdate();
+  renderVirtualGalleryRange(instance);
+  schedulePaginationPrefetch(instance);
+}
+
+function schedulePaginationPrefetch(instance: Virtualizer<Window, HTMLDivElement>): void {
+  if (paginationPrefetchFrame !== null || !hasMorePages || isLoadingPage) return;
+  paginationPrefetchFrame = requestAnimationFrame(() => {
+    paginationPrefetchFrame = null;
+    const items = instance.getVirtualItems();
+    const last = items[items.length - 1];
+    const threshold = Math.max(PAGE, (galleryGeometry?.laneCount || 1) * 8);
+    if (last && last.index >= visibleImages.length - threshold) void loadNextImagesPage();
   });
-  setupLazyLoad();
+}
+
+function galleryContentBottom(): number {
+  if (!galleryVirtualizer || !galleryGeometry) return 0;
+  return galleryGeometry.scrollMargin + galleryVirtualizer.getTotalSize();
+}
+
+async function restorePendingGalleryScroll(): Promise<void> {
+  if (pendingGalleryScrollTop === null) return;
+  const target = Math.max(0, pendingGalleryScrollTop);
+  pendingGalleryScrollTop = null;
+  while (hasMorePages && galleryContentBottom() < target + window.innerHeight * 1.5) {
+    const previousCount = visibleImages.length;
+    await loadNextImagesPage();
+    if (visibleImages.length <= previousCount) break;
+  }
+  await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+  galleryVirtualizer?.scrollToOffset(target, {behavior: 'instant'});
+}
+
+function handleGalleryResize(): void {
+  if (galleryResizeFrame !== null) cancelAnimationFrame(galleryResizeFrame);
+  galleryResizeFrame = requestAnimationFrame(() => {
+    galleryResizeFrame = null;
+    const anchor = captureGalleryAnchor();
+    galleryGeometry = computeGalleryGeometry();
+    const instance = ensureGalleryVirtualizer();
+    instance.measure();
+    renderVirtualGalleryRange(instance);
+    requestAnimationFrame(() => restoreGalleryAnchor(anchor));
+  });
 }
 
 function normalizeTag(tag: unknown): string {
@@ -3713,7 +3844,7 @@ document.addEventListener('scroll', handleChromeScroll, {passive: true, capture:
 window.addEventListener('wheel', () => requestAnimationFrame(handleChromeScroll), {passive: true});
 window.addEventListener('touchmove', () => requestAnimationFrame(handleChromeScroll), {passive: true});
 window.addEventListener('resize', () => {
-  layoutGallery();
+  handleGalleryResize();
   if (graphState && graphState.open) rebuildGraph();
 });
 document.addEventListener('visibilitychange', () => {

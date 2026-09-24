@@ -14,9 +14,12 @@
     "tauri:build": "tauri build"
   },
   "devDependencies": {
+    "@playwright/test": "^1.55.0",
     "@tauri-apps/cli": "^2.11.0",
     "esbuild": "^0.23.1",
-    "typescript": "^5.6.3",
-    "@playwright/test": "^1.55.0"
+    "typescript": "^5.6.3"
+  },
+  "dependencies": {
+    "@tanstack/virtual-core": "^3.17.11"
   }
 }
