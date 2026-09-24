@@ -2,7 +2,7 @@ use crate::sqlite::{
     claim_next_sqlite_job, enqueue_sqlite_job_in_tx, get_sqlite_job, insert_job_event,
     mark_sqlite_claimed_job_failed, mark_sqlite_claimed_job_succeeded,
     mark_sqlite_job_succeeded_in_tx, mark_sqlite_job_terminal_failed_in_tx,
-    set_latest_attempt_state, SqliteJob,
+    set_latest_attempt_state, with_immediate_tx, SqliteJob,
 };
 use crate::sqlite_schema::SQLITE_SCHEMA_VERSION;
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
@@ -22,6 +22,8 @@ use uuid::Uuid;
 
 const DEFAULT_PAGE_LIMIT: i64 = 120;
 const MAX_PAGE_LIMIT: i64 = 500;
+const SQLITE_RUNTIME_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
+const SQLITE_WORKER_BUSY_TIMEOUT: Duration = Duration::from_millis(30_000);
 const VALID_JOB_STATES: &[&str] = &["queued", "running", "succeeded", "failed", "canceled"];
 const VALID_MATCH_MODES: &[&str] = &["any", "all"];
 const IMAGE_SORTS: &[&str] = &[
@@ -264,6 +266,17 @@ struct StaleJob {
 }
 
 pub fn open_sqlite_runtime_db(path: &Path) -> Result<Connection, String> {
+    open_sqlite_runtime_db_with_busy_timeout(path, SQLITE_RUNTIME_BUSY_TIMEOUT)
+}
+
+pub fn open_sqlite_worker_db(path: &Path) -> Result<Connection, String> {
+    open_sqlite_runtime_db_with_busy_timeout(path, SQLITE_WORKER_BUSY_TIMEOUT)
+}
+
+fn open_sqlite_runtime_db_with_busy_timeout(
+    path: &Path,
+    busy_timeout: Duration,
+) -> Result<Connection, String> {
     let conn =
         Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(|e| {
             format!(
@@ -271,15 +284,10 @@ pub fn open_sqlite_runtime_db(path: &Path) -> Result<Connection, String> {
                 path.display()
             )
         })?;
-    conn.busy_timeout(Duration::from_millis(5_000))
+    conn.busy_timeout(busy_timeout)
         .map_err(|e| format!("set sqlite runtime busy_timeout: {e}"))?;
-    conn.execute_batch(
-        r#"
-        PRAGMA foreign_keys = ON;
-        PRAGMA busy_timeout = 5000;
-        "#,
-    )
-    .map_err(|e| format!("set sqlite runtime pragmas: {e}"))?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .map_err(|e| format!("set sqlite runtime pragmas: {e}"))?;
 
     let version = conn
         .query_row(
@@ -3526,25 +3534,6 @@ fn cursor_filter_sqlite(
     }
 }
 
-fn with_immediate_tx<T>(
-    conn: &Connection,
-    f: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(|e| format!("begin sqlite immediate tx: {e}"))?;
-    match f() {
-        Ok(value) => {
-            conn.execute_batch("COMMIT")
-                .map_err(|e| format!("commit sqlite immediate tx: {e}"))?;
-            Ok(value)
-        }
-        Err(err) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(err)
-        }
-    }
-}
-
 fn insert_sqlite_job_event(
     conn: &Connection,
     job_id: &str,
@@ -3693,6 +3682,12 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .expect("busy_timeout pragma");
         assert_eq!(timeout_ms, 5_000);
+
+        let worker = open_sqlite_worker_db(&db_path).expect("open worker db");
+        let worker_timeout_ms: i64 = worker
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("worker busy_timeout pragma");
+        assert_eq!(worker_timeout_ms, 30_000);
 
         let health = check_sqlite_db_health(&db_path);
         assert_eq!(health["db_ready"], true);

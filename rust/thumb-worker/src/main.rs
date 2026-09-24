@@ -14,7 +14,7 @@ use tagimage_core::{
 use tagimage_db::sqlite::{
     claim_next_sqlite_thumb_job, finalize_sqlite_thumb_success, get_sqlite_file_issue_for_image,
     mark_sqlite_claimed_job_terminal_failed, mark_sqlite_image_job_terminal_failed,
-    mark_sqlite_thumb_failed, open_sqlite_runtime_db, record_sqlite_permanent_image_job_failure,
+    mark_sqlite_thumb_failed, open_sqlite_worker_db, record_sqlite_permanent_image_job_failure,
     resolve_sqlite_runtime_path, SqliteDecodedImageRecovery, SqliteFileIssueUpsert,
 };
 use tagimage_db::ClaimedJob;
@@ -547,7 +547,7 @@ async fn run_worker_loop(
     slow_ms: u128,
     shared_metrics: Arc<Mutex<WorkerMetrics>>,
 ) -> Result<(), String> {
-    let conn = open_sqlite_runtime_db(&db_path)
+    let conn = open_sqlite_worker_db(&db_path)
         .map_err(|e| format!("open sqlite db {} (slot={}): {e}", db_path.display(), slot))?;
 
     eprintln!(
@@ -556,7 +556,9 @@ async fn run_worker_loop(
     );
 
     loop {
-        let claimed = claim_next_sqlite_thumb_job(&conn, &worker_id)?;
+        let claimed = claim_next_sqlite_thumb_job(&conn, &worker_id).map_err(|error| {
+            format!("claim sqlite thumb job worker={worker_id} slot={slot}: {error}")
+        })?;
         let Some(job) = claimed else {
             {
                 let mut worker_metrics = lock_worker_metrics(&shared_metrics);

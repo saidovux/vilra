@@ -9,7 +9,7 @@ use tagimage_core::{
 use tagimage_db::sqlite::{
     claim_next_sqlite_metadata_job, get_sqlite_file_issue_for_image,
     mark_sqlite_claimed_job_terminal_failed, mark_sqlite_image_job_terminal_failed,
-    mark_sqlite_metadata_failed, mark_sqlite_metadata_succeeded_with_issue, open_sqlite_runtime_db,
+    mark_sqlite_metadata_failed, mark_sqlite_metadata_succeeded_with_issue, open_sqlite_worker_db,
     record_sqlite_permanent_image_job_failure, resolve_sqlite_runtime_path, SqliteFileIssueUpsert,
 };
 use tagimage_db::ClaimedJob;
@@ -388,13 +388,14 @@ async fn run_worker_loop(
     slow_ms: u128,
     authoritative: bool,
 ) -> Result<(), String> {
-    let conn = open_sqlite_runtime_db(&db_path)
+    let conn = open_sqlite_worker_db(&db_path)
         .map_err(|e| format!("open sqlite db {}: {e}", db_path.display()))?;
 
     let mut metrics = WorkerMetrics::new();
 
     loop {
-        let claimed = claim_next_sqlite_metadata_job(&conn, &worker_id)?;
+        let claimed = claim_next_sqlite_metadata_job(&conn, &worker_id)
+            .map_err(|error| format!("claim sqlite metadata job worker={worker_id}: {error}"))?;
         let Some(job) = claimed else {
             metrics.maybe_log_summary(metrics_interval_sec, &worker_id);
             sleep(Duration::from_millis(poll_ms)).await;

@@ -1,9 +1,13 @@
 use crate::sqlite_schema::{INDEX_STATEMENTS, SQLITE_SCHEMA_VERSION, TABLE_STATEMENTS};
 use crate::ClaimedJob;
-use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
+use rusqlite::{
+    params, Connection, Error as SqliteError, ErrorCode, OptionalExtension, Row,
+    TransactionBehavior,
+};
 use serde_json::{json, Value};
+use std::panic::Location;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub use crate::sqlite_runtime::*;
@@ -600,12 +604,73 @@ pub fn list_sqlite_job_events(
     Ok(events)
 }
 
-fn with_immediate_tx<T>(
+#[derive(Debug)]
+pub(crate) struct SqliteImmediateTxAcquireError {
+    source: SqliteError,
+    waited: Duration,
+}
+
+impl SqliteImmediateTxAcquireError {
+    pub(crate) fn code(&self) -> Option<ErrorCode> {
+        match &self.source {
+            SqliteError::SqliteFailure(error, _) => Some(error.code),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn extended_code(&self) -> Option<i32> {
+        match &self.source {
+            SqliteError::SqliteFailure(error, _) => Some(error.extended_code),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waited(&self) -> Duration {
+        self.waited
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_database_busy(&self) -> bool {
+        self.code() == Some(ErrorCode::DatabaseBusy)
+    }
+}
+
+impl std::fmt::Display for SqliteImmediateTxAcquireError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} (code={:?}, extended_code={:?}, waited_ms={})",
+            self.source,
+            self.code(),
+            self.extended_code(),
+            self.waited.as_millis()
+        )
+    }
+}
+
+pub(crate) fn begin_immediate_tx(conn: &Connection) -> Result<(), SqliteImmediateTxAcquireError> {
+    let started = Instant::now();
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|source| SqliteImmediateTxAcquireError {
+            source,
+            waited: started.elapsed(),
+        })
+}
+
+#[track_caller]
+pub(crate) fn with_immediate_tx<T>(
     conn: &Connection,
     f: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(|e| format!("begin sqlite immediate tx: {e}"))?;
+    let caller = Location::caller();
+    begin_immediate_tx(conn).map_err(|error| {
+        format!(
+            "begin sqlite immediate tx at {}:{}: {error}",
+            caller.file(),
+            caller.line()
+        )
+    })?;
     match f() {
         Ok(value) => {
             conn.execute_batch("COMMIT")
@@ -777,18 +842,19 @@ fn ms_to_u64(value: u128) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        cancel_sqlite_job, claim_next_sqlite_job, enqueue_sqlite_job, get_sqlite_job,
-        init_sqlite_db, list_sqlite_job_events, mark_sqlite_claimed_job_failed,
+        begin_immediate_tx, cancel_sqlite_job, claim_next_sqlite_job, enqueue_sqlite_job,
+        get_sqlite_job, init_sqlite_db, list_sqlite_job_events, mark_sqlite_claimed_job_failed,
         mark_sqlite_claimed_job_succeeded, mark_sqlite_claimed_job_terminal_failed,
         mark_sqlite_job_failed, mark_sqlite_job_succeeded, mark_sqlite_job_terminal_failed,
-        recover_sqlite_stale_running_jobs,
+        recover_sqlite_stale_running_jobs, SqliteImmediateTxAcquireError,
     };
     use crate::sqlite_schema::SQLITE_SCHEMA_VERSION;
-    use rusqlite::Connection;
+    use rusqlite::{Connection, Error as SqliteError, ErrorCode};
     use serde_json::{json, Value};
     use std::collections::{HashSet, VecDeque};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
+    use std::time::{Duration, Instant};
 
     fn temp_db_path() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1420,6 +1486,120 @@ mod tests {
         assert_eq!(claimed.len(), 12);
         assert_eq!(unique.len(), 12);
         assert_eq!(unique, expected);
+    }
+
+    #[test]
+    fn forced_writer_contention_waits_then_claims_once() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let enqueued =
+            enqueue_sqlite_job(&conn, "thumb", payload("contended"), 10, 3, None).expect("enqueue");
+        drop(conn);
+
+        let holder = Connection::open(&db_path).expect("open lock holder");
+        let worker = Connection::open(&db_path).expect("open worker");
+        worker
+            .busy_timeout(Duration::from_millis(500))
+            .expect("set worker test busy timeout");
+        holder
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold writer lock");
+
+        let (result_tx, result_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let started = Instant::now();
+            let result = claim_next_sqlite_job(&worker, Some("thumb"), "contended-worker");
+            result_tx
+                .send((result, started.elapsed()))
+                .expect("send claim result");
+        });
+
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(75)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let (state, attempt): (String, i32) = holder
+            .query_row(
+                "SELECT state, attempt FROM jobs WHERE id = ?1",
+                [&enqueued.job.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("job remains queued while writer lock is held");
+        assert_eq!(state, "queued");
+        assert_eq!(attempt, 0);
+        assert_eq!(
+            holder
+                .query_row("SELECT COUNT(*) FROM job_attempts", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("attempts before release"),
+            0
+        );
+        assert_eq!(event_count(&holder, &enqueued.job.id, "started"), 0);
+
+        holder
+            .execute_batch("ROLLBACK")
+            .expect("release writer lock");
+        let (claimed, waited) = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("claim completes after lock release");
+        handle.join().expect("join contended claimant");
+        let claimed = claimed.expect("claim result").expect("claimed job");
+        assert_eq!(claimed.id, enqueued.job.id);
+        assert_eq!(claimed.worker_id, "contended-worker");
+        assert_eq!(claimed.attempt, 1);
+        assert!(waited >= Duration::from_millis(75));
+
+        let verify = Connection::open(&db_path).expect("open verification connection");
+        assert_eq!(
+            verify
+                .query_row(
+                    "SELECT COUNT(*) FROM job_attempts WHERE job_id = ?1 AND attempt = 1 AND worker_id = 'contended-worker'",
+                    [&enqueued.job.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("attempt count"),
+            1
+        );
+        assert_eq!(event_count(&verify, &enqueued.job.id, "started"), 1);
+    }
+
+    #[test]
+    fn immediate_transaction_timeout_preserves_busy_code_and_bound() {
+        let (_dir, db_path) = temp_db_path();
+        drop(init_sqlite_db(&db_path).expect("init"));
+        let holder = Connection::open(&db_path).expect("open lock holder");
+        let waiter = Connection::open(&db_path).expect("open waiter");
+        waiter
+            .busy_timeout(Duration::from_millis(40))
+            .expect("set short busy timeout");
+        holder
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold writer lock");
+
+        let error = begin_immediate_tx(&waiter).expect_err("busy timeout must be exhausted");
+        assert_eq!(error.code(), Some(ErrorCode::DatabaseBusy));
+        assert_eq!(error.extended_code(), Some(rusqlite::ffi::SQLITE_BUSY));
+        assert!(error.is_database_busy());
+        assert!(error.waited() >= Duration::from_millis(30));
+        assert!(error.waited() < Duration::from_millis(500));
+
+        holder
+            .execute_batch("ROLLBACK")
+            .expect("release writer lock");
+    }
+
+    #[test]
+    fn database_locked_is_not_classified_as_database_busy() {
+        let error = SqliteImmediateTxAcquireError {
+            source: SqliteError::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+                Some("same-connection lock".to_string()),
+            ),
+            waited: Duration::ZERO,
+        };
+        assert_eq!(error.code(), Some(ErrorCode::DatabaseLocked));
+        assert_eq!(error.extended_code(), Some(rusqlite::ffi::SQLITE_LOCKED));
+        assert!(!error.is_database_busy());
     }
 
     #[test]
