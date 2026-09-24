@@ -187,7 +187,9 @@ interface GraphState {
 
 interface PreviewModalOptions {
   modalId: string;
-  canvasId: string;
+  stageId: string;
+  thumbnailId: string;
+  imageId: string;
   closeId: string;
   zoomId: string;
   minScale: number;
@@ -197,15 +199,21 @@ interface PreviewModalOptions {
   postToParent: boolean;
 }
 
+interface PreviewImageRequest {
+  imageId: string;
+  thumbnailUrl: string;
+  thumbnailFallbackUrl: string;
+  originalUrl: string;
+  width: number;
+  height: number;
+  alt: string;
+  onOriginalReady?: () => void;
+  onOriginalError?: () => void;
+}
+
 interface FishController {
   suggestion: string;
   update?: () => void;
-}
-
-class TerminalImageUnavailableError extends Error {
-  constructor(readonly imageId: string) {
-    super('Изображение исключено из галереи из-за ошибки файла.');
-  }
 }
 
 interface TagChipOptions {
@@ -218,17 +226,21 @@ interface TagChipOptions {
 }
 
 /*!
- * PreviewModal standalone lightbox for canvas images.
+ * PreviewModal standalone lightbox for progressive native images.
  *
  * Required HTML contract:
  * - #preview-modal            (overlay root)
  * - #preview-close            (close button)
- * - #preview-modal-canvas     (canvas used inside lightbox)
+ * - #preview-image-stage      (positioned zoom/pan surface)
+ * - #preview-modal-thumbnail  (temporary thumbnail)
+ * - #preview-modal-image      (full-quality original)
  * - #zoom-level               (zoom label, e.g. "100%")
  */
 const PREVIEW_MODAL_DEFAULTS: PreviewModalOptions = {
   modalId: "preview-modal",
-  canvasId: "preview-modal-canvas",
+  stageId: "preview-image-stage",
+  thumbnailId: "preview-modal-thumbnail",
+  imageId: "preview-modal-image",
   closeId: "preview-close",
   zoomId: "zoom-level",
   minScale: 0.1,
@@ -393,12 +405,6 @@ function actionValue(el: HTMLElement): string | undefined {
   return undefined;
 }
 
-function getCanvas2DContext(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Could not obtain 2D context from preview canvas.");
-  return ctx;
-}
-
 function eventTargetElement(event: Event): HTMLElement | null {
   return event.target instanceof HTMLElement ? event.target : null;
 }
@@ -414,10 +420,11 @@ function isTextEntryTarget(target: EventTarget | null): boolean {
 class PreviewModal {
   readonly options: PreviewModalOptions;
   readonly modal: HTMLElement;
-  readonly canvas: HTMLCanvasElement;
+  readonly stage: HTMLElement;
+  readonly thumbnail: HTMLImageElement;
+  readonly image: HTMLImageElement;
   readonly closeBtn: HTMLElement;
   readonly zoomLevel: HTMLElement;
-  readonly ctx: CanvasRenderingContext2D;
   readonly onClosed?: () => void;
   isOpen = false;
   scale = 1;
@@ -436,6 +443,10 @@ class PreviewModal {
   containerWidth = 0;
   containerHeight = 0;
 
+  private generation = 0;
+  private thumbnailRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private thumbnailObjectUrl: string | null = null;
+
   private readonly boundWheel = this.handleWheel.bind(this);
   private readonly boundMouseDown = this.handleMouseDown.bind(this);
   private readonly boundMouseMove = this.handleMouseMove.bind(this);
@@ -443,14 +454,16 @@ class PreviewModal {
   private readonly boundKeyDown = this.handleKeyDown.bind(this);
   private readonly boundBackdropClick = this.handleBackdropClick.bind(this);
   private readonly boundCloseClick = this.close.bind(this);
+  private readonly boundResize = this.handleResize.bind(this);
 
   constructor(options: Partial<PreviewModalOptions> = {}, onClosed?: () => void) {
     this.options = {...PREVIEW_MODAL_DEFAULTS, ...options};
     this.modal = requireElement(this.options.modalId, HTMLElement, "Preview modal element is missing");
-    this.canvas = requireElement(this.options.canvasId, HTMLCanvasElement, "Preview modal canvas is missing");
+    this.stage = requireElement(this.options.stageId, HTMLElement, "Preview image stage is missing");
+    this.thumbnail = requireElement(this.options.thumbnailId, HTMLImageElement, "Preview thumbnail is missing");
+    this.image = requireElement(this.options.imageId, HTMLImageElement, "Preview original image is missing");
     this.closeBtn = requireElement(this.options.closeId, HTMLElement, "Preview close button is missing");
     this.zoomLevel = requireElement(this.options.zoomId, HTMLElement, "Preview zoom label is missing");
-    this.ctx = getCanvas2DContext(this.canvas);
     this.minScale = Number(this.options.minScale);
     this.maxScale = Number(this.options.maxScale);
     this.onClosed = onClosed;
@@ -469,11 +482,12 @@ class PreviewModal {
     this.closeBtn.addEventListener("click", this.boundCloseClick);
     this.modal.addEventListener("click", this.boundBackdropClick);
     document.addEventListener("keydown", this.boundKeyDown);
-    this.canvas.addEventListener("wheel", this.boundWheel, { passive: false });
-    this.canvas.addEventListener("mousedown", this.boundMouseDown);
-    this.canvas.addEventListener("mousemove", this.boundMouseMove);
-    this.canvas.addEventListener("mouseup", this.boundMouseUp);
-    this.canvas.addEventListener("mouseleave", this.boundMouseUp);
+    this.stage.addEventListener("wheel", this.boundWheel, { passive: false });
+    this.stage.addEventListener("mousedown", this.boundMouseDown);
+    this.stage.addEventListener("mousemove", this.boundMouseMove);
+    this.stage.addEventListener("mouseup", this.boundMouseUp);
+    this.stage.addEventListener("mouseleave", this.boundMouseUp);
+    window.addEventListener("resize", this.boundResize);
   }
 
   private handleBackdropClick(event: MouseEvent): void {
@@ -484,13 +498,11 @@ class PreviewModal {
     if (event.key === "Escape" && this.isOpen) this.close();
   }
 
-  open(sourceCanvas: HTMLCanvasElement): void {
-    if (!(sourceCanvas instanceof HTMLCanvasElement)) {
-      throw new TypeError("PreviewModal.open(sourceCanvas) expects an HTMLCanvasElement.");
-    }
-    this.imageWidth = sourceCanvas.width;
-    this.imageHeight = sourceCanvas.height;
-    if (!this.imageWidth || !this.imageHeight) throw new Error("Source canvas is empty.");
+  open(source: PreviewImageRequest): void {
+    this.releaseMedia(false);
+    const generation = this.generation;
+    this.imageWidth = Math.max(1, source.width);
+    this.imageHeight = Math.max(1, source.height);
     this.containerWidth = window.innerWidth;
     this.containerHeight = window.innerHeight;
     let fill = Number(this.options.initialViewportFill);
@@ -499,28 +511,55 @@ class PreviewModal {
     const targetHeight = this.containerHeight * fill;
     const scaleX = targetWidth / this.imageWidth;
     const scaleY = targetHeight / this.imageHeight;
-    this.scale = clamp(Math.min(scaleX, scaleY), this.minScale, this.maxScale);
+    const fitScale = Math.min(scaleX, scaleY);
+    this.minScale = Math.min(Number(this.options.minScale), fitScale);
+    this.scale = clamp(fitScale, this.minScale, this.maxScale);
     this.offsetX = (this.containerWidth - this.imageWidth * this.scale) / 2;
     this.offsetY = (this.containerHeight - this.imageHeight * this.scale) / 2;
-    this.canvas.width = this.imageWidth;
-    this.canvas.height = this.imageHeight;
-    this.ctx.clearRect(0, 0, this.imageWidth, this.imageHeight);
-    this.ctx.drawImage(sourceCanvas, 0, 0);
+    this.modal.dataset.imageId = source.imageId;
+    this.stage.dataset.imageId = source.imageId;
+    this.stage.dataset.originalState = "loading";
+    this.stage.classList.remove("original-ready");
+    this.thumbnail.dataset.state = "loading";
+    this.thumbnail.alt = source.alt;
+    this.image.dataset.state = "loading";
+    this.image.alt = source.alt;
     this.modal.style.display = "flex";
     this.isOpen = true;
     this.notifyShell(true);
     this.render();
-  }
 
-  update(sourceCanvas: HTMLCanvasElement): void {
-    if (!this.isOpen) return;
-    if (!(sourceCanvas instanceof HTMLCanvasElement)) return;
-    if (sourceCanvas.width !== this.imageWidth || sourceCanvas.height !== this.imageHeight) {
-      this.open(sourceCanvas);
-      return;
-    }
-    this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    this.ctx.drawImage(sourceCanvas, 0, 0);
+    this.thumbnail.onload = () => {
+      if (!this.isCurrent(generation, source.imageId)) return;
+      this.thumbnail.dataset.state = "ready";
+    };
+    this.thumbnail.onerror = () => {
+      if (!this.isCurrent(generation, source.imageId)) return;
+      this.thumbnail.onload = null;
+      this.thumbnail.onerror = null;
+      void this.loadFallbackThumbnail(source, generation);
+    };
+    this.thumbnail.src = source.thumbnailUrl;
+
+    this.image.onload = () => {
+      if (!this.isCurrent(generation, source.imageId)) return;
+      const naturalWidth = this.image.naturalWidth || this.imageWidth;
+      const naturalHeight = this.image.naturalHeight || this.imageHeight;
+      this.adoptNaturalDimensions(naturalWidth, naturalHeight);
+      this.image.dataset.state = "ready";
+      this.stage.dataset.originalState = "ready";
+      this.stage.classList.add("original-ready");
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        if (this.isCurrent(generation, source.imageId)) source.onOriginalReady?.();
+      }));
+    };
+    this.image.onerror = () => {
+      if (!this.isCurrent(generation, source.imageId)) return;
+      this.image.dataset.state = "error";
+      this.stage.dataset.originalState = "error";
+      source.onOriginalError?.();
+    };
+    this.image.src = source.originalUrl;
   }
 
   close(): void {
@@ -529,8 +568,99 @@ class PreviewModal {
     this.isOpen = false;
     this.isDragging = false;
     this.hasDragged = false;
+    const generation = this.releaseMedia(false);
+    this.releaseSourcesAfterPaint(generation);
     this.notifyShell(false);
     if (wasOpen) this.onClosed?.();
+  }
+
+  private isCurrent(generation: number, imageId: string): boolean {
+    return this.isOpen && this.generation === generation && this.modal.dataset.imageId === imageId;
+  }
+
+  private releaseMedia(removeSources = true): number {
+    this.generation += 1;
+    if (this.thumbnailRetryTimer) clearTimeout(this.thumbnailRetryTimer);
+    this.thumbnailRetryTimer = null;
+    if (this.thumbnailObjectUrl) URL.revokeObjectURL(this.thumbnailObjectUrl);
+    this.thumbnailObjectUrl = null;
+    this.thumbnail.onload = null;
+    this.thumbnail.onerror = null;
+    this.image.onload = null;
+    this.image.onerror = null;
+    if (removeSources) {
+      this.thumbnail.removeAttribute("src");
+      this.image.removeAttribute("src");
+    }
+    this.thumbnail.dataset.state = "idle";
+    this.image.dataset.state = "idle";
+    this.stage.dataset.originalState = "idle";
+    this.stage.classList.remove("original-ready");
+    delete this.modal.dataset.imageId;
+    delete this.stage.dataset.imageId;
+    return this.generation;
+  }
+
+  private releaseSourcesAfterPaint(generation: number): void {
+    requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(() => {
+      if (this.generation !== generation || this.isOpen) return;
+      this.thumbnail.removeAttribute("src");
+      this.image.removeAttribute("src");
+    }, 0)));
+  }
+
+  private async loadFallbackThumbnail(source: PreviewImageRequest, generation: number, attempt = 0): Promise<void> {
+    try {
+      const response = await fetch(source.thumbnailFallbackUrl, {cache: "no-store"});
+      if (!this.isCurrent(generation, source.imageId)) return;
+      if (response.status === 200) {
+        const objectUrl = URL.createObjectURL(await response.blob());
+        if (!this.isCurrent(generation, source.imageId)) {
+          URL.revokeObjectURL(objectUrl);
+          return;
+        }
+        this.thumbnailObjectUrl = objectUrl;
+        this.thumbnail.onload = () => {
+          if (!this.isCurrent(generation, source.imageId)) return;
+          this.thumbnail.dataset.state = "ready";
+          URL.revokeObjectURL(objectUrl);
+          if (this.thumbnailObjectUrl === objectUrl) this.thumbnailObjectUrl = null;
+        };
+        this.thumbnail.onerror = () => {
+          URL.revokeObjectURL(objectUrl);
+          if (this.thumbnailObjectUrl === objectUrl) this.thumbnailObjectUrl = null;
+          if (this.isCurrent(generation, source.imageId)) this.thumbnail.dataset.state = "error";
+        };
+        this.thumbnail.src = objectUrl;
+        return;
+      }
+      if (response.status === 202 && attempt < 120) {
+        const payload = await readJsonRecord(response).catch((): JsonRecord => ({}));
+        const delay = Math.min(1500, Math.max(80, Number(payload.retry_after_ms || 180)));
+        this.thumbnailRetryTimer = setTimeout(() => {
+          this.thumbnailRetryTimer = null;
+          if (this.isCurrent(generation, source.imageId)) {
+            void this.loadFallbackThumbnail(source, generation, attempt + 1);
+          }
+        }, delay);
+        return;
+      }
+    } catch (error) {
+      console.warn("Preview thumbnail request failed", {imageId: source.imageId, attempt, error});
+    }
+    if (this.isCurrent(generation, source.imageId)) this.thumbnail.dataset.state = "error";
+  }
+
+  private adoptNaturalDimensions(width: number, height: number): void {
+    if (width <= 0 || height <= 0 || (width === this.imageWidth && height === this.imageHeight)) return;
+    const centerX = (this.containerWidth / 2 - this.offsetX) / (this.imageWidth * this.scale);
+    const centerY = (this.containerHeight / 2 - this.offsetY) / (this.imageHeight * this.scale);
+    this.imageWidth = width;
+    this.imageHeight = height;
+    this.offsetX = this.containerWidth / 2 - centerX * this.imageWidth * this.scale;
+    this.offsetY = this.containerHeight / 2 - centerY * this.imageHeight * this.scale;
+    this.constrainOffset();
+    this.render();
   }
 
   private zoomAt(mouseX: number, mouseY: number, factor: number): void {
@@ -559,7 +689,7 @@ class PreviewModal {
     this.dragStartY = event.clientY;
     this.lastX = event.clientX;
     this.lastY = event.clientY;
-    this.canvas.style.cursor = "grabbing";
+    this.stage.style.cursor = "grabbing";
   }
 
   private handleMouseMove(event: MouseEvent): void {
@@ -583,7 +713,19 @@ class PreviewModal {
     if (!this.isDragging) return;
     if (!this.hasDragged) this.zoomAt(event.clientX, event.clientY, 1.5);
     this.isDragging = false;
-    this.canvas.style.cursor = "grab";
+    this.stage.style.cursor = "grab";
+  }
+
+  private handleResize(): void {
+    if (!this.isOpen) return;
+    const centerX = (this.containerWidth / 2 - this.offsetX) / (this.imageWidth * this.scale);
+    const centerY = (this.containerHeight / 2 - this.offsetY) / (this.imageHeight * this.scale);
+    this.containerWidth = window.innerWidth;
+    this.containerHeight = window.innerHeight;
+    this.offsetX = this.containerWidth / 2 - centerX * this.imageWidth * this.scale;
+    this.offsetY = this.containerHeight / 2 - centerY * this.imageHeight * this.scale;
+    this.constrainOffset();
+    this.render();
   }
 
   private constrainOffset(): void {
@@ -603,10 +745,10 @@ class PreviewModal {
     if (!this.isOpen) return;
     const scaledWidth = this.imageWidth * this.scale;
     const scaledHeight = this.imageHeight * this.scale;
-    this.canvas.style.width = `${scaledWidth}px`;
-    this.canvas.style.height = `${scaledHeight}px`;
-    this.canvas.style.left = `${this.offsetX}px`;
-    this.canvas.style.top = `${this.offsetY}px`;
+    this.stage.style.width = `${scaledWidth}px`;
+    this.stage.style.height = `${scaledHeight}px`;
+    this.stage.style.left = `${this.offsetX}px`;
+    this.stage.style.top = `${this.offsetY}px`;
     this.zoomLevel.textContent = `${Math.round(this.scale * 100)}%`;
   }
 }
@@ -678,8 +820,6 @@ const PAGE = 48;
 const MASONRY_COL_MIN = 230;
 const GALLERY_OVERSCAN = 20;
 const CARD_BORDER_WIDTH = 1;
-const canvasCache = new Map<string, Promise<HTMLCanvasElement>>();
-const MAX_CANVAS_CACHE = 9;
 const SORT_MODES: SortMode[] = ['path_asc', 'path_desc', 'date_desc', 'date_asc', 'size_desc', 'size_asc'];
 const DEFAULT_SORT_MODE: SortMode = 'date_desc';
 
@@ -1123,7 +1263,6 @@ function applyLiveImage(image: ImageItem, operation: 'created' | 'updated'): voi
   if (serverTotalKnown && operation === 'created' && !existingWasVisible && imageMatchesActiveTab(image)) {
     serverTotal += 1;
   }
-  canvasCache.delete(image.id);
   renderLiveGalleryState();
   scheduleLiveFolderRefresh();
   scheduleLiveTagRefresh();
@@ -1139,7 +1278,6 @@ function removeLiveImage(imageId: string, removedImage: ImageItem | null): void 
   if (serverTotalKnown && (wasVisible || (removedImage && imageMatchesActiveTab(removedImage)))) {
     serverTotal = Math.max(0, serverTotal - 1);
   }
-  canvasCache.delete(imageId);
   if (activeTab().lastImageId === imageId) closePreview(true);
   renderLiveGalleryState();
   scheduleLiveFolderRefresh();
@@ -1618,6 +1756,14 @@ function loadNextImagesPage(): Promise<void> {
   return activePageLoad;
 }
 
+function thumbnailUrls(img: ImageItem): {primary: string; fallback: string} {
+  const version = Number(img.mtime || 0);
+  return {
+    primary: `${img.thumb_url || `/thumb-file/${img.id}.jpg`}?v=${version}`,
+    fallback: `/thumb/${img.id}?v=${version}`,
+  };
+}
+
 function makeCard(img: ImageItem, highPriority = false): HTMLElement {
   const card = document.createElement('article');
   card.className = 'card';
@@ -1626,9 +1772,8 @@ function makeCard(img: ImageItem, highPriority = false): HTMLElement {
   const ph = document.createElement('img');
   ph.className = 'lazy';
   ph.dataset.imageId = img.id;
-  const version = Number(img.mtime || 0);
-  const source = `${img.thumb_url || `/thumb-file/${img.id}.jpg`}?v=${version}`;
-  ph.dataset.fallbackSrc = `/thumb/${img.id}?v=${version}`;
+  const sources = thumbnailUrls(img);
+  ph.dataset.fallbackSrc = sources.fallback;
   ph.alt = name;
   ph.decoding = 'async';
   ph.loading = 'eager';
@@ -1659,7 +1804,7 @@ function makeCard(img: ImageItem, highPriority = false): HTMLElement {
     ph.classList.add('loaded');
     ph.alt = 'Ошибка загрузки';
   };
-  ph.src = source;
+  ph.src = sources.primary;
   return card;
 }
 
@@ -1750,7 +1895,6 @@ function handleTerminalImageUnavailable(imageId: string): void {
   const timer = thumbRetryTimers.get(imageId);
   if (timer) clearTimeout(timer);
   thumbRetryTimers.delete(imageId);
-  canvasCache.delete(imageId);
   if (activeTab().lastImageId === imageId || lightboxImages[lbIndex]?.id === imageId) {
     previewRequestToken += 1;
     closePreview(true);
@@ -2867,7 +3011,7 @@ function openLightboxById(imageId: string, persist = true): void {
   void openLightbox(idx, persist, sourceList);
 }
 
-async function openLightbox(idx: number, persist = true, sourceList: ImageItem[] = visibleImages): Promise<void> {
+function openLightbox(idx: number, persist = true, sourceList: ImageItem[] = visibleImages): void {
   const nextSource = Array.isArray(sourceList) && sourceList.length ? sourceList : visibleImages;
   if (!Number.isInteger(idx) || idx < 0 || idx >= nextSource.length) {
     console.warn('openLightbox: invalid image index', {
@@ -2885,22 +3029,60 @@ async function openLightbox(idx: number, persist = true, sourceList: ImageItem[]
   renderPreviewMeta(img, true);
   document.body.style.overflow = 'hidden';
   const token = ++previewRequestToken;
+  if (!previewModal) return;
+  const sources = thumbnailUrls(img);
+  previewModal.open({
+    imageId: img.id,
+    thumbnailUrl: sources.primary,
+    thumbnailFallbackUrl: sources.fallback,
+    originalUrl: `/file/${img.id}`,
+    width: Number(img.width || 1),
+    height: Number(img.height || 1),
+    alt: fileName(img.path),
+    onOriginalReady: () => {
+      if (!isCurrentPreviewRequest(img.id, token)) return;
+      renderPreviewMeta(img, false);
+    },
+    onOriginalError: () => {
+      if (isCurrentPreviewRequest(img.id, token)) void diagnosePreviewOriginalFailure(img, token);
+    },
+  });
+  if (persist) saveSessionSoon();
+}
+
+function isCurrentPreviewRequest(imageId: string, token: number): boolean {
+  return token === previewRequestToken
+    && Boolean(previewModal?.isOpen)
+    && previewModal?.modal.dataset.imageId === imageId
+    && lightboxImages[lbIndex]?.id === imageId;
+}
+
+async function diagnosePreviewOriginalFailure(img: ImageItem, token: number): Promise<void> {
+  const originalUrl = `/file/${img.id}`;
+  let message: string;
   try {
-    const canvas = await getOriginalCanvas(img);
-    if (token !== previewRequestToken || !lightboxImages[lbIndex] || lightboxImages[lbIndex].id !== img.id) return;
-    if (!previewModal) return;
-    previewModal.open(canvas);
-    renderPreviewMeta(img, false);
-    if (persist) saveSessionSoon();
-    preloadPreviewNeighbors(idx);
-  } catch (e) {
-    console.error(e);
-    if (e instanceof TerminalImageUnavailableError) return;
-    alert('Не удалось открыть изображение: ' + errorMessage(e));
+    const response = await fetch(originalUrl, {method: 'HEAD', cache: 'no-store'});
+    if (!isCurrentPreviewRequest(img.id, token)) return;
+    if (response.status === 422) {
+      handleTerminalImageUnavailable(img.id);
+      return;
+    }
+    message = response.status === 404
+      ? `Оригинал недоступен: ${img.path} (${originalUrl})`
+      : response.ok
+        ? `Не удалось декодировать оригинал: ${img.path} (${originalUrl})`
+        : `Не удалось загрузить оригинал (${response.status}): ${img.path} (${originalUrl})`;
+  } catch (error) {
+    if (!isCurrentPreviewRequest(img.id, token)) return;
+    message = `Не удалось проверить оригинал: ${errorMessage(error)}`;
   }
+  requiredHtml('preview-name').textContent = `Ошибка оригинала: ${fileName(img.path)}`;
+  console.error(message);
+  alert('Не удалось открыть изображение: ' + message);
 }
 
 function closePreview(clearLast = true): void {
+  previewRequestToken += 1;
   suppressPreviewCloseClear = !clearLast;
   if (previewModal && previewModal.isOpen) previewModal.close();
   suppressPreviewCloseClear = false;
@@ -2911,6 +3093,7 @@ function closePreview(clearLast = true): void {
 }
 
 function handlePreviewClosed(): void {
+  previewRequestToken += 1;
   document.body.style.overflow = '';
   togglePreviewTagDropdown(false);
   lightboxImages = [];
@@ -3033,74 +3216,6 @@ function updateImageTags(id: string, updated: JsonRecord): void {
     updateCardForImage(updatedImage);
     updateFishGhosts();
   }
-}
-
-function getOriginalCanvas(img: ImageItem): Promise<HTMLCanvasElement> {
-  const cached = canvasCache.get(img.id);
-  if (cached) return cached;
-  const originalUrl = `/file/${img.id}`;
-  const promise = (async () => {
-    const response = await fetch(originalUrl);
-    if (!response.ok) {
-      if (response.status === 422) {
-        const payload = await readJsonRecord(response).catch((): JsonRecord => ({}));
-        if (payload.error === 'image_unavailable') {
-          handleTerminalImageUnavailable(img.id);
-          throw new TerminalImageUnavailableError(img.id);
-        }
-      }
-      if (response.status === 404) {
-        throw new Error(`Оригинал недоступен: ${img.path} (${originalUrl})`);
-      }
-      throw new Error(`Не удалось загрузить оригинал (${response.status}): ${img.path} (${originalUrl})`);
-    }
-    const blob = await response.blob();
-    return await new Promise<HTMLCanvasElement>((resolve, reject) => {
-      const image = new Image();
-      const objectUrl = URL.createObjectURL(blob);
-      image.decoding = 'async';
-      image.onload = () => {
-        URL.revokeObjectURL(objectUrl);
-        const canvas = document.createElement('canvas');
-        canvas.width = image.naturalWidth || img.width || 1;
-        canvas.height = image.naturalHeight || img.height || 1;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          reject(new Error(`Не удалось открыть canvas для ${img.path}`));
-          return;
-        }
-        ctx.drawImage(image, 0, 0);
-        resolve(canvas);
-        trimCanvasCache();
-      };
-      image.onerror = () => {
-        URL.revokeObjectURL(objectUrl);
-        reject(new Error(`Не удалось декодировать оригинал: ${img.path} (${originalUrl})`));
-      };
-      image.src = objectUrl;
-    });
-  })();
-  canvasCache.set(img.id, promise);
-  promise.catch(() => {
-    if (canvasCache.get(img.id) === promise) canvasCache.delete(img.id);
-  });
-  trimCanvasCache();
-  return promise;
-}
-
-function trimCanvasCache() {
-  while (canvasCache.size > MAX_CANVAS_CACHE) {
-    const first = canvasCache.keys().next().value;
-    if (first !== undefined) canvasCache.delete(first);
-  }
-}
-
-function preloadPreviewNeighbors(idx: number): void {
-  const source = lightboxImages.length ? lightboxImages : visibleImages;
-  [-2, -1, 1, 2].forEach(offset => {
-    const img = source[idx + offset];
-    if (img) getOriginalCanvas(img).catch(() => {});
-  });
 }
 
 function restorePreviewIfNeeded(): void {

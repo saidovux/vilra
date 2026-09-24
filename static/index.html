@@ -232,7 +232,10 @@
 <div id="preview-modal">
   <button id="preview-close" class="btn btn-ghost icon-btn" title="Закрыть">×</button>
   <button id="preview-prev" title="Назад" data-action="preview-nav" data-dir="-1">‹</button>
-  <canvas id="preview-modal-canvas"></canvas>
+  <div id="preview-image-stage">
+    <img id="preview-modal-thumbnail" alt="" draggable="false">
+    <img id="preview-modal-image" alt="" draggable="false">
+  </div>
   <button id="preview-next" title="Вперед" data-action="preview-nav" data-dir="1">›</button>
   <div id="preview-dock">
     <div class="preview-info">
