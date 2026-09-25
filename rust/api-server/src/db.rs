@@ -18,11 +18,12 @@ use tagimage_db::sqlite::{
     folder_sqlite_tree_rows, get_sqlite_file_issue_by_id, get_sqlite_file_issue_for_image,
     get_sqlite_image_by_id, get_sqlite_image_by_id_including_hidden, get_sqlite_job_api_value,
     list_sqlite_file_issue_recheck_targets, list_sqlite_jobs, list_sqlite_thumb_rebuild_rows,
-    load_sqlite_session, open_sqlite_runtime_db, query_sqlite_file_issues,
-    query_sqlite_images_page, save_sqlite_session_value, set_sqlite_session_root,
+    load_sqlite_session, mutate_sqlite_session_value_with_root, open_sqlite_runtime_db,
+    query_sqlite_file_issues, query_sqlite_images_page, set_sqlite_session_root,
     sqlite_roots_from_session, summarize_sqlite_file_issues, tag_sqlite_summary_rows,
     update_sqlite_tag_definition, SqliteAutoTagCleanupResult, SqliteFileIssue,
     SqliteFileIssueRecheckTarget, SqliteImageRecord, SqliteImagesQuery, SqliteSession,
+    SqliteSessionMutation,
 };
 
 const VALID_JOB_STATES: &[&str] = &["queued", "running", "succeeded", "failed", "canceled"];
@@ -44,6 +45,12 @@ pub struct Session {
     pub tabs: Value,
     pub active_tab_id: Option<String>,
     pub folder_tag_sync: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionMutation {
+    pub before: Session,
+    pub after: Session,
 }
 
 #[derive(Debug, Clone)]
@@ -266,9 +273,17 @@ pub fn load_session(conn: &Connection) -> Result<Session, ApiError> {
         .map_err(map_db_error)
 }
 
-pub fn save_session_value(conn: &Connection, fields: &Value) -> Result<Session, ApiError> {
-    save_sqlite_session_value(conn, fields)
-        .map(session_from_sqlite)
+pub fn mutate_session_value(
+    conn: &Connection,
+    fields: &Value,
+    root_path: Option<&Path>,
+    append_root: bool,
+) -> Result<SessionMutation, ApiError> {
+    mutate_sqlite_session_value_with_root(conn, fields, root_path, append_root)
+        .map(|SqliteSessionMutation { before, after }| SessionMutation {
+            before: session_from_sqlite(before),
+            after: session_from_sqlite(after),
+        })
         .map_err(map_db_error)
 }
 

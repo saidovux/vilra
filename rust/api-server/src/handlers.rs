@@ -344,13 +344,19 @@ pub async fn create_tag(
     let name = payload
         .get("name")
         .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::bad_request("Tag name is empty"))?;
-    let client = state.connect()?;
-    let tag = db::create_user_tag_entry(&client, name)?;
-    Ok(json_response(json!({
-        "tag": tag,
-        "tags": db::tag_summary_rows(&client)?,
-    })))
+        .ok_or_else(|| ApiError::bad_request("Tag name is empty"))?
+        .to_string();
+    let value = tokio::task::spawn_blocking(move || {
+        let client = state.connect()?;
+        let tag = db::create_user_tag_entry(&client, &name)?;
+        Ok::<_, ApiError>(json!({
+            "tag": tag,
+            "tags": db::tag_summary_rows(&client)?,
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Create tag task failed: {error}")))??;
+    Ok(json_response(value))
 }
 
 pub async fn update_tag(
@@ -358,12 +364,17 @@ pub async fn update_tag(
     Path(tag): Path<String>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let client = state.connect()?;
-    let tag_summary = db::update_tag_definition(&client, &tag, &payload)?;
-    Ok(json_response(json!({
-        "tag": tag_summary,
-        "tags": db::tag_summary_rows(&client)?,
-    })))
+    let value = tokio::task::spawn_blocking(move || {
+        let client = state.connect()?;
+        let tag_summary = db::update_tag_definition(&client, &tag, &payload)?;
+        Ok::<_, ApiError>(json!({
+            "tag": tag_summary,
+            "tags": db::tag_summary_rows(&client)?,
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Update tag task failed: {error}")))??;
+    Ok(json_response(value))
 }
 
 pub async fn delete_tag(
@@ -412,29 +423,34 @@ pub async fn set_image_tags(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let client = state.connect()?;
-    let image = get_image_record(&client, &img_id)?
-        .ok_or_else(|| ApiError::not_found("Image not found"))?;
-    let user_tags = clean_tag_list(&tags);
-    db::replace_image_user_tags(&client, &img_id, &user_tags)?;
-    let rows = vec![ImageRow {
-        id: image.id.clone(),
-        path: image.path,
-        thumb: image.thumb,
-        size: image.size,
-        mtime: image.mtime,
-        width: image.width,
-        height: image.height,
-    }];
-    let refreshed = db::rows_to_images(&client, rows)?;
-    let image = refreshed.into_iter().next().unwrap_or_else(|| json!({}));
-    Ok(json_response(json!({
-        "id": img_id,
-        "tags": image["tags"],
-        "auto_tags": image["auto_tags"],
-        "folder_tags": image["auto_tags"],
-        "user_tags": image["user_tags"],
-    })))
+    let value = tokio::task::spawn_blocking(move || {
+        let client = state.connect()?;
+        let image = get_image_record(&client, &img_id)?
+            .ok_or_else(|| ApiError::not_found("Image not found"))?;
+        let user_tags = clean_tag_list(&tags);
+        db::replace_image_user_tags(&client, &img_id, &user_tags)?;
+        let rows = vec![ImageRow {
+            id: image.id.clone(),
+            path: image.path,
+            thumb: image.thumb,
+            size: image.size,
+            mtime: image.mtime,
+            width: image.width,
+            height: image.height,
+        }];
+        let refreshed = db::rows_to_images(&client, rows)?;
+        let image = refreshed.into_iter().next().unwrap_or_else(|| json!({}));
+        Ok::<_, ApiError>(json!({
+            "id": img_id,
+            "tags": image["tags"],
+            "auto_tags": image["auto_tags"],
+            "folder_tags": image["auto_tags"],
+            "user_tags": image["user_tags"],
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Set image tags task failed: {error}")))??;
+    Ok(json_response(value))
 }
 
 pub async fn get_session(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
@@ -452,24 +468,29 @@ pub async fn patch_session(
     let Some(object) = payload.as_object() else {
         return Err(ApiError::bad_request("Request body must be an object"));
     };
-    let client = state.connect()?;
-    let previous = db::load_session(&client)?;
-    let mut payload = Value::Object(object.clone());
-    if let Some(root_path) = payload.get("root_path").and_then(Value::as_str) {
-        if !root_path.is_empty() {
-            let session = set_root(&client, root_path, true)?;
-            if let Some(root) = session.root_path.as_deref() {
-                state
-                    .live
-                    .add_root(PathBuf::from(root))
-                    .map_err(ApiError::internal)?;
-            }
-            payload["root_path"] = json!(session.root_path);
-            payload["root_paths"] = json!(session.root_paths);
+    let root_path = object
+        .get("root_path")
+        .and_then(Value::as_str)
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from);
+    let db_state = state.clone();
+    let db_root_path = root_path.clone();
+    let mutation = tokio::task::spawn_blocking(move || {
+        let client = db_state.connect()?;
+        db::mutate_session_value(&client, &payload, db_root_path.as_deref(), true)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Patch session task failed: {error}")))??;
+    let session = mutation.after;
+    if root_path.is_some() {
+        if let Some(root) = session.root_path.as_deref() {
+            state
+                .live
+                .add_root(PathBuf::from(root))
+                .map_err(ApiError::internal)?;
         }
     }
-    let session = db::save_session_value(&client, &payload)?;
-    if session.folder_tag_sync != previous.folder_tag_sync {
+    if session.folder_tag_sync != mutation.before.folder_tag_sync {
         state.events.publish(
             "settings_changed",
             json!({"folder_tag_sync": session.folder_tag_sync}),
@@ -546,9 +567,6 @@ pub async fn rebuild_thumbs(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let client = state.connect()?;
-    let session = db::load_session(&client)?;
-    let roots = require_roots(&session)?;
     let input = ThumbRebuildInput {
         stale_only: payload
             .get("stale_only")
@@ -556,8 +574,15 @@ pub async fn rebuild_thumbs(
             .unwrap_or(true),
         limit: payload.get("limit").and_then(Value::as_i64),
     };
-    let result =
-        db::enqueue_thumb_rebuild_jobs(&client, &roots, input, state.config.thumb_max_attempts)?;
+    let max_attempts = state.config.thumb_max_attempts;
+    let result = tokio::task::spawn_blocking(move || {
+        let client = state.connect()?;
+        let session = db::load_session(&client)?;
+        let roots = require_roots(&session)?;
+        db::enqueue_thumb_rebuild_jobs(&client, &roots, input, max_attempts)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Rebuild thumbnails task failed: {error}")))??;
     Ok(json_response(json!({
         "ok": true,
         "enqueued": result.enqueued,

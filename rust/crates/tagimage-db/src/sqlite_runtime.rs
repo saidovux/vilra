@@ -57,6 +57,12 @@ pub struct SqliteSession {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct SqliteSessionMutation {
+    pub before: SqliteSession,
+    pub after: SqliteSession,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SqliteImageRecord {
     pub id: String,
     pub root_path: String,
@@ -2082,15 +2088,70 @@ pub fn save_sqlite_session_value(
     conn: &Connection,
     fields: &JsonValue,
 ) -> Result<SqliteSession, String> {
-    let mut session = load_sqlite_session(conn)?;
     let object = fields
         .as_object()
         .ok_or_else(|| "Request body must be an object".to_string())?;
-    if let Some(value) = object.get("root_path") {
-        session.root_path = value.as_str().map(|item| item.to_string());
-    }
-    if let Some(value) = object.get("root_paths") {
-        session.root_paths = string_array(value).unwrap_or_default();
+    Ok(mutate_sqlite_session(conn, |session| {
+        apply_sqlite_session_fields(session, object, false);
+        Ok(())
+    })?
+    .after)
+}
+
+pub fn mutate_sqlite_session_value(
+    conn: &Connection,
+    fields: &JsonValue,
+) -> Result<SqliteSessionMutation, String> {
+    mutate_sqlite_session_value_with_root(conn, fields, None, true)
+}
+
+pub fn mutate_sqlite_session_value_with_root(
+    conn: &Connection,
+    fields: &JsonValue,
+    root_path: Option<&Path>,
+    append_root: bool,
+) -> Result<SqliteSessionMutation, String> {
+    let object = fields
+        .as_object()
+        .ok_or_else(|| "Request body must be an object".to_string())?;
+    let canonical_root = root_path
+        .map(canonicalize_sqlite_session_root)
+        .transpose()?;
+    mutate_sqlite_session(conn, |session| {
+        if let Some(root) = canonical_root.as_deref() {
+            apply_sqlite_session_root(session, root, append_root);
+        }
+        apply_sqlite_session_fields(session, object, canonical_root.is_some());
+        Ok(())
+    })
+}
+
+fn mutate_sqlite_session(
+    conn: &Connection,
+    mutation: impl FnOnce(&mut SqliteSession) -> Result<(), String>,
+) -> Result<SqliteSessionMutation, String> {
+    with_immediate_tx(conn, || {
+        let before = load_sqlite_session(conn)?;
+        let mut pending = before.clone();
+        mutation(&mut pending)?;
+        persist_sqlite_session_in_tx(conn, &pending)?;
+        let after = load_sqlite_session(conn)?;
+        Ok(SqliteSessionMutation { before, after })
+    })
+}
+
+fn apply_sqlite_session_fields(
+    session: &mut SqliteSession,
+    object: &serde_json::Map<String, JsonValue>,
+    preserve_canonical_root: bool,
+) {
+    if !preserve_canonical_root {
+        if let Some(value) = object.get("root_path") {
+            session.root_path = value.as_str().map(|item| item.to_string());
+        }
+        if let Some(value) = object.get("root_paths") {
+            session.root_paths = string_array(value).unwrap_or_default();
+        }
     }
     if let Some(value) = object.get("search_tags") {
         let tags = string_array(value).unwrap_or_default();
@@ -2128,7 +2189,9 @@ pub fn save_sqlite_session_value(
     if let Some(value) = object.get("folder_tag_sync").and_then(JsonValue::as_bool) {
         session.folder_tag_sync = value;
     }
+}
 
+fn persist_sqlite_session_in_tx(conn: &Connection, session: &SqliteSession) -> Result<(), String> {
     let root_paths = json_text(&session.root_paths)?;
     let search_tags = json_text(&session.search_tags)?;
     let tabs = json_text(&session.tabs)?;
@@ -2151,18 +2214,39 @@ pub fn save_sqlite_session_value(
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         "#,
         params![
-            session.root_path,
+            &session.root_path,
             root_paths,
             search_tags,
-            session.search_mode,
-            session.last_image_id,
+            &session.search_mode,
+            &session.last_image_id,
             tabs,
-            session.active_tab_id,
+            &session.active_tab_id,
             if session.folder_tag_sync { 1 } else { 0 },
         ],
     )
     .map_err(|e| format!("upsert sqlite session: {e}"))?;
-    load_sqlite_session(conn)
+    Ok(())
+}
+
+fn canonicalize_sqlite_session_root(path: &Path) -> Result<String, String> {
+    let root =
+        std::fs::canonicalize(path).map_err(|_| format!("Not a directory: {}", path.display()))?;
+    if !root.is_dir() {
+        return Err(format!("Not a directory: {}", root.display()));
+    }
+    Ok(root.to_string_lossy().to_string())
+}
+
+fn apply_sqlite_session_root(session: &mut SqliteSession, root: &str, append: bool) {
+    if append {
+        if !session.root_paths.iter().any(|item| item == root) {
+            session.root_paths.push(root.to_string());
+        }
+    } else {
+        session.root_paths = vec![root.to_string()];
+    }
+    session.root_path = Some(root.to_string());
+    session.last_image_id = None;
 }
 
 pub fn set_sqlite_session_root(
@@ -2170,28 +2254,7 @@ pub fn set_sqlite_session_root(
     path: &Path,
     append: bool,
 ) -> Result<SqliteSession, String> {
-    let root =
-        std::fs::canonicalize(path).map_err(|_| format!("Not a directory: {}", path.display()))?;
-    if !root.is_dir() {
-        return Err(format!("Not a directory: {}", root.display()));
-    }
-    let root_str = root.to_string_lossy().to_string();
-    let mut session = load_sqlite_session(conn)?;
-    if append {
-        if !session.root_paths.iter().any(|item| item == &root_str) {
-            session.root_paths.push(root_str.clone());
-        }
-    } else {
-        session.root_paths = vec![root_str.clone()];
-    }
-    save_sqlite_session_value(
-        conn,
-        &json!({
-            "root_path": root_str,
-            "root_paths": session.root_paths,
-            "last_image_id": null,
-        }),
-    )
+    Ok(mutate_sqlite_session_value_with_root(conn, &json!({}), Some(path), append)?.after)
 }
 
 pub fn sqlite_roots_from_session(session: &SqliteSession) -> Vec<String> {
@@ -4917,6 +4980,241 @@ mod tests {
         let folders = folder_sqlite_tree_rows(&conn, &[root]).expect("folders");
         assert_eq!(folders[0]["path"], "animals/cat.jpg");
         assert_eq!(folders[1]["path"], "zebra.jpg");
+    }
+
+    #[test]
+    fn concurrent_session_mutations_preserve_different_fields() {
+        let (_dir, db_path) = temp_db_path();
+        drop(init_sqlite_db(&db_path).expect("init"));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let db_a = db_path.clone();
+        let writer_a = std::thread::spawn(move || {
+            let conn = open_sqlite_runtime_db(&db_a).expect("open writer a");
+            mutate_sqlite_session(&conn, |session| {
+                session.search_mode = "all".to_string();
+                entered_tx.send(()).expect("signal transaction entered");
+                release_rx.recv().expect("release writer a");
+                Ok(())
+            })
+            .expect("mutate search mode")
+        });
+        entered_rx.recv().expect("writer a owns immediate tx");
+
+        let (calling_tx, calling_rx) = std::sync::mpsc::channel();
+        let db_b = db_path.clone();
+        let writer_b = std::thread::spawn(move || {
+            let conn = open_sqlite_runtime_db(&db_b).expect("open writer b");
+            calling_tx.send(()).expect("signal writer b call");
+            mutate_sqlite_session_value(&conn, &json!({"folder_tag_sync": false}))
+                .expect("mutate folder sync")
+        });
+        calling_rx.recv().expect("writer b is ready to mutate");
+        release_tx.send(()).expect("commit writer a");
+        let mutation_a = writer_a.join().expect("join writer a");
+        let mutation_b = writer_b.join().expect("join writer b");
+
+        assert_eq!(mutation_a.before.search_mode, "any");
+        assert_eq!(mutation_a.after.search_mode, "all");
+        assert_eq!(mutation_b.before.search_mode, "all");
+        let conn = open_sqlite_runtime_db(&db_path).expect("open final session");
+        let session = load_sqlite_session(&conn).expect("load final session");
+        assert_eq!(session.search_mode, "all");
+        assert!(!session.folder_tag_sync);
+    }
+
+    #[test]
+    fn concurrent_same_session_field_is_serialized_last_commit_wins() {
+        let (_dir, db_path) = temp_db_path();
+        drop(init_sqlite_db(&db_path).expect("init"));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let db_a = db_path.clone();
+        let writer_a = std::thread::spawn(move || {
+            let conn = open_sqlite_runtime_db(&db_a).expect("open writer a");
+            mutate_sqlite_session(&conn, |session| {
+                session.last_image_id = Some("image-a".to_string());
+                entered_tx.send(()).expect("signal transaction entered");
+                release_rx.recv().expect("release writer a");
+                Ok(())
+            })
+            .expect("write image a")
+        });
+        entered_rx.recv().expect("writer a owns immediate tx");
+
+        let (calling_tx, calling_rx) = std::sync::mpsc::channel();
+        let db_b = db_path.clone();
+        let writer_b = std::thread::spawn(move || {
+            let conn = open_sqlite_runtime_db(&db_b).expect("open writer b");
+            calling_tx.send(()).expect("signal writer b call");
+            mutate_sqlite_session_value(&conn, &json!({"last_image_id": "image-b"}))
+                .expect("write image b")
+        });
+        calling_rx.recv().expect("writer b is ready to mutate");
+        release_tx.send(()).expect("commit writer a");
+        writer_a.join().expect("join writer a");
+        let mutation_b = writer_b.join().expect("join writer b");
+
+        assert_eq!(mutation_b.before.last_image_id.as_deref(), Some("image-a"));
+        assert_eq!(mutation_b.after.last_image_id.as_deref(), Some("image-b"));
+        let conn = open_sqlite_runtime_db(&db_path).expect("open final session");
+        assert_eq!(
+            load_sqlite_session(&conn)
+                .expect("load final session")
+                .last_image_id
+                .as_deref(),
+            Some("image-b")
+        );
+    }
+
+    #[test]
+    fn concurrent_session_root_appends_preserve_both_roots() {
+        let (_dir, db_path) = temp_db_path();
+        drop(init_sqlite_db(&db_path).expect("init"));
+        let root_a = tempfile::tempdir().expect("root a");
+        let root_b = tempfile::tempdir().expect("root b");
+        let canonical_a =
+            canonicalize_sqlite_session_root(root_a.path()).expect("canonical root a");
+        let root_b_path = root_b.path().to_path_buf();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let db_a = db_path.clone();
+        let expected_a = canonical_a.clone();
+        let writer_a = std::thread::spawn(move || {
+            let conn = open_sqlite_runtime_db(&db_a).expect("open writer a");
+            mutate_sqlite_session(&conn, |session| {
+                apply_sqlite_session_root(session, &canonical_a, true);
+                entered_tx.send(()).expect("signal transaction entered");
+                release_rx.recv().expect("release writer a");
+                Ok(())
+            })
+            .expect("append root a")
+        });
+        entered_rx.recv().expect("writer a owns immediate tx");
+
+        let (calling_tx, calling_rx) = std::sync::mpsc::channel();
+        let db_b = db_path.clone();
+        let writer_b = std::thread::spawn(move || {
+            let conn = open_sqlite_runtime_db(&db_b).expect("open writer b");
+            calling_tx.send(()).expect("signal writer b call");
+            set_sqlite_session_root(&conn, &root_b_path, true).expect("append root b")
+        });
+        calling_rx.recv().expect("writer b is ready to mutate");
+        release_tx.send(()).expect("commit writer a");
+        writer_a.join().expect("join writer a");
+        let session_b = writer_b.join().expect("join writer b");
+        let expected_b = canonicalize_sqlite_session_root(root_b.path()).expect("canonical root b");
+
+        assert_eq!(session_b.root_path.as_deref(), Some(expected_b.as_str()));
+        assert_eq!(session_b.root_paths.len(), 2);
+        assert!(session_b.root_paths.contains(&expected_a));
+        assert!(session_b.root_paths.contains(&expected_b));
+        assert_eq!(
+            session_b
+                .root_paths
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn session_patch_fields_nulls_and_root_precedence_remain_compatible() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let initial = save_sqlite_session_value(
+            &conn,
+            &json!({
+                "root_path": "/legacy",
+                "root_paths": ["/legacy"],
+                "search_tags": [" One ", "two"],
+                "search_mode": "all",
+                "last_image_id": "old-image",
+                "tabs": [{"id": "tab-1"}],
+                "active_tab_id": "tab-1",
+                "folder_tag_sync": true,
+            }),
+        )
+        .expect("seed session");
+        let mutation = mutate_sqlite_session_value(&conn, &json!({"folder_tag_sync": false}))
+            .expect("toggle folder sync");
+        assert_eq!(mutation.before, initial);
+        assert!(!mutation.after.folder_tag_sync);
+        assert_eq!(mutation.after.search_mode, "all");
+        assert_eq!(mutation.after.last_image_id.as_deref(), Some("old-image"));
+        assert_eq!(mutation.after.tabs, json!([{"id": "tab-1"}]));
+
+        let root = tempfile::tempdir().expect("root");
+        let canonical = canonicalize_sqlite_session_root(root.path()).expect("canonical root");
+        let combined = mutate_sqlite_session_value_with_root(
+            &conn,
+            &json!({
+                "root_path": "/must-not-win",
+                "root_paths": ["/must-not-win"],
+                "search_mode": "any",
+                "folder_tag_sync": true,
+                "last_image_id": "explicit-image",
+            }),
+            Some(root.path()),
+            true,
+        )
+        .expect("combined root patch");
+        assert_eq!(
+            combined.after.root_path.as_deref(),
+            Some(canonical.as_str())
+        );
+        assert_eq!(
+            combined.after.root_paths,
+            vec!["/legacy".to_string(), canonical.clone()]
+        );
+        assert_eq!(combined.after.search_mode, "any");
+        assert!(combined.after.folder_tag_sync);
+        assert_eq!(
+            combined.after.last_image_id.as_deref(),
+            Some("explicit-image")
+        );
+        assert_eq!(combined.after.search_tags, vec!["one", "two"]);
+        assert_eq!(combined.after.active_tab_id.as_deref(), Some("tab-1"));
+
+        let second_root = tempfile::tempdir().expect("second root");
+        let reset = mutate_sqlite_session_value_with_root(
+            &conn,
+            &json!({"search_mode": "all"}),
+            Some(second_root.path()),
+            true,
+        )
+        .expect("root patch resets preview");
+        assert_eq!(reset.after.last_image_id, None);
+        assert_eq!(reset.after.search_mode, "all");
+        assert_eq!(reset.after.tabs, json!([{"id": "tab-1"}]));
+
+        let nulls = mutate_sqlite_session_value(
+            &conn,
+            &json!({
+                "root_path": null,
+                "root_paths": null,
+                "search_tags": null,
+                "search_mode": null,
+                "last_image_id": null,
+                "tabs": null,
+                "active_tab_id": null,
+                "folder_tag_sync": null,
+            }),
+        )
+        .expect("null patch");
+        assert_eq!(nulls.after.root_path, None);
+        assert!(nulls.after.root_paths.is_empty());
+        assert!(nulls.after.search_tags.is_empty());
+        assert_eq!(nulls.after.search_mode, "any");
+        assert_eq!(nulls.after.last_image_id, None);
+        assert_eq!(nulls.after.tabs, json!([]));
+        assert_eq!(nulls.after.active_tab_id, None);
+        assert!(nulls.after.folder_tag_sync);
+
+        let empty_root = mutate_sqlite_session_value(&conn, &json!({"root_path": ""}))
+            .expect("empty root patch");
+        assert_eq!(empty_root.after.root_path.as_deref(), Some(""));
     }
 
     #[test]

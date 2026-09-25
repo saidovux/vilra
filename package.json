@@ -8,6 +8,7 @@
     "typecheck:frontend": "tsc --noEmit",
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed",
+    "test:sqlite-stress": "node scripts/sqlite-lock-stress.mjs",
     "tauri": "tauri",
     "tauri:prepare": "npm run build:frontend && node scripts/prepare-tauri-sidecars.mjs",
     "tauri:dev": "tauri dev",
