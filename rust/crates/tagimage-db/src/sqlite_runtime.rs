@@ -2133,23 +2133,22 @@ pub fn save_sqlite_session_value(
     let search_tags = json_text(&session.search_tags)?;
     let tabs = json_text(&session.tabs)?;
     conn.execute(
-        "INSERT INTO app_session (id) VALUES (1) ON CONFLICT(id) DO NOTHING",
-        [],
-    )
-    .map_err(|e| format!("ensure sqlite app_session: {e}"))?;
-    conn.execute(
         r#"
-        UPDATE app_session
-        SET root_path = ?1,
-            root_paths = ?2,
-            search_tags = ?3,
-            search_mode = ?4,
-            last_image_id = ?5,
-            tabs = ?6,
-            active_tab_id = ?7,
-            folder_tag_sync = ?8,
+        INSERT INTO app_session (
+            id, root_path, root_paths, search_tags, search_mode,
+            last_image_id, tabs, active_tab_id, folder_tag_sync
+        )
+        VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ON CONFLICT(id) DO UPDATE SET
+            root_path = excluded.root_path,
+            root_paths = excluded.root_paths,
+            search_tags = excluded.search_tags,
+            search_mode = excluded.search_mode,
+            last_image_id = excluded.last_image_id,
+            tabs = excluded.tabs,
+            active_tab_id = excluded.active_tab_id,
+            folder_tag_sync = excluded.folder_tag_sync,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-        WHERE id = 1
         "#,
         params![
             session.root_path,
@@ -2162,7 +2161,7 @@ pub fn save_sqlite_session_value(
             if session.folder_tag_sync { 1 } else { 0 },
         ],
     )
-    .map_err(|e| format!("save sqlite session: {e}"))?;
+    .map_err(|e| format!("upsert sqlite session: {e}"))?;
     load_sqlite_session(conn)
 }
 

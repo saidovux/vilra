@@ -848,6 +848,7 @@ mod tests {
         mark_sqlite_job_failed, mark_sqlite_job_succeeded, mark_sqlite_job_terminal_failed,
         recover_sqlite_stale_running_jobs, SqliteImmediateTxAcquireError,
     };
+    use crate::sqlite_runtime::open_sqlite_worker_db;
     use crate::sqlite_schema::SQLITE_SCHEMA_VERSION;
     use rusqlite::{Connection, Error as SqliteError, ErrorCode};
     use serde_json::{json, Value};
@@ -1497,10 +1498,11 @@ mod tests {
         drop(conn);
 
         let holder = Connection::open(&db_path).expect("open lock holder");
-        let worker = Connection::open(&db_path).expect("open worker");
-        worker
-            .busy_timeout(Duration::from_millis(500))
-            .expect("set worker test busy timeout");
+        let worker = open_sqlite_worker_db(&db_path).expect("open production worker connection");
+        let timeout_ms: i64 = worker
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("worker timeout");
+        assert_eq!(timeout_ms, 30_000);
         holder
             .execute_batch("BEGIN IMMEDIATE")
             .expect("hold writer lock");

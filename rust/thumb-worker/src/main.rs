@@ -486,12 +486,12 @@ where
     let applied = match finalize_result {
         Ok(applied) => applied,
         Err(error) => {
-            let Some(publish_error) = publish_failure else {
-                return Err(error);
-            };
             if let Some(temp_target) = &temp_target {
                 let _ = fs::remove_file(temp_target);
             }
+            let Some(publish_error) = publish_failure else {
+                return Err(error);
+            };
             let total_ms = started.elapsed().as_millis();
             let error = format!("publish thumbnail: {publish_error}");
             let applied =
@@ -536,6 +536,13 @@ fn permanent_issue_from_error(
     })
 }
 
+fn thumb_post_claim_error(worker_id: &str, slot: usize, job: &ClaimedJob, error: String) -> String {
+    format!(
+        "execute thumb job worker={worker_id} slot={slot} job={} attempt={}: {error}",
+        job.id, job.attempt
+    )
+}
+
 async fn run_worker_loop(
     db_path: PathBuf,
     worker_id: String,
@@ -568,7 +575,9 @@ async fn run_worker_loop(
             continue;
         };
 
-        match execute_thumb_job(&conn, &job, max_backoff_sec)? {
+        match execute_thumb_job(&conn, &job, max_backoff_sec)
+            .map_err(|error| thumb_post_claim_error(&worker_id, slot, &job, error))?
+        {
             ThumbExecution::Succeeded(job_metrics) => {
                 let image = job_metrics.image_id.as_deref().unwrap_or("unknown");
                 eprintln!(
@@ -1175,6 +1184,129 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn pre_publish_database_failure_removes_attempt_temp_without_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        let (job, target) = setup_claimed_thumb(
+            dir.path(),
+            &conn,
+            "image-1",
+            "pre-publish-db-failure.jpg",
+            &encoded(ImageFormat::Jpeg),
+        );
+        let temp_target = thumb_attempt_temp_path(&target, &job);
+        conn.busy_timeout(Duration::from_millis(40)).unwrap();
+        let holder = rusqlite::Connection::open(&db_path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let publisher_called = std::cell::Cell::new(false);
+
+        let error = execute_thumb_job_with_decoder_and_publisher(
+            &conn,
+            &job,
+            120,
+            decode_supported_image,
+            |temp, final_target| {
+                publisher_called.set(true);
+                publish_thumb(temp, final_target)
+            },
+        )
+        .expect_err("database contention must escape worker execution");
+        holder.execute_batch("ROLLBACK").unwrap();
+
+        assert!(error.contains("DatabaseBusy"), "unexpected error: {error}");
+        assert!(!publisher_called.get());
+        assert!(!temp_target.exists());
+        assert!(!target.exists());
+        assert_eq!(
+            get_sqlite_job(&conn, &job.id).unwrap().unwrap().state,
+            "running"
+        );
+        assert!(!list_sqlite_job_events(&conn, &job.id)
+            .unwrap()
+            .iter()
+            .any(|event| event.event == "succeeded"));
+    }
+
+    #[test]
+    fn post_publish_database_failure_keeps_final_without_false_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = init_sqlite_db(&dir.path().join("db.sqlite")).unwrap();
+        let (job, target) = setup_claimed_thumb(
+            dir.path(),
+            &conn,
+            "image-1",
+            "post-publish-db-failure.jpg",
+            &encoded(ImageFormat::Jpeg),
+        );
+        let temp_target = thumb_attempt_temp_path(&target, &job);
+        conn.execute_batch(
+            r#"
+            CREATE TRIGGER fail_thumb_success
+            BEFORE UPDATE OF state ON jobs
+            WHEN NEW.state = 'succeeded'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected post-publish db failure');
+            END;
+            "#,
+        )
+        .unwrap();
+
+        let error = execute_thumb_job_with_decoder_and_publisher(
+            &conn,
+            &job,
+            120,
+            decode_supported_image,
+            publish_thumb,
+        )
+        .expect_err("post-publish database failure must escape worker execution");
+
+        assert!(
+            error.contains("injected post-publish db failure"),
+            "unexpected error: {error}"
+        );
+        assert!(!temp_target.exists());
+        assert!(target.exists());
+        assert_eq!(
+            get_sqlite_job(&conn, &job.id).unwrap().unwrap().state,
+            "running"
+        );
+        assert!(!list_sqlite_job_events(&conn, &job.id)
+            .unwrap()
+            .iter()
+            .any(|event| event.event == "succeeded"));
+    }
+
+    #[test]
+    fn post_claim_error_context_keeps_thumb_execution_identity_and_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = init_sqlite_db(&dir.path().join("db.sqlite")).unwrap();
+        let (job, _) = setup_claimed_thumb(
+            dir.path(),
+            &conn,
+            "image-1",
+            "context.jpg",
+            &encoded(ImageFormat::Jpeg),
+        );
+
+        let error = thumb_post_claim_error(
+            "thumb-context-worker",
+            3,
+            &job,
+            "underlying sentinel".to_string(),
+        );
+        for expected in [
+            "thumb-context-worker".to_string(),
+            "slot=3".to_string(),
+            format!("job={}", job.id),
+            format!("attempt={}", job.attempt),
+            "underlying sentinel".to_string(),
+        ] {
+            assert!(error.contains(&expected), "missing {expected:?} in {error}");
+        }
     }
 
     #[test]

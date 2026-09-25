@@ -380,6 +380,13 @@ fn permanent_issue_from_error(
     })
 }
 
+fn metadata_post_claim_error(worker_id: &str, job: &ClaimedJob, error: String) -> String {
+    format!(
+        "execute metadata job worker={worker_id} job={} attempt={}: {error}",
+        job.id, job.attempt
+    )
+}
+
 async fn run_worker_loop(
     db_path: PathBuf,
     worker_id: String,
@@ -402,7 +409,9 @@ async fn run_worker_loop(
             continue;
         };
 
-        match execute_metadata_job(&conn, &job, authoritative)? {
+        match execute_metadata_job(&conn, &job, authoritative)
+            .map_err(|error| metadata_post_claim_error(&worker_id, &job, error))?
+        {
             MetadataExecution::Succeeded {
                 extracted,
                 total_ms,
@@ -593,6 +602,32 @@ mod tests {
             get_sqlite_job(&conn, &job.id).unwrap().unwrap().state,
             "succeeded"
         );
+    }
+
+    #[test]
+    fn post_claim_error_context_keeps_metadata_execution_identity_and_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = init_sqlite_db(&dir.path().join("db.sqlite")).unwrap();
+        let job = insert_image_and_claim(
+            &conn,
+            dir.path(),
+            "context.jpg",
+            &encoded(ImageFormat::Jpeg),
+        );
+
+        let error = metadata_post_claim_error(
+            "metadata-context-worker",
+            &job,
+            "underlying sentinel".to_string(),
+        );
+        for expected in [
+            "metadata-context-worker".to_string(),
+            format!("job={}", job.id),
+            format!("attempt={}", job.attempt),
+            "underlying sentinel".to_string(),
+        ] {
+            assert!(error.contains(&expected), "missing {expected:?} in {error}");
+        }
     }
 
     #[test]
