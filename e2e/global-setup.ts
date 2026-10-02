@@ -6,7 +6,9 @@ import zlib from 'node:zlib';
 
 const repoRoot = path.resolve(__dirname, '..');
 const runDir = path.join(repoRoot, '.run');
-const statePath = path.join(runDir, 'e2e-state.json');
+const runtimeDir = path.join(runDir, 'e2e-runtime');
+const logDir = path.join(runDir, 'e2e-logs');
+const statePath = path.join(runtimeDir, 'state.json');
 const fixtureDir = path.join(runDir, 'e2e-images');
 const sqlitePath = path.join(runDir, 'e2e', 'tagimage.sqlite');
 const port = Number(process.env.TAGIMAGE_E2E_PORT || 8765);
@@ -132,6 +134,8 @@ async function globalSetup(): Promise<void> {
   createFixtures();
   const env = {
     ...process.env,
+    TAGIMAGE_RUN_DIR: runtimeDir,
+    TAGIMAGE_LOG_DIR: logDir,
     TAGIMAGE_SQLITE_PATH: sqlitePath,
     IMGVIEWER_THUMB_WORKERS: '2',
     IMGVIEWER_THUMB_WAIT_MS: '50',

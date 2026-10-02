@@ -776,7 +776,7 @@ let galleryGeometry: GalleryGeometry | null = null;
 let galleryResizeFrame: number | null = null;
 let paginationPrefetchFrame: number | null = null;
 let pendingGalleryScrollTop: number | null = null;
-let activePageLoad: Promise<void> | null = null;
+let activePageLoad: {requestId: number; promise: Promise<void>} | null = null;
 const mountedGalleryCards = new Map<string, MountedGalleryCard>();
 let previewModal: PreviewModal | null = null;
 let lightboxImages: ImageItem[] = [];
@@ -1665,6 +1665,8 @@ function updateImageCounter(): void {
 
 async function refreshImages(clear = true): Promise<void> {
   const requestId = ++activeImagesRequest;
+  activePageLoad = null;
+  isLoadingPage = true;
   const tab = activeTab();
   const params = new URLSearchParams();
   if (tab.includeTags && tab.includeTags.length) params.set('include_tags', tab.includeTags.join(','));
@@ -1694,6 +1696,7 @@ async function refreshImages(clear = true): Promise<void> {
     await restorePendingGalleryScroll();
     restorePreviewIfNeeded();
   } catch (e) {
+    if (requestId === activeImagesRequest) isLoadingPage = false;
     console.error(e);
     requiredHtml('status-text').textContent = errorMessage(e);
   }
@@ -1712,10 +1715,13 @@ function applyFilter(clear = true): void {
 }
 
 function loadNextImagesPage(): Promise<void> {
-  if (activePageLoad) return activePageLoad;
+  const requestId = activeImagesRequest;
+  if (activePageLoad?.requestId === requestId) return activePageLoad.promise;
   if (!hasMorePages || !nextCursor) return Promise.resolve();
+  const cursor = nextCursor;
   isLoadingPage = true;
-  activePageLoad = (async () => {
+  const load = {requestId, promise: Promise.resolve()};
+  load.promise = (async () => {
     const tab = activeTab();
     const params = new URLSearchParams();
     if (tab.includeTags && tab.includeTags.length) params.set('include_tags', tab.includeTags.join(','));
@@ -1724,11 +1730,12 @@ function loadNextImagesPage(): Promise<void> {
     params.set('limit', String(PAGE));
     params.set('sort', tab.sortMode || DEFAULT_SORT_MODE);
     params.set('include_total', '0');
-    params.set('cursor', nextCursor);
+    params.set('cursor', cursor);
     try {
       const r = await fetch('/api/images?' + params.toString());
       if (!r.ok) throw new Error(await readError(r));
       const d = await readJsonRecord(r);
+      if (requestId !== activeImagesRequest) return;
       const items = imagesFromRecord(d);
       items.forEach(image => acceptActiveImage(image.id));
       const seen = new Set(allImages.map(img => img.id));
@@ -1748,12 +1755,15 @@ function loadNextImagesPage(): Promise<void> {
     } catch (e) {
       console.error(e);
     } finally {
-      isLoadingPage = false;
-      activePageLoad = null;
-      if (galleryVirtualizer) schedulePaginationPrefetch(galleryVirtualizer);
+      if (activePageLoad === load) {
+        isLoadingPage = false;
+        activePageLoad = null;
+        if (galleryVirtualizer) schedulePaginationPrefetch(galleryVirtualizer);
+      }
     }
   })();
-  return activePageLoad;
+  activePageLoad = load;
+  return load.promise;
 }
 
 function thumbnailUrls(img: ImageItem): {primary: string; fallback: string} {

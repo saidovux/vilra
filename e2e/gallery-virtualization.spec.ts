@@ -174,6 +174,20 @@ test('TanStack virtual masonry stays bounded through pagination, reverse scroll,
   expect(new Set(reversed.ids).size).toBe(reversed.ids.length);
   expect(reversed.cards).toBeLessThanOrEqual(DOM_CARD_LIMIT);
 
+  await page.evaluate(() => window.scrollTo({top: document.documentElement.scrollHeight * 0.7}));
+  await page.waitForTimeout(40);
+  await page.evaluate(() => window.scrollTo({top: document.documentElement.scrollHeight * 0.85}));
+  await page.waitForTimeout(40);
+  await page.evaluate(() => window.scrollTo({top: document.documentElement.scrollHeight * 0.5}));
+  await page.waitForTimeout(40);
+  await page.evaluate(() => window.scrollTo({top: document.documentElement.scrollHeight * 0.8}));
+  await expect.poll(() => page.locator('.card img').evaluateAll(images => images.filter(image => {
+    const rect = image.getBoundingClientRect();
+    return rect.bottom > 0 && rect.top < innerHeight && !image.classList.contains('loaded');
+  }).length)).toBe(0);
+  const directionReversal = await gallerySnapshot(page);
+  expect(directionReversal.cards).toBeLessThanOrEqual(DOM_CARD_LIMIT);
+
   await page.evaluate(() => window.scrollTo({top: document.documentElement.scrollHeight * 0.6}));
   await page.waitForTimeout(150);
   const beforeResize = await gallerySnapshot(page);
@@ -190,6 +204,81 @@ test('TanStack virtual masonry stays bounded through pagination, reverse scroll,
 
   await testInfo.attach('virtualization-snapshots.json', {
     contentType: 'application/json',
-    body: Buffer.from(JSON.stringify({initial, deepest, returned, reversed, beforeResize, afterResize, deepGeometryDrift}, null, 2)),
+    body: Buffer.from(JSON.stringify({
+      initial,
+      deepest,
+      returned,
+      reversed,
+      directionReversal,
+      beforeResize,
+      afterResize,
+      deepGeometryDrift,
+    }, null, 2)),
   });
+});
+
+test('stale cursor page cannot append after sort generation changes', async ({page}) => {
+  let releaseOldPage: () => void = () => undefined;
+  let markOldPageStarted: () => void = () => undefined;
+  const oldPageGate = new Promise<void>(resolve => { releaseOldPage = resolve; });
+  const oldPageStarted = new Promise<void>(resolve => { markOldPageStarted = resolve; });
+
+  await page.route('**/api/events', route => route.abort());
+  await page.route('**/api/session', async route => {
+    if (route.request().method() !== 'GET') return route.fulfill({status: 200, json: {ok: true}});
+    const response = await route.fetch();
+    const payload = await response.json();
+    await route.fulfill({response, json: {
+      ...payload,
+      tabs: [],
+      active_tab_id: null,
+      search_tags: [],
+      search_mode: 'any',
+      last_image_id: null,
+    }});
+  });
+  await page.route('**/api/images?**', async route => {
+    const url = new URL(route.request().url());
+    const sort = url.searchParams.get('sort') || 'date_desc';
+    const cursor = url.searchParams.get('cursor');
+    if (sort === 'date_desc' && cursor) {
+      markOldPageStarted();
+      await oldPageGate;
+      return route.fulfill({json: {
+        items: Array.from({length: PAGE_SIZE}, (_, index) => ({
+          ...syntheticImage(PAGE_SIZE + index),
+          id: `stale-a-${index}`,
+          thumb_url: `/thumb-file/stale-a-${index}.jpg`,
+        })),
+        page: {total: null, next_cursor: null, has_more: false},
+      }});
+    }
+    const prefix = sort === 'path_asc' ? 'fresh-b' : 'initial-a';
+    return route.fulfill({json: {
+      items: Array.from({length: PAGE_SIZE}, (_, index) => ({
+        ...syntheticImage(index),
+        id: `${prefix}-${index}`,
+        thumb_url: `/thumb-file/${prefix}-${index}.jpg`,
+      })),
+      page: {
+        total: PAGE_SIZE,
+        next_cursor: sort === 'path_asc' ? null : String(PAGE_SIZE),
+        has_more: sort !== 'path_asc',
+      },
+    }});
+  });
+  await page.route('**/thumb-file/**', route => route.fulfill({status: 200, contentType: 'image/png', body: THUMBNAIL}));
+
+  await page.goto('/');
+  await expect(page.locator('.card[data-id^="initial-a-"]').first()).toBeVisible();
+  await oldPageStarted;
+  await page.locator('#sort-select').selectOption('path_asc');
+  await expect(page.locator('.card[data-id^="fresh-b-"]').first()).toBeVisible();
+
+  releaseOldPage();
+  await page.waitForTimeout(150);
+  await page.evaluate(() => window.scrollTo({top: document.documentElement.scrollHeight}));
+  await page.waitForTimeout(100);
+  await expect(page.locator('.card[data-id^="stale-a-"]')).toHaveCount(0);
+  await expect(page.locator('.card[data-id^="fresh-b-"]')).not.toHaveCount(0);
 });

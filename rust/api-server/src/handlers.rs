@@ -595,6 +595,7 @@ pub async fn rebuild_thumbs(
 pub async fn get_thumb_file(
     State(state): State<Arc<AppState>>,
     Path(img_id_jpg): Path<String>,
+    request_headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let Some(img_id) = img_id_jpg.strip_suffix(".jpg") else {
         return Err(ApiError::not_found("Not found"));
@@ -611,15 +612,10 @@ pub async fn get_thumb_file(
     }
     let path = image_thumb_path(&image);
     if !path.exists() {
-        return Err(ApiError::not_found("Not found"));
+        return Ok(thumbnail_not_found_response());
     }
     drop(client);
-    file_response(
-        path,
-        Some("image/jpeg"),
-        Some("public, max-age=31536000, immutable"),
-    )
-    .await
+    thumbnail_file_response(path, &request_headers).await
 }
 
 pub async fn get_thumb(
@@ -758,7 +754,56 @@ fn unavailable_image_response(
     } else {
         json!({"error": "image_unavailable"})
     };
-    Some((StatusCode::UNPROCESSABLE_ENTITY, Json(payload)).into_response())
+    let mut response = (StatusCode::UNPROCESSABLE_ENTITY, Json(payload)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Some(response)
+}
+
+fn thumbnail_not_found_response() -> Response {
+    let mut response =
+        (StatusCode::NOT_FOUND, Json(json!({"detail": "Not found"}))).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn thumbnail_file_response(
+    path: PathBuf,
+    request_headers: &HeaderMap,
+) -> Result<Response, ApiError> {
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(thumbnail_not_found_response()),
+    };
+    let hash = bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    let etag = format!("\"{:x}-{:x}\"", bytes.len(), hash);
+    let cache_control = HeaderValue::from_static("public, max-age=0, must-revalidate");
+    let etag_header = HeaderValue::from_str(&etag)
+        .map_err(|error| ApiError::internal(format!("Invalid thumbnail ETag: {error}")))?;
+    let matches = request_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|candidate| candidate == etag || candidate == "*")
+        });
+    let mut response = if matches {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        Body::from(bytes).into_response()
+    };
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"));
+    headers.insert(header::CACHE_CONTROL, cache_control);
+    headers.insert(header::ETAG, etag_header);
+    Ok(response)
 }
 
 fn original_image_content_type<'a>(
@@ -1014,10 +1059,18 @@ mod tests {
         assert_eq!(count_sqlite_jobs(&conn, Some("thumb"), None).unwrap(), 0);
         drop(conn);
 
-        let thumb_file = get_thumb_file(State(state.clone()), Path("image-1.jpg".to_string()))
-            .await
-            .unwrap();
+        let thumb_file = get_thumb_file(
+            State(state.clone()),
+            Path("image-1.jpg".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(thumb_file.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            thumb_file.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
         let original = get_file(State(state), Path("image-1".to_string()))
             .await
             .unwrap();
@@ -1026,6 +1079,68 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<Value>(&body).unwrap()["error"],
             "image_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn thumbnail_cache_revalidates_and_missing_files_are_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        insert_delivery_image(&conn, dir.path(), &encoded(ImageFormat::Jpeg));
+        drop(conn);
+        let state = test_state(dir.path(), db_path);
+
+        let missing = get_thumb_file(
+            State(state.clone()),
+            Path("image-1.jpg".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+
+        let thumb = dir.path().join(".imgindex/thumbs/image-1.jpg");
+        fs::create_dir_all(thumb.parent().unwrap()).unwrap();
+        fs::write(&thumb, b"thumbnail-v1").unwrap();
+        let first = get_thumb_file(
+            State(state.clone()),
+            Path("image-1.jpg".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=0, must-revalidate"
+        );
+        let first_etag = first.headers().get(header::ETAG).unwrap().clone();
+
+        let mut conditional = HeaderMap::new();
+        conditional.insert(header::IF_NONE_MATCH, first_etag.clone());
+        let unchanged = get_thumb_file(
+            State(state.clone()),
+            Path("image-1.jpg".to_string()),
+            conditional.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
+
+        fs::write(&thumb, b"thumbnail-v2-with-new-content").unwrap();
+        let rebuilt = get_thumb_file(State(state), Path("image-1.jpg".to_string()), conditional)
+            .await
+            .unwrap();
+        assert_eq!(rebuilt.status(), StatusCode::OK);
+        assert_ne!(rebuilt.headers().get(header::ETAG).unwrap(), &first_etag);
+        assert_eq!(
+            to_bytes(rebuilt.into_body(), usize::MAX).await.unwrap(),
+            "thumbnail-v2-with-new-content"
         );
     }
 

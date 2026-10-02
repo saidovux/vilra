@@ -3,13 +3,20 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 const repoRoot = path.resolve(__dirname, '..');
-const statePath = path.join(repoRoot, '.run', 'e2e-state.json');
+const runDir = path.join(repoRoot, '.run');
+const runtimeDir = path.join(runDir, 'e2e-runtime');
+const logDir = path.join(runDir, 'e2e-logs');
+const statePath = path.join(runtimeDir, 'state.json');
 
 function stopApp(): Promise<void> {
   return new Promise(resolve => {
     const child = spawn('./start.sh', ['stop'], {
       cwd: repoRoot,
-      env: process.env,
+      env: {
+        ...process.env,
+        TAGIMAGE_RUN_DIR: runtimeDir,
+        TAGIMAGE_LOG_DIR: logDir,
+      },
       stdio: 'inherit',
     });
     child.on('error', () => resolve());

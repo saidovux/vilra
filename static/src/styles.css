@@ -409,7 +409,6 @@ input::placeholder { color: var(--faint); }
   height: auto;
   object-fit: contain;
   background: #0b0c0d;
-  transition: opacity .2s;
 }
 .card img.lazy { opacity: 0; }
 .card img.loaded { opacity: 1; }

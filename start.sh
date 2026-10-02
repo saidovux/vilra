@@ -4,8 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-RUN_DIR="$SCRIPT_DIR/.run"
-LOG_DIR="$SCRIPT_DIR/.logs"
+RUN_DIR="${TAGIMAGE_RUN_DIR:-$SCRIPT_DIR/.run}"
+LOG_DIR="${TAGIMAGE_LOG_DIR:-$SCRIPT_DIR/.logs}"
 PORT_FILE="$RUN_DIR/port"
 
 API_PID_FILE="$RUN_DIR/api.pid"
