@@ -6,6 +6,11 @@ import {
   type VirtualItem,
   type VirtualizerOptions,
 } from '@tanstack/virtual-core';
+import {
+  galleryDiagnostics,
+  type DiagnosticCardRef,
+  type DiagnosticPageOutcome,
+} from './gallery-diagnostics';
 
 type MatchMode = 'any' | 'all';
 type SortMode = 'path_asc' | 'path_desc' | 'date_desc' | 'date_asc' | 'size_desc' | 'size_asc';
@@ -1665,6 +1670,7 @@ function updateImageCounter(): void {
 
 async function refreshImages(clear = true): Promise<void> {
   const requestId = ++activeImagesRequest;
+  const diagnosticPage = galleryDiagnostics.beginPage('refresh', allImages.length);
   activePageLoad = null;
   isLoadingPage = true;
   const tab = activeTab();
@@ -1677,25 +1683,51 @@ async function refreshImages(clear = true): Promise<void> {
   params.set('include_total', '1');
   try {
     const r = await fetch('/api/images?' + params.toString());
-    if (!r.ok) throw new Error(await readError(r));
-    const d = await readJsonRecord(r);
-    if (requestId !== activeImagesRequest) return;
+    galleryDiagnostics.pageResponse(diagnosticPage, r);
+    if (!r.ok) {
+      galleryDiagnostics.finishPage(diagnosticPage, 'http_failure', allImages.length);
+      throw new Error(await readError(r));
+    }
+    let d: JsonRecord;
+    try {
+      d = await readJsonRecord(r);
+      galleryDiagnostics.pageStage(diagnosticPage, 'json');
+    } catch (error) {
+      galleryDiagnostics.finishPage(diagnosticPage, 'parse_failure', allImages.length);
+      throw error;
+    }
+    if (requestId !== activeImagesRequest) {
+      galleryDiagnostics.finishPage(diagnosticPage, 'stale', allImages.length);
+      return;
+    }
     const refreshedPage = imagesFromRecord(d);
+    galleryDiagnostics.pageStage(diagnosticPage, 'mapped');
     refreshedPage.forEach(image => acceptActiveImage(image.id));
     allImages = clear
       ? refreshedPage
       : mergeRefreshedPageIntoLoadedImages(allImages, refreshedPage);
+    galleryDiagnostics.pageStage(diagnosticPage, 'deduped');
     visibleImages = allImages.slice();
+    galleryDiagnostics.pageStage(diagnosticPage, 'arrays');
     const page = imagePage(d.page);
     setServerTotalFromPage(page, visibleImages.length, true);
     nextCursor = page ? page.next_cursor || null : null;
     hasMorePages = Boolean(page && page.has_more);
     isLoadingPage = false;
     await refreshTagPool();
+    galleryDiagnostics.pageStage(diagnosticPage, 'pre_virtualizer_wait');
     applyFilter(clear);
+    galleryDiagnostics.pageStage(diagnosticPage, 'virtualizer');
+    galleryDiagnostics.finishPage(diagnosticPage, 'success', allImages.length);
     await restorePendingGalleryScroll();
     restorePreviewIfNeeded();
   } catch (e) {
+    if (diagnosticPage && !diagnosticPage.finished) {
+      const outcome: DiagnosticPageOutcome = e instanceof DOMException && e.name === 'AbortError'
+        ? 'aborted'
+        : 'network_failure';
+      galleryDiagnostics.finishPage(diagnosticPage, outcome, allImages.length);
+    }
     if (requestId === activeImagesRequest) isLoadingPage = false;
     console.error(e);
     requiredHtml('status-text').textContent = errorMessage(e);
@@ -1719,6 +1751,7 @@ function loadNextImagesPage(): Promise<void> {
   if (activePageLoad?.requestId === requestId) return activePageLoad.promise;
   if (!hasMorePages || !nextCursor) return Promise.resolve();
   const cursor = nextCursor;
+  const diagnosticPage = galleryDiagnostics.beginPage('cursor', allImages.length);
   isLoadingPage = true;
   const load = {requestId, promise: Promise.resolve()};
   load.promise = (async () => {
@@ -1733,10 +1766,25 @@ function loadNextImagesPage(): Promise<void> {
     params.set('cursor', cursor);
     try {
       const r = await fetch('/api/images?' + params.toString());
-      if (!r.ok) throw new Error(await readError(r));
-      const d = await readJsonRecord(r);
-      if (requestId !== activeImagesRequest) return;
+      galleryDiagnostics.pageResponse(diagnosticPage, r);
+      if (!r.ok) {
+        galleryDiagnostics.finishPage(diagnosticPage, 'http_failure', allImages.length);
+        throw new Error(await readError(r));
+      }
+      let d: JsonRecord;
+      try {
+        d = await readJsonRecord(r);
+        galleryDiagnostics.pageStage(diagnosticPage, 'json');
+      } catch (error) {
+        galleryDiagnostics.finishPage(diagnosticPage, 'parse_failure', allImages.length);
+        throw error;
+      }
+      if (requestId !== activeImagesRequest) {
+        galleryDiagnostics.finishPage(diagnosticPage, 'stale', allImages.length);
+        return;
+      }
       const items = imagesFromRecord(d);
+      galleryDiagnostics.pageStage(diagnosticPage, 'mapped');
       items.forEach(image => acceptActiveImage(image.id));
       const seen = new Set(allImages.map(img => img.id));
       items.forEach(img => {
@@ -1745,14 +1793,24 @@ function loadNextImagesPage(): Promise<void> {
           allImages.push(img);
         }
       });
+      galleryDiagnostics.pageStage(diagnosticPage, 'deduped');
       visibleImages = allImages.slice();
+      galleryDiagnostics.pageStage(diagnosticPage, 'arrays');
       const page = imagePage(d.page);
       setServerTotalFromPage(page, visibleImages.length, false);
       nextCursor = page ? page.next_cursor || null : null;
       hasMorePages = Boolean(page && page.has_more);
       updateImageCounter();
       updateVirtualGalleryCount();
+      galleryDiagnostics.pageStage(diagnosticPage, 'virtualizer');
+      galleryDiagnostics.finishPage(diagnosticPage, 'success', allImages.length);
     } catch (e) {
+      if (diagnosticPage && !diagnosticPage.finished) {
+        const outcome: DiagnosticPageOutcome = e instanceof DOMException && e.name === 'AbortError'
+          ? 'aborted'
+          : 'network_failure';
+        galleryDiagnostics.finishPage(diagnosticPage, outcome, allImages.length);
+      }
       console.error(e);
     } finally {
       if (activePageLoad === load) {
@@ -1774,7 +1832,27 @@ function thumbnailUrls(img: ImageItem): {primary: string; fallback: string} {
   };
 }
 
-function makeCard(img: ImageItem, highPriority = false): HTMLElement {
+function bindDiagnosticCardRef(image: HTMLImageElement, ref: DiagnosticCardRef | null): void {
+  if (!ref) return;
+  image.dataset.diagnosticGeneration = String(ref.generation);
+  image.dataset.diagnosticLifecycle = String(ref.lifecycle);
+}
+
+function diagnosticCardRef(image: HTMLImageElement | null): DiagnosticCardRef | null {
+  if (!image) return null;
+  const generation = Number(image.dataset.diagnosticGeneration);
+  const lifecycle = Number(image.dataset.diagnosticLifecycle);
+  const key = String(image.dataset.imageId || '');
+  return key && Number.isInteger(generation) && Number.isInteger(lifecycle)
+    ? {key, generation, lifecycle}
+    : null;
+}
+
+function makeCard(
+  img: ImageItem,
+  highPriority = false,
+  initialDiagnosticRef: DiagnosticCardRef | null = null,
+): HTMLElement {
   const card = document.createElement('article');
   card.className = 'card';
   card.dataset.id = img.id;
@@ -1782,6 +1860,7 @@ function makeCard(img: ImageItem, highPriority = false): HTMLElement {
   const ph = document.createElement('img');
   ph.className = 'lazy';
   ph.dataset.imageId = img.id;
+  bindDiagnosticCardRef(ph, initialDiagnosticRef);
   const sources = thumbnailUrls(img);
   ph.dataset.fallbackSrc = sources.fallback;
   ph.alt = name;
@@ -1804,8 +1883,15 @@ function makeCard(img: ImageItem, highPriority = false): HTMLElement {
   card.appendChild(ph);
   card.appendChild(overlay);
   card.addEventListener('click', () => openLightboxById(img.id));
-  ph.onload = () => ph.classList.add('loaded');
+  ph.onload = () => {
+    galleryDiagnostics.primaryLoaded(
+      diagnosticCardRef(ph),
+      ph.complete && ph.naturalWidth > 0,
+    );
+    ph.classList.add('loaded');
+  };
   ph.onerror = () => {
+    galleryDiagnostics.primaryFailed(diagnosticCardRef(ph));
     const fallback = ph.dataset.fallbackSrc;
     if (fallback) {
       void loadThumbWithRetry(ph, fallback);
@@ -1814,6 +1900,7 @@ function makeCard(img: ImageItem, highPriority = false): HTMLElement {
     ph.classList.add('loaded');
     ph.alt = 'Ошибка загрузки';
   };
+  galleryDiagnostics.primaryRequestStarted(diagnosticCardRef(ph));
   ph.src = sources.primary;
   return card;
 }
@@ -1838,10 +1925,13 @@ function updateCardForImage(img: ImageItem): void {
 async function loadThumbWithRetry(img: HTMLImageElement, url: string, attempt = 0): Promise<void> {
   const imageId = String(img.dataset.imageId || img.closest<HTMLElement>('.card[data-id]')?.dataset.id || '');
   if (!imageId || terminalThumbIds.has(imageId)) return;
+  const diagnosticRef = diagnosticCardRef(img);
+  const diagnosticStartedAt = galleryDiagnostics.fallbackAttemptStarted(diagnosticRef);
   thumbRetryTimers.delete(imageId);
   const maxAttempts = 120;
   try {
     const r = await fetch(url, {cache: 'no-store'});
+    galleryDiagnostics.fallbackResponse(diagnosticRef, r.status, diagnosticStartedAt);
     if (!img.isConnected || terminalThumbIds.has(imageId)) return;
     if (r.status === 200) {
       const objectUrl = URL.createObjectURL(await r.blob());
@@ -1851,11 +1941,16 @@ async function loadThumbWithRetry(img: HTMLImageElement, url: string, attempt = 
       }
       img.dataset.objectUrl = objectUrl;
       img.onload = () => {
+        galleryDiagnostics.fallbackImageLoaded(
+          diagnosticRef,
+          img.complete && img.naturalWidth > 0,
+        );
         img.classList.add('loaded');
         URL.revokeObjectURL(objectUrl);
         delete img.dataset.objectUrl;
       };
       img.onerror = () => {
+        galleryDiagnostics.fallbackImageFailed(diagnosticRef);
         URL.revokeObjectURL(objectUrl);
         delete img.dataset.objectUrl;
         img.classList.add('loaded');
@@ -1886,6 +1981,7 @@ async function loadThumbWithRetry(img: HTMLImageElement, url: string, attempt = 
     }
     console.warn('Thumbnail request failed', {url, status: r.status, attempt});
   } catch (error) {
+    galleryDiagnostics.fallbackNetworkError(diagnosticRef);
     console.warn('Thumbnail request failed', {url, attempt, error});
   }
   img.classList.add('loaded');
@@ -3391,7 +3487,12 @@ function galleryVirtualizerOptions(geometry: GalleryGeometry): VirtualizerOption
     scrollToFn: windowScroll,
     observeElementRect: observeWindowRect,
     observeElementOffset: observeWindowOffset,
-    onChange: instance => {
+    onChange: (instance, sync) => {
+      galleryDiagnostics.virtualizerChanged(
+        sync,
+        Number.isFinite(instance.scrollOffset) ? Number(instance.scrollOffset) : null,
+        instance.scrollDirection,
+      );
       renderVirtualGalleryRange(instance);
       schedulePaginationPrefetch(instance);
     },
@@ -3432,6 +3533,9 @@ function clearThumbLifecycle(imageId: string, card: HTMLElement): void {
 function unmountVirtualCard(imageId: string): void {
   const mounted = mountedGalleryCards.get(imageId);
   if (!mounted) return;
+  galleryDiagnostics.cardUnmounted(
+    diagnosticCardRef(mounted.card.querySelector<HTMLImageElement>('img')),
+  );
   clearThumbLifecycle(imageId, mounted.card);
   mounted.slot.remove();
   mountedGalleryCards.delete(imageId);
@@ -3448,11 +3552,17 @@ function virtualItemIsVisible(item: VirtualItem, geometry: GalleryGeometry): boo
   return item.end - geometry.scrollMargin >= viewportStart && itemStart <= viewportEnd;
 }
 
-function mountVirtualCard(item: VirtualItem, image: ImageItem, geometry: GalleryGeometry): MountedGalleryCard {
+function mountVirtualCard(
+  item: VirtualItem,
+  image: ImageItem,
+  geometry: GalleryGeometry,
+  visible: boolean,
+): MountedGalleryCard {
   const slot = document.createElement('div');
   slot.className = 'virtual-card-slot';
   slot.dataset.id = image.id;
-  const card = makeCard(image, virtualItemIsVisible(item, geometry));
+  const diagnosticRef = galleryDiagnostics.cardMounted(image.id, item.index);
+  const card = makeCard(image, visible, diagnosticRef);
   slot.appendChild(card);
   requiredHtml('gallery').appendChild(slot);
   const mounted = {slot, card, signature: cardRenderSignature(image)};
@@ -3472,9 +3582,13 @@ function positionVirtualCard(mounted: MountedGalleryCard, item: VirtualItem, geo
 
 function renderVirtualGalleryRange(instance = galleryVirtualizer): void {
   if (!instance || !galleryGeometry) return;
+  const diagnosticsRecording = galleryDiagnostics.recording;
+  const diagnosticStartedAt = diagnosticsRecording ? performance.now() : 0;
   const gallery = requiredHtml('gallery');
   const virtualItems = instance.getVirtualItems();
   const desiredIds = new Set<string>();
+  let maximumMountedIndex = -1;
+  let maximumVisibleIndex = -1;
   gallery.style.height = `${Math.max(0, instance.getTotalSize())}px`;
 
   for (const item of virtualItems) {
@@ -3483,22 +3597,53 @@ function renderVirtualGalleryRange(instance = galleryVirtualizer): void {
     desiredIds.add(image.id);
     const signature = cardRenderSignature(image);
     let mounted = mountedGalleryCards.get(image.id);
+    const visible = diagnosticsRecording || !mounted || mounted.signature !== signature
+      ? virtualItemIsVisible(item, galleryGeometry)
+      : false;
+    if (diagnosticsRecording) {
+      maximumMountedIndex = Math.max(maximumMountedIndex, item.index);
+      if (visible) maximumVisibleIndex = Math.max(maximumVisibleIndex, item.index);
+    }
     if (!mounted) {
-      mounted = mountVirtualCard(item, image, galleryGeometry);
+      mounted = mountVirtualCard(item, image, galleryGeometry, visible);
     } else if (mounted.signature !== signature) {
+      galleryDiagnostics.cardUnmounted(
+        diagnosticCardRef(mounted.card.querySelector<HTMLImageElement>('img')),
+      );
       clearThumbLifecycle(image.id, mounted.card);
-      const card = makeCard(image, virtualItemIsVisible(item, galleryGeometry));
+      const diagnosticRef = galleryDiagnostics.cardMounted(image.id, item.index);
+      const card = makeCard(image, visible, diagnosticRef);
       mounted.slot.replaceChildren(card);
       mounted.card = card;
       mounted.signature = signature;
     }
     positionVirtualCard(mounted, item, galleryGeometry);
+    const cardImage = diagnosticsRecording
+      ? mounted.card.querySelector<HTMLImageElement>('img')
+      : null;
+    if (diagnosticsRecording && visible) {
+      galleryDiagnostics.cardVisible(
+        diagnosticCardRef(cardImage),
+        item.index,
+        Boolean(cardImage?.complete && cardImage.naturalWidth > 0),
+      );
+    }
   }
 
   for (const imageId of [...mountedGalleryCards.keys()]) {
     if (!desiredIds.has(imageId)) unmountVirtualCard(imageId);
   }
+  if (diagnosticsRecording) {
+    galleryDiagnostics.virtualRange(
+      maximumMountedIndex,
+      maximumVisibleIndex,
+      mountedGalleryCards.size,
+    );
+  }
   instance._willUpdate();
+  if (diagnosticsRecording) {
+    galleryDiagnostics.measureRenderRange(performance.now() - diagnosticStartedAt);
+  }
 }
 
 function ensureGalleryVirtualizer(): Virtualizer<Window, HTMLDivElement> {
@@ -3541,11 +3686,31 @@ function invalidateVirtualGallery(options: {preserveAnchor: boolean; resetCards:
 }
 
 function updateVirtualGalleryCount(): void {
+  const diagnosticStartedAt = galleryDiagnostics.recording ? performance.now() : 0;
   const instance = ensureGalleryVirtualizer();
   instance.setOptions(galleryVirtualizerOptions(galleryGeometry!));
   instance._willUpdate();
   renderVirtualGalleryRange(instance);
   schedulePaginationPrefetch(instance);
+  if (galleryDiagnostics.recording) {
+    galleryDiagnostics.measureVirtualizerUpdate(performance.now() - diagnosticStartedAt);
+  }
+}
+
+function captureMountedCardsForDiagnostics(): void {
+  galleryDiagnostics.setLoadedMetadataCount(allImages.length);
+  for (const [imageId, mounted] of mountedGalleryCards) {
+    const image = mounted.card.querySelector<HTMLImageElement>('img');
+    const index = Number(mounted.slot.dataset.index);
+    if (!image || !Number.isInteger(index)) continue;
+    const reference = galleryDiagnostics.cardMounted(
+      imageId,
+      index,
+      image.complete && image.naturalWidth > 0,
+    );
+    bindDiagnosticCardRef(image, reference);
+  }
+  if (galleryVirtualizer) renderVirtualGalleryRange(galleryVirtualizer);
 }
 
 function schedulePaginationPrefetch(instance: Virtualizer<Window, HTMLDivElement>): void {
@@ -3841,6 +4006,9 @@ function runAction(actionEl: HTMLElement): void {
     case 'open-graph':
       openGraph();
       break;
+    case 'open-gallery-diagnostics':
+      galleryDiagnostics.openPanel();
+      break;
     case 'open-tag-manager':
       openTagManager();
       break;
@@ -3978,6 +4146,13 @@ document.addEventListener('visibilitychange', () => {
 
 initActionBindings();
 initPreview();
+galleryDiagnostics.install({
+  captureMountedCards: captureMountedCardsForDiagnostics,
+  isGalleryActive: () => activeView === 'gallery'
+    && !previewModal?.isOpen
+    && !graphState?.open
+    && !requiredHtml('settings-panel').classList.contains('open'),
+});
 initFilterInput();
 initFishInputs();
 startLiveEvents();

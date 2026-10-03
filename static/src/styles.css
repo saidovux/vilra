@@ -2081,6 +2081,77 @@ html.chrome-hidden #filter-bar {
   color: var(--muted);
 }
 
+.gallery-diagnostics-panel {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 2147483000;
+  width: min(380px, calc(100vw - 24px));
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: rgba(10,10,10,.96);
+  color: var(--text);
+  box-shadow: 0 18px 60px rgba(0,0,0,.72);
+  padding: 10px;
+}
+.gallery-diagnostics-panel[hidden] { display: none; }
+.gallery-diagnostics-panel header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.gallery-diagnostics-panel strong {
+  font-size: 12px;
+  letter-spacing: 0;
+}
+.gallery-diagnostics-panel pre {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  color: var(--muted);
+  font: 11px/1.5 var(--font-mono);
+  white-space: pre-wrap;
+}
+.gallery-diagnostics-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.gallery-diagnostics-controls button,
+.gallery-diagnostics-hide {
+  min-height: 30px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel-2);
+  color: var(--text);
+  padding: 0 8px;
+  cursor: pointer;
+}
+.gallery-diagnostics-controls button:disabled {
+  color: var(--faint);
+  cursor: default;
+  opacity: .55;
+}
+.gallery-diagnostics-hide {
+  width: 30px;
+  padding: 0;
+  font-size: 17px;
+}
+#gallery-diagnostics-json {
+  width: 100%;
+  min-height: 180px;
+  margin-top: 8px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: #080808;
+  color: var(--text);
+  font: 10px/1.4 var(--font-mono);
+}
+
 .tag-chip-base,
 .tag-chip-base.is-exclude {
   --tag-color: #D4D4D4;
