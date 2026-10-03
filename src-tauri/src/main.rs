@@ -1,3 +1,5 @@
+mod diagnostics;
+
 use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
@@ -265,7 +267,13 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(RuntimeProcesses::default())
-        .invoke_handler(tauri::generate_handler![reveal_problem])
+        .invoke_handler(tauri::generate_handler![
+            reveal_problem,
+            diagnostics::begin_gallery_diagnostic_session,
+            diagnostics::checkpoint_gallery_diagnostic_session,
+            diagnostics::finalize_gallery_diagnostic_session,
+            diagnostics::gallery_diagnostics_status,
+        ])
         .setup(|app| {
             let sqlite_path = sqlite_path(app)?;
             if let Some(parent) = sqlite_path.parent() {
@@ -327,7 +335,19 @@ fn main() {
                 return Err(error.into());
             }
             watch_runtime(app.handle().clone());
-            let url = format!("http://127.0.0.1:{api_port}/")
+            let diagnostic_query = if option_env!("VILRA_DIAGNOSTIC_BUILD") == Some("1") {
+                let auto_stop_sec = std::env::var("VILRA_DIAGNOSTIC_AUTOSTOP_SEC")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(600)
+                    .clamp(10, 86_400);
+                format!(
+                    "?gallery_diagnostics=auto&gallery_diagnostics_auto_stop_sec={auto_stop_sec}"
+                )
+            } else {
+                String::new()
+            };
+            let url = format!("http://127.0.0.1:{api_port}/{diagnostic_query}")
                 .parse()
                 .map_err(|error| io_error(format!("build local UI URL: {error}")))?;
             let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))

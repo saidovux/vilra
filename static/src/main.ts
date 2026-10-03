@@ -1951,6 +1951,7 @@ async function loadThumbWithRetry(img: HTMLImageElement, url: string, attempt = 
       };
       img.onerror = () => {
         galleryDiagnostics.fallbackImageFailed(diagnosticRef);
+        galleryDiagnostics.terminalThumbnailError(diagnosticRef, 'fallback_decode_error');
         URL.revokeObjectURL(objectUrl);
         delete img.dataset.objectUrl;
         img.classList.add('loaded');
@@ -1975,13 +1976,19 @@ async function loadThumbWithRetry(img: HTMLImageElement, url: string, attempt = 
     if (r.status === 422) {
       const payload = await readJsonRecord(r).catch((): JsonRecord => ({}));
       if (payload.error === 'image_unavailable') {
+        galleryDiagnostics.terminalThumbnailUnavailable(diagnosticRef);
         handleTerminalImageUnavailable(imageId);
         return;
       }
     }
     console.warn('Thumbnail request failed', {url, status: r.status, attempt});
+    galleryDiagnostics.terminalThumbnailError(
+      diagnosticRef,
+      r.status === 202 ? 'fallback_202_exhausted' : `fallback_http_${r.status}`,
+    );
   } catch (error) {
     galleryDiagnostics.fallbackNetworkError(diagnosticRef);
+    galleryDiagnostics.terminalThumbnailError(diagnosticRef, 'fallback_network_error');
     console.warn('Thumbnail request failed', {url, attempt, error});
   }
   img.classList.add('loaded');

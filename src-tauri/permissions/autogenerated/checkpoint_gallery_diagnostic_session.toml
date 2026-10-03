@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-checkpoint-gallery-diagnostic-session"
+description = "Enables the checkpoint_gallery_diagnostic_session command without any pre-configured scope."
+commands.allow = ["checkpoint_gallery_diagnostic_session"]
+
+[[permission]]
+identifier = "deny-checkpoint-gallery-diagnostic-session"
+description = "Denies the checkpoint_gallery_diagnostic_session command without any pre-configured scope."
+commands.deny = ["checkpoint_gallery_diagnostic_session"]

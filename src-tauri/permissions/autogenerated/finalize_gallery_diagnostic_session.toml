@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-finalize-gallery-diagnostic-session"
+description = "Enables the finalize_gallery_diagnostic_session command without any pre-configured scope."
+commands.allow = ["finalize_gallery_diagnostic_session"]
+
+[[permission]]
+identifier = "deny-finalize-gallery-diagnostic-session"
+description = "Denies the finalize_gallery_diagnostic_session command without any pre-configured scope."
+commands.deny = ["finalize_gallery_diagnostic_session"]

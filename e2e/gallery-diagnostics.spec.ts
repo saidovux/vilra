@@ -24,6 +24,10 @@ type DiagnosticReport = {
     mount_lifecycles_with_202: number;
     mount_lifecycles_recovered: number;
     mount_lifecycles_failed: number;
+    fallback_image_decode_errors: number;
+    terminal_image_unavailable: number;
+    terminal_error_placeholders: number;
+    terminal_error_reasons: Record<string, number>;
   };
   resources: {
     observer_support: string;
@@ -114,6 +118,10 @@ test('diagnostic lifecycle resets, survives hiding, exports private-safe JSON, a
     refreshTimerActive: false,
     animationFrameActive: false,
     resourceObserverActive: false,
+    checkpointTimerActive: false,
+    checkpointInFlight: false,
+    savedJsonPath: null,
+    savedMarkdownPath: null,
   });
 
   await page.locator('#settings-toggle').click();
@@ -149,6 +157,116 @@ test('diagnostic lifecycle resets, survives hiding, exports private-safe JSON, a
   expect(second.session.generation).toBe(first.session.generation + 1);
   expect(second.manual_slowdown_markers).toEqual([]);
   expect(await diagnostics.reportJson()).not.toBe(firstJson);
+});
+
+test('native stop saves JSON and Markdown automatically without clipboard access', async ({page}) => {
+  await page.addInitScript(() => {
+    type Invocation = {command: string; args: Record<string, unknown>};
+    const runtime = window as Window & {
+      __TAURI_INTERNALS__?: object;
+      __TAURI__?: {core: {invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>}};
+      __diagnosticInvocations?: Invocation[];
+    };
+    runtime.__TAURI_INTERNALS__ = {};
+    runtime.__diagnosticInvocations = [];
+    runtime.__TAURI__ = {core: {invoke: async (command, args = {}) => {
+      runtime.__diagnosticInvocations!.push({command, args});
+      if (command === 'begin_gallery_diagnostic_session') {
+        return {
+          session_id: '1700000000-001-123-1',
+          diagnostics_dir: '/mock-app-data/diagnostics',
+          checkpoint_path: '/mock-app-data/diagnostics/long-scroll.checkpoint.json',
+        };
+      }
+      if (command === 'checkpoint_gallery_diagnostic_session') {
+        return {checkpoint_path: '/mock-app-data/diagnostics/long-scroll.checkpoint.json', bytes: 1024};
+      }
+      if (command === 'finalize_gallery_diagnostic_session') {
+        return {
+          json_path: '/mock-app-data/diagnostics/long-scroll-final.json',
+          markdown_path: '/mock-app-data/diagnostics/long-scroll-final.md',
+          analysis_error: null,
+          bytes: 2048,
+        };
+      }
+      if (command === 'gallery_diagnostics_status') {
+        return {
+          diagnostics_dir: '/mock-app-data/diagnostics',
+          latest_json: null,
+          latest_markdown: null,
+          checkpoints: 0,
+        };
+      }
+      throw new Error(`unexpected command: ${command}`);
+    }}};
+    Object.defineProperty(navigator, 'clipboard', {value: undefined, configurable: true});
+  });
+  await page.goto('/');
+  await waitForGallery(page);
+  const diagnostics = await diagnosticsApi(page);
+  await diagnostics.start();
+  await expect.poll(() => page.evaluate(() => (
+    (window as Window & {__diagnosticInvocations?: Array<{command: string}>})
+      .__diagnosticInvocations?.some(call => call.command === 'checkpoint_gallery_diagnostic_session')
+  ))).toBe(true);
+
+  await diagnostics.stop();
+  await expect.poll(() => diagnostics.state()).toBe('exported');
+  const invocations = await page.evaluate(() => (
+    (window as Window & {__diagnosticInvocations?: Array<{command: string; args: Record<string, unknown>}>})
+      .__diagnosticInvocations || []
+  ));
+  expect(invocations.map(call => call.command)).toContain('finalize_gallery_diagnostic_session');
+  const final = invocations.find(call => call.command === 'finalize_gallery_diagnostic_session');
+  const report = JSON.parse(String(final?.args.reportJson || '{}')) as DiagnosticReport;
+  expect(report.session.state).toBe('stopped');
+  expect(JSON.stringify(report)).not.toContain('synthetic-private');
+
+  await page.evaluate(() => window.__vilraGalleryDiagnostics!.open());
+  await expect(page.locator('#gallery-diagnostics-details')).toContainText('long-scroll-final.json');
+  await expect(page.locator('#gallery-diagnostics-details')).toContainText('long-scroll-final.md');
+});
+
+test('terminal thumbnail failure is diagnosed while the original remains independently available', async ({page}) => {
+  await installSyntheticMetadata(page);
+  let releaseThumbnail: () => void = () => undefined;
+  const thumbnailGate = new Promise<void>(resolve => { releaseThumbnail = resolve; });
+  await page.route('**/thumb-file/**', async route => {
+    await thumbnailGate;
+    return route.fulfill({
+      status: 404,
+      headers: {'cache-control': 'no-store'},
+      json: {detail: 'Not found'},
+    });
+  });
+  await page.route('**/thumb/**', route => route.fulfill({
+    status: 500,
+    json: {error: 'synthetic_thumbnail_failure'},
+  }));
+  await page.route('**/file/**', route => route.fulfill({
+    status: 200,
+    contentType: 'image/png',
+    body: THUMBNAIL,
+  }));
+  await page.goto('/');
+  await waitForGallery(page);
+  const diagnostics = await diagnosticsApi(page);
+  await diagnostics.start();
+  releaseThumbnail();
+
+  const card = page.locator('.card[data-id="synthetic-private-00000"]');
+  const image = card.locator('img');
+  await expect(image).toHaveClass(/loaded/);
+  await expect.poll(() => image.evaluate(node => node.naturalWidth)).toBe(0);
+  await card.click();
+  await expect(page.locator('#preview-modal')).toBeVisible();
+  await expect(page.locator('#preview-modal-image')).toHaveAttribute('data-state', 'ready');
+  await expect(page.locator('#preview-modal-image')).toHaveAttribute('src', /\/file\/synthetic-private-00000$/);
+
+  await diagnostics.stop();
+  const report = await diagnostics.report();
+  expect(report.thumbnails.terminal_error_placeholders).toBeGreaterThanOrEqual(1);
+  expect(report.thumbnails.terminal_error_reasons.fallback_http_500).toBeGreaterThanOrEqual(1);
 });
 
 test('late queue response cannot mutate a stopped report', async ({page}) => {

@@ -99,6 +99,27 @@ type DiagnosticCard = {
   had202: boolean;
   recovered: boolean;
   failed: boolean;
+  terminalError: boolean;
+};
+
+type NativeDiagnosticSession = {
+  session_id: string;
+  diagnostics_dir: string;
+  checkpoint_path: string;
+};
+
+type NativeDiagnosticFinal = {
+  json_path: string;
+  markdown_path: string | null;
+  analysis_error: string | null;
+  bytes: number;
+};
+
+type NativeDiagnosticStatus = {
+  diagnostics_dir: string;
+  latest_json: string | null;
+  latest_markdown: string | null;
+  checkpoints: number;
 };
 
 type ImportantEvent = {
@@ -129,6 +150,7 @@ const MAX_COARSE_INTERVALS = 720;
 const MAX_IMPORTANT_EVENTS = 600;
 const MAX_MARKERS = 50;
 const QUEUE_SAMPLE_MS = 7_000;
+const CHECKPOINT_MS = 60_000;
 const FRAME_ANOMALY_MS = 50;
 const DISTRIBUTION_BOUNDS_MS = [
   1, 2, 4, 8, 12, 16, 20, 25, 33, 40, 50, 67, 80, 100, 125, 150, 200,
@@ -143,6 +165,10 @@ function rounded(value: number): number {
 function finiteNumber(value: unknown): number | null {
   const numberValue = Number(value);
   return Number.isFinite(numberValue) ? numberValue : null;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function latencyAggregate(): LatencyAggregate {
@@ -356,6 +382,9 @@ class GalleryDiagnostics {
   private fallbackText: HTMLTextAreaElement | null = null;
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private queueTimer: ReturnType<typeof setInterval> | null = null;
+  private checkpointTimer: ReturnType<typeof setInterval> | null = null;
+  private deferredCheckpointTimer: ReturnType<typeof setTimeout> | null = null;
+  private autoStopTimer: ReturnType<typeof setTimeout> | null = null;
   private queueAbortController: AbortController | null = null;
   private queueRequestPending = false;
   private queueRequestsStarted = 0;
@@ -411,6 +440,11 @@ class GalleryDiagnostics {
   private mountLifecyclesWith202 = 0;
   private mountLifecyclesRecovered = 0;
   private mountLifecyclesFailed = 0;
+  private fallbackImageDecodeErrors = 0;
+  private terminalImageUnavailable = 0;
+  private terminalErrorPlaceholders = 0;
+  private terminalErrorReasons: Record<string, number> = {};
+  private unmountedBeforeLoad = 0;
   private frameGapOverThreshold = 0;
 
   private pageOutcomes = pageOutcomes();
@@ -433,6 +467,14 @@ class GalleryDiagnostics {
 
   private snapshotJson: string | null = null;
   private exportMethod: 'clipboard' | 'textarea' | null = null;
+  private nativeSessionPromise: Promise<NativeDiagnosticSession | null> | null = null;
+  private checkpointInFlight = false;
+  private checkpointSavePromise: Promise<void> = Promise.resolve();
+  private finalSavePromise: Promise<void> = Promise.resolve();
+  private persistenceNotice = '';
+  private diagnosticsDir: string | null = null;
+  private savedJsonPath: string | null = null;
+  private savedMarkdownPath: string | null = null;
 
   get state(): DiagnosticState {
     return this.currentState;
@@ -475,14 +517,32 @@ class GalleryDiagnostics {
         refreshTimerActive: this.refreshTimer !== null,
         animationFrameActive: this.animationFrame !== 0,
         resourceObserverActive: this.resourceObserver !== null,
+        checkpointTimerActive: this.checkpointTimer !== null,
+        checkpointInFlight: this.checkpointInFlight,
+        savedJsonPath: this.savedJsonPath,
+        savedMarkdownPath: this.savedMarkdownPath,
       }),
     };
+    const query = new URLSearchParams(window.location.search);
+    if (query.get('gallery_diagnostics') === 'auto') {
+      setTimeout(() => {
+        if (this.currentState !== 'off') return;
+        this.startRecording();
+        const autoStopSec = Number(query.get('gallery_diagnostics_auto_stop_sec') || 600);
+        if (Number.isFinite(autoStopSec) && autoStopSec > 0) {
+          this.autoStopTimer = setTimeout(() => {
+            void this.stopRecording();
+          }, Math.max(10, autoStopSec) * 1_000);
+        }
+      }, 0);
+    }
   }
 
   openPanel(): void {
     this.ensurePanel();
     if (this.panel) this.panel.hidden = false;
     this.renderPanel();
+    void this.loadNativeStatus();
   }
 
   hidePanel(): void {
@@ -506,14 +566,21 @@ class GalleryDiagnostics {
     this.attachResourceObserver();
     this.refreshTimer = setInterval(() => this.renderPanel(), 1_000);
     this.queueTimer = setInterval(() => { void this.sampleQueue(this.generation); }, QUEUE_SAMPLE_MS);
+    if (isTauriRuntime()) {
+      this.nativeSessionPromise = this.beginNativeSession(this.generation);
+      this.checkpointTimer = setInterval(
+        () => this.scheduleCheckpoint(this.generation),
+        CHECKPOINT_MS,
+      );
+    }
     this.configuration?.captureMountedCards();
     this.recordImportant('diagnostics_started');
     void this.sampleQueue(this.generation);
     this.openPanel();
   }
 
-  stopRecording(): void {
-    if (this.currentState !== 'recording') return;
+  stopRecording(): Promise<void> {
+    if (this.currentState !== 'recording') return this.finalSavePromise;
     this.endedAt = performance.now();
     if (this.resourceObserver) {
       for (const entry of this.resourceObserver.takeRecords()) {
@@ -528,11 +595,18 @@ class GalleryDiagnostics {
     this.recordImportant('diagnostics_stopped');
     this.currentState = 'stopped';
     this.cleanupRuntime();
-    const snapshot = this.buildSnapshot(pendingAtStop);
+    const snapshot = this.buildSnapshot(pendingAtStop, 'stopped', this.endedAt);
     this.snapshotJson = JSON.stringify(snapshot, null, 2);
     this.cards.clear();
     this.activePages.clear();
+    this.persistenceNotice = isTauriRuntime()
+      ? 'Сохранение JSON и Markdown…'
+      : 'Нативное автосохранение доступно в диагностической AppImage.';
     this.renderPanel();
+    const generation = this.generation;
+    const snapshotJson = this.snapshotJson;
+    this.finalSavePromise = this.saveFinalReport(generation, snapshotJson);
+    return this.finalSavePromise;
   }
 
   markSlowdown(): void {
@@ -595,6 +669,105 @@ class GalleryDiagnostics {
     }
     this.currentState = 'exported';
     this.renderPanel(copied ? 'JSON скопирован.' : 'JSON доступен в поле для ручного копирования.');
+  }
+
+  private async beginNativeSession(generation: number): Promise<NativeDiagnosticSession | null> {
+    try {
+      const session = await nativeInvoke<NativeDiagnosticSession>(
+        'begin_gallery_diagnostic_session',
+      );
+      if (generation !== this.generation || this.currentState !== 'recording') return session;
+      this.diagnosticsDir = session.diagnostics_dir;
+      this.persistenceNotice = `Checkpoint: ${session.checkpoint_path}`;
+      this.renderPanel();
+      this.scheduleCheckpoint(generation, true);
+      return session;
+    } catch (error) {
+      if (generation === this.generation) {
+        this.persistenceNotice = `Автосохранение недоступно: ${errorMessage(error)}`;
+        this.renderPanel();
+      }
+      return null;
+    }
+  }
+
+  private scheduleCheckpoint(generation: number, immediate = false): void {
+    if (!isTauriRuntime() || generation !== this.generation || this.currentState !== 'recording') return;
+    if (this.deferredCheckpointTimer !== null || this.checkpointInFlight) return;
+    const delay = immediate ? 0 : (performance.now() <= this.frameActiveUntil ? 1_500 : 0);
+    this.deferredCheckpointTimer = setTimeout(() => {
+      this.deferredCheckpointTimer = null;
+      this.checkpointSavePromise = this.saveCheckpoint(generation);
+    }, delay);
+  }
+
+  private async saveCheckpoint(generation: number): Promise<void> {
+    if (generation !== this.generation || this.currentState !== 'recording' || this.checkpointInFlight) return;
+    const session = await this.nativeSessionPromise;
+    if (!session || generation !== this.generation || this.currentState !== 'recording') return;
+    this.checkpointInFlight = true;
+    const now = performance.now();
+    const checkpoint = this.buildSnapshot({
+      pages: this.activePages.size,
+      status_requests: this.queueRequestPending ? 1 : 0,
+      mounted_cards: this.cards.size,
+    }, 'recording', now);
+    try {
+      await nativeInvoke('checkpoint_gallery_diagnostic_session', {
+        sessionId: session.session_id,
+        reportJson: JSON.stringify(checkpoint),
+      });
+      if (generation === this.generation && this.currentState === 'recording') {
+        this.persistenceNotice = `Checkpoint сохранён: ${session.checkpoint_path}`;
+        this.renderPanel();
+      }
+    } catch (error) {
+      if (generation === this.generation && this.currentState === 'recording') {
+        this.persistenceNotice = `Ошибка checkpoint: ${errorMessage(error)}`;
+        this.renderPanel();
+      }
+    } finally {
+      this.checkpointInFlight = false;
+    }
+  }
+
+  private async saveFinalReport(generation: number, reportJson: string): Promise<void> {
+    if (!isTauriRuntime()) return;
+    await this.checkpointSavePromise;
+    const session = await this.nativeSessionPromise;
+    if (!session) return;
+    try {
+      const saved = await nativeInvoke<NativeDiagnosticFinal>(
+        'finalize_gallery_diagnostic_session',
+        {sessionId: session.session_id, reportJson},
+      );
+      if (generation !== this.generation || this.snapshotJson !== reportJson) return;
+      this.savedJsonPath = saved.json_path;
+      this.savedMarkdownPath = saved.markdown_path;
+      this.currentState = 'exported';
+      this.persistenceNotice = saved.markdown_path
+        ? `Сохранено:\nJSON: ${saved.json_path}\nMarkdown: ${saved.markdown_path}`
+        : `JSON сохранён: ${saved.json_path}\nОшибка анализа: ${saved.analysis_error || 'неизвестна'}`;
+      this.renderPanel();
+    } catch (error) {
+      if (generation === this.generation && this.snapshotJson === reportJson) {
+        this.persistenceNotice = `Ошибка сохранения: ${errorMessage(error)}`;
+        this.renderPanel();
+      }
+    }
+  }
+
+  private async loadNativeStatus(): Promise<void> {
+    if (!isTauriRuntime() || this.currentState === 'recording') return;
+    try {
+      const status = await nativeInvoke<NativeDiagnosticStatus>('gallery_diagnostics_status');
+      this.diagnosticsDir = status.diagnostics_dir;
+      if (!this.savedJsonPath) this.savedJsonPath = status.latest_json;
+      if (!this.savedMarkdownPath) this.savedMarkdownPath = status.latest_markdown;
+      this.renderPanel();
+    } catch {
+      // The panel remains usable in a browser and in older native builds.
+    }
   }
 
   beginPage(kind: DiagnosticPageKind, loadedMetadataCount: number): DiagnosticPageTrace | null {
@@ -731,6 +904,7 @@ class GalleryDiagnostics {
       had202: false,
       recovered: false,
       failed: false,
+      terminalError: false,
     });
     this.cardMounts += 1;
     return ref;
@@ -755,6 +929,7 @@ class GalleryDiagnostics {
   cardUnmounted(ref: DiagnosticCardRef | null): void {
     const card = this.cardFor(ref);
     if (!card) return;
+    if (card.loadedAt === null && !card.terminalError) this.unmountedBeforeLoad += 1;
     this.cards.delete(card.ref.key);
     this.cardUnmounts += 1;
   }
@@ -833,7 +1008,28 @@ class GalleryDiagnostics {
 
   fallbackImageFailed(ref: DiagnosticCardRef | null): void {
     const card = this.cardFor(ref);
-    if (card) this.failLifecycle(card);
+    if (card) {
+      this.fallbackImageDecodeErrors += 1;
+      this.failLifecycle(card);
+    }
+  }
+
+  terminalThumbnailError(ref: DiagnosticCardRef | null, reason: string): void {
+    const card = this.cardFor(ref);
+    if (!card || card.terminalError) return;
+    card.terminalError = true;
+    this.terminalErrorPlaceholders += 1;
+    this.terminalErrorReasons[reason] = (this.terminalErrorReasons[reason] || 0) + 1;
+    this.failLifecycle(card);
+    this.recordImportant('terminal_thumbnail_error', undefined, reason);
+  }
+
+  terminalThumbnailUnavailable(ref: DiagnosticCardRef | null): void {
+    const card = this.cardFor(ref);
+    if (!card) return;
+    this.terminalImageUnavailable += 1;
+    this.failLifecycle(card);
+    this.recordImportant('terminal_image_unavailable');
   }
 
   reportSnapshot(): object | null {
@@ -906,6 +1102,11 @@ class GalleryDiagnostics {
     this.mountLifecyclesWith202 = 0;
     this.mountLifecyclesRecovered = 0;
     this.mountLifecyclesFailed = 0;
+    this.fallbackImageDecodeErrors = 0;
+    this.terminalImageUnavailable = 0;
+    this.terminalErrorPlaceholders = 0;
+    this.terminalErrorReasons = {};
+    this.unmountedBeforeLoad = 0;
     this.frameGapOverThreshold = 0;
     this.pageOutcomes = pageOutcomes();
     this.pageRequestsByKind = {refresh: 0, cursor: 0};
@@ -923,6 +1124,13 @@ class GalleryDiagnostics {
     this.statusRequestLatency = new StreamingDistribution();
     this.snapshotJson = null;
     this.exportMethod = null;
+    this.nativeSessionPromise = null;
+    this.checkpointInFlight = false;
+    this.checkpointSavePromise = Promise.resolve();
+    this.finalSavePromise = Promise.resolve();
+    this.persistenceNotice = '';
+    this.savedJsonPath = null;
+    this.savedMarkdownPath = null;
     if (this.fallbackText) {
       this.fallbackText.hidden = true;
       this.fallbackText.value = '';
@@ -1174,11 +1382,18 @@ class GalleryDiagnostics {
     this.importantEvents.push(event);
   }
 
-  private buildSnapshot(pendingAtStop: object): object {
+  private buildSnapshot(
+    pendingAtStop: object,
+    sessionState: 'recording' | 'stopped',
+    endedAt: number,
+  ): object {
     const intervals = [...this.coarseIntervals, ...this.intervals.values()]
       .sort((left, right) => left.intervalStartMs - right.intervalStartMs)
       .map(intervalSnapshot);
-    const durationMs = Math.max(0, this.endedAt - this.startedAt);
+    const durationMs = Math.max(0, endedAt - this.startedAt);
+    const activeCards = [...this.cards.values()];
+    const pendingVisible = activeCards.filter(card => card.firstVisibleAt !== null && card.loadedAt === null).length;
+    const pendingGeneration = activeCards.filter(card => card.had202 && card.loadedAt === null).length;
     const resourceCoverage = this.resourceObserverSupport === 'UNSUPPORTED'
       ? 'UNSUPPORTED'
       : 'PARTIAL';
@@ -1187,7 +1402,7 @@ class GalleryDiagnostics {
       description: 'Vilra opt-in long-scroll diagnostics; no paths, names, IDs, tags or request URLs',
       session: {
         generation: this.generation,
-        state: 'stopped',
+        state: sessionState,
         started_at_utc: this.startedAtUtc,
         duration_ms: rounded(durationMs),
         interval_target_ms: INTERVAL_MS,
@@ -1228,7 +1443,14 @@ class GalleryDiagnostics {
         mount_lifecycles_with_202: this.mountLifecyclesWith202,
         mount_lifecycles_recovered: this.mountLifecyclesRecovered,
         mount_lifecycles_failed: this.mountLifecyclesFailed,
+        fallback_image_decode_errors: this.fallbackImageDecodeErrors,
+        terminal_image_unavailable: this.terminalImageUnavailable,
+        terminal_error_placeholders: this.terminalErrorPlaceholders,
+        terminal_error_reasons: this.terminalErrorReasons,
+        unmounted_before_load: this.unmountedBeforeLoad,
         pending_mount_lifecycles: this.cards.size,
+        pending_visible_lifecycles: pendingVisible,
+        pending_generation_lifecycles: pendingGeneration,
         image_load_latency: this.imageLoadLatency.snapshot(),
         visible_to_load_latency: this.visibleToLoadLatency.snapshot(),
         fallback_http_latency: this.fallbackHttpLatency.snapshot(),
@@ -1300,12 +1522,18 @@ class GalleryDiagnostics {
   private cleanupRuntime(): void {
     if (this.refreshTimer !== null) clearInterval(this.refreshTimer);
     if (this.queueTimer !== null) clearInterval(this.queueTimer);
+    if (this.checkpointTimer !== null) clearInterval(this.checkpointTimer);
+    if (this.deferredCheckpointTimer !== null) clearTimeout(this.deferredCheckpointTimer);
+    if (this.autoStopTimer !== null) clearTimeout(this.autoStopTimer);
     if (this.animationFrame) cancelAnimationFrame(this.animationFrame);
     this.queueAbortController?.abort();
     this.queueAbortController = null;
     this.queueRequestPending = false;
     this.refreshTimer = null;
     this.queueTimer = null;
+    this.checkpointTimer = null;
+    this.deferredCheckpointTimer = null;
+    this.autoStopTimer = null;
     this.animationFrame = 0;
     this.lastFrameAt = 0;
     if (this.resourceObserver) {
@@ -1379,8 +1607,13 @@ class GalleryDiagnostics {
       `Visible-to-load p95: ${String(this.visibleToLoadLatency.percentile(0.95))} мс`,
       `Frame proxy p95: ${String(this.frameIntervals.percentile(0.95))} мс`,
       `Fallback 202: ${this.fallback202} · lifecycle: ${this.mountLifecyclesWith202}`,
+      `Ошибочные thumbnail-заглушки: ${this.terminalErrorPlaceholders}`,
       `Очередь thumbnails: ${String(queue)}`,
       `Отметки: ${this.markers.length} · интервал scroll: ${currentInterval?.scrollActivity ?? 0}`,
+      this.diagnosticsDir ? `Каталог отчётов: ${this.diagnosticsDir}` : '',
+      this.savedJsonPath ? `Последний JSON: ${this.savedJsonPath}` : '',
+      this.savedMarkdownPath ? `Последний Markdown: ${this.savedMarkdownPath}` : '',
+      this.persistenceNotice,
       notice,
     ].filter(Boolean).join('\n');
     const start = document.getElementById('diagnostics-start') as HTMLButtonElement | null;
@@ -1403,13 +1636,22 @@ function isTauriRuntime(): boolean {
   return Boolean((window as Window & {__TAURI_INTERNALS__?: unknown}).__TAURI_INTERNALS__);
 }
 
+async function nativeInvoke<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
+  const tauri = window as Window & {
+    __TAURI__?: {core?: {invoke?: (name: string, input?: Record<string, unknown>) => Promise<T>}};
+  };
+  const invoke = tauri.__TAURI__?.core?.invoke;
+  if (!invoke) throw new Error('Native diagnostics persistence is unavailable');
+  return invoke(command, args);
+}
+
 declare global {
   interface Window {
     __vilraGalleryDiagnostics?: {
       open: () => void;
       hide: () => void;
       start: () => void;
-      stop: () => void;
+      stop: () => Promise<void>;
       mark: () => void;
       copy: () => Promise<void>;
       state: () => DiagnosticState;

@@ -2523,6 +2523,27 @@ pub fn recover_sqlite_stale_running_jobs(
     stale_after_sec: i64,
     limit: i64,
 ) -> Result<SqliteRecoveryResult, String> {
+    recover_sqlite_stale_running_jobs_inner(conn, None, stale_after_sec, limit)
+}
+
+pub fn recover_sqlite_stale_running_jobs_for_type(
+    conn: &Connection,
+    job_type: &str,
+    stale_after_sec: i64,
+    limit: i64,
+) -> Result<SqliteRecoveryResult, String> {
+    if job_type.trim().is_empty() {
+        return Err("job type is empty".to_string());
+    }
+    recover_sqlite_stale_running_jobs_inner(conn, Some(job_type), stale_after_sec, limit)
+}
+
+fn recover_sqlite_stale_running_jobs_inner(
+    conn: &Connection,
+    job_type: Option<&str>,
+    stale_after_sec: i64,
+    limit: i64,
+) -> Result<SqliteRecoveryResult, String> {
     if stale_after_sec <= 0 {
         return Ok(SqliteRecoveryResult {
             disabled: true,
@@ -2534,7 +2555,7 @@ pub fn recover_sqlite_stale_running_jobs(
     }
     let capped_limit = limit.clamp(1, 500);
     with_immediate_tx(conn, || {
-        let stale_jobs = select_stale_sqlite_jobs(conn, stale_after_sec, capped_limit)?;
+        let stale_jobs = select_stale_sqlite_jobs(conn, job_type, stale_after_sec, capped_limit)?;
         let checked = stale_jobs.len() as i64;
         let mut requeued = 0;
         let mut failed = 0;
@@ -3639,6 +3660,7 @@ fn set_latest_sqlite_attempt_state(
 
 fn select_stale_sqlite_jobs(
     conn: &Connection,
+    job_type: Option<&str>,
     stale_after_sec: i64,
     limit: i64,
 ) -> Result<Vec<StaleJob>, String> {
@@ -3650,15 +3672,16 @@ fn select_stale_sqlite_jobs(
         FROM jobs
         WHERE state = 'running'
           AND {activity} <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', printf('-%d seconds', ?1))
+          AND (?2 IS NULL OR job_type = ?2)
         ORDER BY updated_at, started_at, created_at
-        LIMIT ?2
+        LIMIT ?3
         "#
     );
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| format!("prepare sqlite stale jobs: {e}"))?;
     let rows = stmt
-        .query_map(params![stale_after_sec, limit], |row| {
+        .query_map(params![stale_after_sec, job_type, limit], |row| {
             Ok(StaleJob {
                 job: sqlite_job_from_row(row)?,
                 age_sec: row.get("age_sec")?,
@@ -5344,6 +5367,43 @@ mod tests {
 
         let jobs = list_sqlite_jobs(&conn, None, None, 10).expect("list jobs");
         assert!(jobs.iter().any(|job| job["id"] == queued.job.id));
+    }
+
+    #[test]
+    fn typed_stale_recovery_only_requeues_the_requested_worker_jobs() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let thumb = enqueue_sqlite_job(&conn, "thumb", json!({"image_id": "img-1"}), 10, 3, None)
+            .expect("thumb enqueue");
+        let metadata =
+            enqueue_sqlite_job(&conn, "metadata", json!({"image_id": "img-1"}), 10, 3, None)
+                .expect("metadata enqueue");
+        claim_next_sqlite_job(&conn, Some("thumb"), "thumb-old")
+            .expect("thumb claim")
+            .expect("thumb job");
+        claim_next_sqlite_job(&conn, Some("metadata"), "metadata-old")
+            .expect("metadata claim")
+            .expect("metadata job");
+        conn.execute(
+            "UPDATE jobs SET started_at = '2000-01-01T00:00:00.000Z', updated_at = '2000-01-01T00:00:00.000Z' WHERE id IN (?1, ?2)",
+            params![thumb.job.id, metadata.job.id],
+        )
+        .expect("age jobs");
+
+        let recovered = recover_sqlite_stale_running_jobs_for_type(&conn, "thumb", 300, 10)
+            .expect("recover thumbs");
+        assert_eq!(recovered.requeued, 1);
+        assert_eq!(
+            get_sqlite_job(&conn, &thumb.job.id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(
+            get_sqlite_job(&conn, &metadata.job.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "running"
+        );
     }
 
     #[test]

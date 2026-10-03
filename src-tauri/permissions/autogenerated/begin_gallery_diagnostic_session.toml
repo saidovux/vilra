@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-begin-gallery-diagnostic-session"
+description = "Enables the begin_gallery_diagnostic_session command without any pre-configured scope."
+commands.allow = ["begin_gallery_diagnostic_session"]
+
+[[permission]]
+identifier = "deny-begin-gallery-diagnostic-session"
+description = "Denies the begin_gallery_diagnostic_session command without any pre-configured scope."
+commands.deny = ["begin_gallery_diagnostic_session"]

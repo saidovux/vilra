@@ -15,7 +15,8 @@ use tagimage_db::sqlite::{
     claim_next_sqlite_thumb_job, finalize_sqlite_thumb_success, get_sqlite_file_issue_for_image,
     mark_sqlite_claimed_job_terminal_failed, mark_sqlite_image_job_terminal_failed,
     mark_sqlite_thumb_failed, open_sqlite_worker_db, record_sqlite_permanent_image_job_failure,
-    resolve_sqlite_runtime_path, SqliteDecodedImageRecovery, SqliteFileIssueUpsert,
+    recover_sqlite_stale_running_jobs_for_type, resolve_sqlite_runtime_path,
+    SqliteDecodedImageRecovery, SqliteFileIssueUpsert, SqliteRecoveryResult,
 };
 use tagimage_db::ClaimedJob;
 use tokio::time::sleep;
@@ -634,6 +635,16 @@ async fn run_worker_loop(
     }
 }
 
+fn recover_stale_thumb_jobs(
+    db_path: &Path,
+    stale_after_sec: i64,
+) -> Result<SqliteRecoveryResult, String> {
+    let conn = open_sqlite_worker_db(db_path)
+        .map_err(|error| format!("open sqlite db for thumbnail recovery: {error}"))?;
+    recover_sqlite_stale_running_jobs_for_type(&conn, "thumb", stale_after_sec, 500)
+        .map_err(|error| format!("recover stale thumbnail jobs: {error}"))
+}
+
 async fn run() -> Result<(), String> {
     let repo_root = resolve_repo_root()?;
     if !matches!(
@@ -658,6 +669,19 @@ async fn run() -> Result<(), String> {
     let worker_count = parse_usize_env("IMGVIEWER_THUMB_WORKERS", 1);
     let metrics_interval_sec = parse_u64_env("IMGVIEWER_THUMB_METRICS_INTERVAL_SEC", 30);
     let slow_ms = parse_u64_env("IMGVIEWER_THUMB_SLOW_MS", 1000) as u128;
+    let stale_after_sec = std::env::var("IMGVIEWER_JOB_STALE_RUNNING_SEC")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(300)
+        .max(1);
+
+    let recovery = recover_stale_thumb_jobs(&db_path, stale_after_sec)?;
+    if recovery.recovered > 0 {
+        eprintln!(
+            "[rust-thumb-worker] stale_recovery checked={} requeued={} failed={}",
+            recovery.checked, recovery.requeued, recovery.failed
+        );
+    }
 
     eprintln!(
         "[rust-thumb-worker] started as {} workers={} sqlite={}",
@@ -890,6 +914,39 @@ mod tests {
             .unwrap();
         assert_eq!(claimed.id, queued.job.id);
         (claimed, target, replacement)
+    }
+
+    #[test]
+    fn worker_startup_requeues_stale_thumbnail_job_for_a_valid_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        let (claimed, target) = setup_claimed_thumb(
+            dir.path(),
+            &conn,
+            "image-stale",
+            "stale.jpg",
+            &encoded(ImageFormat::Jpeg),
+        );
+        conn.execute(
+            "UPDATE jobs SET started_at = '2000-01-01T00:00:00.000Z', updated_at = '2000-01-01T00:00:00.000Z' WHERE id = ?1",
+            [&claimed.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let recovered = recover_stale_thumb_jobs(&db_path, 300).unwrap();
+        assert_eq!(recovered.requeued, 1);
+        let conn = open_sqlite_worker_db(&db_path).unwrap();
+        let reclaimed = claim_next_sqlite_thumb_job(&conn, "thumb-new")
+            .unwrap()
+            .expect("reclaimed stale thumbnail");
+        assert_eq!(reclaimed.id, claimed.id);
+        assert!(matches!(
+            execute_thumb_job(&conn, &reclaimed, 120).unwrap(),
+            ThumbExecution::Succeeded(_)
+        ));
+        assert!(target.is_file());
     }
 
     #[test]

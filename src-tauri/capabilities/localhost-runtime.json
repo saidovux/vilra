@@ -1,10 +1,18 @@
 {
   "$schema": "../gen/schemas/remote-schema.json",
   "identifier": "localhost-runtime",
-  "description": "Allow the packaged Vilra UI to invoke its native folder picker and constrained problem reveal command.",
+  "description": "Allow the packaged Vilra UI to invoke constrained local runtime commands.",
   "windows": ["main"],
   "remote": {
     "urls": ["http://127.0.0.1:*/*"]
   },
-  "permissions": ["core:default", "dialog:allow-open", "allow-reveal-problem"]
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "allow-reveal-problem",
+    "allow-begin-gallery-diagnostic-session",
+    "allow-checkpoint-gallery-diagnostic-session",
+    "allow-finalize-gallery-diagnostic-session",
+    "allow-gallery-diagnostics-status"
+  ]
 }
