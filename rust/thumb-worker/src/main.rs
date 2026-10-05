@@ -4,7 +4,11 @@ use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    mpsc::{self, RecvTimeoutError, Sender},
+    Arc, Mutex, MutexGuard,
+};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tagimage_core::{
     decode_supported_image, expected_format_for_path, file_fingerprint, parse_u64_env,
@@ -16,7 +20,8 @@ use tagimage_db::sqlite::{
     mark_sqlite_claimed_job_terminal_failed, mark_sqlite_image_job_terminal_failed,
     mark_sqlite_thumb_failed, open_sqlite_worker_db, record_sqlite_permanent_image_job_failure,
     recover_sqlite_stale_running_jobs_for_type, resolve_sqlite_runtime_path,
-    SqliteDecodedImageRecovery, SqliteFileIssueUpsert, SqliteRecoveryResult,
+    touch_sqlite_claimed_job_heartbeat, SqliteDecodedImageRecovery, SqliteFileIssueUpsert,
+    SqliteRecoveryResult,
 };
 use tagimage_db::ClaimedJob;
 use tokio::time::sleep;
@@ -43,6 +48,88 @@ struct WorkerMetrics {
     slowest_ms: u128,
     started_at: Instant,
     last_summary_at: Instant,
+}
+
+enum HeartbeatCommand {
+    Track(ClaimedJob),
+    Clear,
+    Stop,
+}
+
+struct ClaimHeartbeat {
+    commands: Sender<HeartbeatCommand>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ClaimHeartbeat {
+    fn start(
+        db_path: &Path,
+        worker_id: &str,
+        slot: usize,
+        interval: Duration,
+    ) -> Result<Self, String> {
+        let conn = open_sqlite_worker_db(db_path).map_err(|error| {
+            format!(
+                "open sqlite db for thumbnail heartbeat worker={worker_id} slot={slot}: {error}"
+            )
+        })?;
+        let (commands, receiver) = mpsc::channel();
+        let thread_worker_id = worker_id.to_string();
+        let handle = thread::Builder::new()
+            .name(format!("thumb-heartbeat-{slot}"))
+            .spawn(move || {
+                let mut current: Option<ClaimedJob> = None;
+                loop {
+                    match receiver.recv_timeout(interval) {
+                        Ok(HeartbeatCommand::Track(job)) => {
+                            current = Some(job);
+                            continue;
+                        }
+                        Ok(HeartbeatCommand::Clear) => {
+                            current = None;
+                            continue;
+                        }
+                        Ok(HeartbeatCommand::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {}
+                    }
+                    let Some(job) = current.as_ref() else {
+                        continue;
+                    };
+                    match touch_sqlite_claimed_job_heartbeat(&conn, job) {
+                        Ok(true) => {}
+                        Ok(false) => current = None,
+                        Err(error) => eprintln!(
+                            "[rust-thumb-worker] heartbeat_failed worker={} slot={} job={} attempt={} error={}",
+                            thread_worker_id, slot, job.id, job.attempt, error
+                        ),
+                    }
+                }
+            })
+            .map_err(|error| format!("spawn thumbnail heartbeat thread: {error}"))?;
+        Ok(Self {
+            commands,
+            thread: Some(handle),
+        })
+    }
+
+    fn track(&self, job: &ClaimedJob) -> Result<(), String> {
+        self.commands
+            .send(HeartbeatCommand::Track(job.clone()))
+            .map_err(|_| "thumbnail heartbeat thread stopped".to_string())
+    }
+
+    fn clear(&self) {
+        let _ = self.commands.send(HeartbeatCommand::Clear);
+    }
+}
+
+impl Drop for ClaimHeartbeat {
+    fn drop(&mut self) {
+        let _ = self.commands.send(HeartbeatCommand::Stop);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl WorkerMetrics {
@@ -551,12 +638,14 @@ async fn run_worker_loop(
     worker_count: usize,
     poll_ms: u64,
     max_backoff_sec: i64,
+    heartbeat_interval: Duration,
     metrics_interval_sec: u64,
     slow_ms: u128,
     shared_metrics: Arc<Mutex<WorkerMetrics>>,
 ) -> Result<(), String> {
     let conn = open_sqlite_worker_db(&db_path)
         .map_err(|e| format!("open sqlite db {} (slot={}): {e}", db_path.display(), slot))?;
+    let heartbeat = ClaimHeartbeat::start(&db_path, &worker_id, slot, heartbeat_interval)?;
 
     eprintln!(
         "[rust-thumb-worker] loop_started worker={} slot={}",
@@ -576,9 +665,10 @@ async fn run_worker_loop(
             continue;
         };
 
-        match execute_thumb_job(&conn, &job, max_backoff_sec)
-            .map_err(|error| thumb_post_claim_error(&worker_id, slot, &job, error))?
-        {
+        heartbeat.track(&job)?;
+        let execution = execute_thumb_job(&conn, &job, max_backoff_sec);
+        heartbeat.clear();
+        match execution.map_err(|error| thumb_post_claim_error(&worker_id, slot, &job, error))? {
             ThumbExecution::Succeeded(job_metrics) => {
                 let image = job_metrics.image_id.as_deref().unwrap_or("unknown");
                 eprintln!(
@@ -645,6 +735,33 @@ fn recover_stale_thumb_jobs(
         .map_err(|error| format!("recover stale thumbnail jobs: {error}"))
 }
 
+fn log_stale_recovery(phase: &str, recovery: &SqliteRecoveryResult) {
+    eprintln!(
+        "[rust-thumb-worker] stale_recovery phase={} checked={} recovered={} requeued={} failed={}",
+        phase, recovery.checked, recovery.recovered, recovery.requeued, recovery.failed
+    );
+}
+
+async fn run_runtime_recovery_loop(
+    db_path: PathBuf,
+    stale_after_sec: i64,
+    interval: Duration,
+) -> Result<(), String> {
+    loop {
+        sleep(interval).await;
+        match recover_stale_thumb_jobs(&db_path, stale_after_sec) {
+            Ok(recovery) => log_stale_recovery("runtime", &recovery),
+            Err(error) => {
+                eprintln!("[rust-thumb-worker] stale_recovery_failed phase=runtime error={error}")
+            }
+        }
+    }
+}
+
+fn worker_build_identity() -> &'static str {
+    option_env!("VILRA_BUILD_ID").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 async fn run() -> Result<(), String> {
     let repo_root = resolve_repo_root()?;
     if !matches!(
@@ -674,18 +791,17 @@ async fn run() -> Result<(), String> {
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(300)
         .max(1);
+    let stale_after_ms = (stale_after_sec as u64).saturating_mul(1_000);
+    let heartbeat_interval = Duration::from_millis((stale_after_ms / 3).clamp(250, 30_000));
+    let recovery_interval = Duration::from_millis((stale_after_ms / 2).clamp(500, 60_000));
 
     let recovery = recover_stale_thumb_jobs(&db_path, stale_after_sec)?;
-    if recovery.recovered > 0 {
-        eprintln!(
-            "[rust-thumb-worker] stale_recovery checked={} requeued={} failed={}",
-            recovery.checked, recovery.requeued, recovery.failed
-        );
-    }
+    log_stale_recovery("startup", &recovery);
 
     eprintln!(
-        "[rust-thumb-worker] started as {} workers={} sqlite={}",
+        "[rust-thumb-worker] started as {} build={} workers={} sqlite={}",
         worker_id,
+        worker_build_identity(),
         worker_count,
         db_path.display()
     );
@@ -701,11 +817,17 @@ async fn run() -> Result<(), String> {
             worker_count,
             poll_ms,
             max_backoff_sec,
+            heartbeat_interval,
             metrics_interval_sec,
             slow_ms,
             Arc::clone(&shared_metrics),
         ));
     }
+    workers.spawn(run_runtime_recovery_loop(
+        db_path,
+        stale_after_sec,
+        recovery_interval,
+    ));
 
     while let Some(result) = workers.join_next().await {
         match result {
@@ -947,6 +1069,116 @@ mod tests {
             ThumbExecution::Succeeded(_)
         ));
         assert!(target.is_file());
+    }
+
+    #[test]
+    fn runtime_recovery_keeps_a_heartbeating_claim_and_requeues_an_expired_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        let (claimed, target) = setup_claimed_thumb(
+            dir.path(),
+            &conn,
+            "image-runtime-stale",
+            "runtime-stale.jpg",
+            &encoded(ImageFormat::Jpeg),
+        );
+        conn.execute(
+            "UPDATE jobs SET started_at = '2000-01-01T00:00:00.000Z', updated_at = '2000-01-01T00:00:00.000Z' WHERE id = ?1",
+            [&claimed.id],
+        )
+        .unwrap();
+
+        assert!(touch_sqlite_claimed_job_heartbeat(&conn, &claimed).unwrap());
+        assert_eq!(
+            recover_stale_thumb_jobs(&db_path, 300).unwrap().recovered,
+            0
+        );
+        assert_eq!(
+            get_sqlite_job(&conn, &claimed.id).unwrap().unwrap().state,
+            "running"
+        );
+
+        conn.execute(
+            "UPDATE jobs SET started_at = '2000-01-01T00:00:00.000Z', updated_at = '2000-01-01T00:00:00.000Z' WHERE id = ?1",
+            [&claimed.id],
+        )
+        .unwrap();
+        assert_eq!(recover_stale_thumb_jobs(&db_path, 300).unwrap().requeued, 1);
+        let reclaimed = claim_next_sqlite_thumb_job(&conn, "thumb-runtime-new")
+            .unwrap()
+            .expect("runtime recovery claim");
+        assert!(matches!(
+            execute_thumb_job(&conn, &reclaimed, 120).unwrap(),
+            ThumbExecution::Succeeded(_)
+        ));
+        assert!(target.is_file());
+    }
+
+    #[test]
+    fn stale_attempt_cannot_publish_or_remove_the_new_attempt_thumbnail() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        let (old_claim, target) = setup_claimed_thumb(
+            dir.path(),
+            &conn,
+            "image-attempt-ownership",
+            "attempt-ownership.jpg",
+            &encoded(ImageFormat::Jpeg),
+        );
+        conn.execute(
+            "UPDATE jobs SET started_at = '2000-01-01T00:00:00.000Z', updated_at = '2000-01-01T00:00:00.000Z' WHERE id = ?1",
+            [&old_claim.id],
+        )
+        .unwrap();
+        assert_eq!(recover_stale_thumb_jobs(&db_path, 300).unwrap().requeued, 1);
+        let new_claim = claim_next_sqlite_thumb_job(&conn, "thumb-new-owner")
+            .unwrap()
+            .expect("new owner claim");
+        let old_temp = thumb_attempt_temp_path(&target, &old_claim);
+        let publisher_called = std::cell::Cell::new(false);
+
+        let old_result = execute_thumb_job_with_decoder_and_publisher(
+            &conn,
+            &old_claim,
+            120,
+            decode_supported_image,
+            |_, _| {
+                publisher_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(old_result, ThumbExecution::Discarded { .. }));
+        assert!(!publisher_called.get());
+        assert!(!old_temp.exists());
+        assert!(!target.exists());
+
+        assert!(matches!(
+            execute_thumb_job(&conn, &new_claim, 120).unwrap(),
+            ThumbExecution::Succeeded(_)
+        ));
+        let published = fs::read(&target).unwrap();
+        assert!(published.starts_with(&[0xff, 0xd8]));
+        assert_eq!(
+            get_sqlite_job(&conn, &new_claim.id).unwrap().unwrap().state,
+            "succeeded"
+        );
+        assert!(!old_temp.exists());
+    }
+
+    #[test]
+    fn startup_recovery_reports_zero_when_no_jobs_are_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        init_sqlite_db(&db_path).unwrap();
+
+        let recovery = recover_stale_thumb_jobs(&db_path, 300).unwrap();
+        assert_eq!(recovery.checked, 0);
+        assert_eq!(recovery.recovered, 0);
+        assert_eq!(recovery.requeued, 0);
+        assert_eq!(recovery.failed, 0);
     }
 
     #[test]

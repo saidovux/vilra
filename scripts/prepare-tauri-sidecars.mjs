@@ -5,7 +5,10 @@ import {fileURLToPath} from 'node:url';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const rustManifest = join(repoRoot, 'rust', 'Cargo.toml');
-const targetRoot = join(repoRoot, 'rust', 'thumb-worker', 'target');
+const configuredTargetRoot = String(process.env.CARGO_TARGET_DIR || '').trim();
+const targetRoot = configuredTargetRoot
+  ? resolve(repoRoot, configuredTargetRoot)
+  : join(repoRoot, 'rust', 'thumb-worker', 'target');
 const binariesDir = join(repoRoot, 'src-tauri', 'binaries');
 const binaryNames = [
   'imgviewer-api-server',
@@ -32,14 +35,28 @@ function hostTriple() {
 const targetTriple = hostTriple();
 const windowsTarget = targetTriple.includes('windows');
 const extension = windowsTarget ? '.exe' : '';
+const gitHead = execFileSync('git', ['rev-parse', '--short=12', 'HEAD'], {
+  cwd: repoRoot,
+  encoding: 'utf8',
+}).trim();
+const dirty = execFileSync('git', ['status', '--porcelain'], {
+  cwd: repoRoot,
+  encoding: 'utf8',
+}).trim();
+const buildId = `${gitHead}${dirty ? '-dirty' : ''}`;
 
 execFileSync('cargo', [
   'build',
   '--manifest-path', rustManifest,
   '--release',
   '--target', targetTriple,
+  '--target-dir', targetRoot,
   ...binaryNames.flatMap(name => ['--bin', name]),
-], {cwd: repoRoot, stdio: 'inherit'});
+], {
+  cwd: repoRoot,
+  stdio: 'inherit',
+  env: {...process.env, VILRA_BUILD_ID: buildId},
+});
 
 mkdirSync(binariesDir, {recursive: true});
 for (const name of binaryNames) {
@@ -47,5 +64,5 @@ for (const name of binaryNames) {
   const destination = join(binariesDir, `${name}-${targetTriple}${extension}`);
   copyFileSync(source, destination);
   if (!windowsTarget) chmodSync(destination, 0o755);
-  process.stdout.write(`[tauri] prepared ${destination}\n`);
+  process.stdout.write(`[tauri] prepared ${destination} from ${source} build=${buildId}\n`);
 }

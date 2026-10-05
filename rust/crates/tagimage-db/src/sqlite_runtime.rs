@@ -2471,6 +2471,26 @@ pub fn touch_sqlite_job_progress(
     Ok(())
 }
 
+pub fn touch_sqlite_claimed_job_heartbeat(
+    conn: &Connection,
+    job: &crate::ClaimedJob,
+) -> Result<bool, String> {
+    let changed = conn
+        .execute(
+            r#"
+            UPDATE jobs
+            SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+              AND state = 'running'
+              AND worker_id = ?2
+              AND attempt = ?3
+            "#,
+            params![job.id, job.worker_id, job.attempt],
+        )
+        .map_err(|e| format!("touch sqlite claimed job heartbeat: {e}"))?;
+    Ok(changed == 1)
+}
+
 pub fn cancel_sqlite_job(conn: &Connection, job_id: &str) -> Result<bool, String> {
     with_immediate_tx(conn, || {
         let previous_state = get_sqlite_job(conn, job_id)?.map(|job| job.state);
@@ -5404,6 +5424,54 @@ mod tests {
                 .state,
             "running"
         );
+    }
+
+    #[test]
+    fn claimed_job_heartbeat_is_scoped_to_owner_and_attempt() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let queued = enqueue_sqlite_job(
+            &conn,
+            "thumb",
+            json!({"image_id": "heartbeat-image"}),
+            10,
+            3,
+            None,
+        )
+        .expect("enqueue");
+        let first = claim_next_sqlite_job(&conn, Some("thumb"), "worker-first")
+            .expect("claim")
+            .expect("first claim");
+        conn.execute(
+            "UPDATE jobs SET started_at = '2000-01-01T00:00:00.000Z', updated_at = '2000-01-01T00:00:00.000Z' WHERE id = ?1",
+            [&queued.job.id],
+        )
+        .expect("make first attempt stale");
+
+        assert!(touch_sqlite_claimed_job_heartbeat(&conn, &first).expect("heartbeat first"));
+        assert_eq!(
+            count_sqlite_stale_running_jobs(&conn, Some("thumb"), 300).expect("stale count"),
+            0
+        );
+
+        conn.execute(
+            "UPDATE jobs SET started_at = '2000-01-01T00:00:00.000Z', updated_at = '2000-01-01T00:00:00.000Z' WHERE id = ?1",
+            [&queued.job.id],
+        )
+        .expect("expire first attempt");
+        assert_eq!(
+            recover_sqlite_stale_running_jobs_for_type(&conn, "thumb", 300, 10)
+                .expect("recover")
+                .requeued,
+            1
+        );
+        let second = claim_next_sqlite_job(&conn, Some("thumb"), "worker-second")
+            .expect("claim second")
+            .expect("second claim");
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.attempt, first.attempt + 1);
+        assert!(!touch_sqlite_claimed_job_heartbeat(&conn, &first).expect("stale heartbeat"));
+        assert!(touch_sqlite_claimed_job_heartbeat(&conn, &second).expect("current heartbeat"));
     }
 
     #[test]

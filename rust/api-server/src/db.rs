@@ -628,10 +628,13 @@ pub fn status_payload(state: &AppState, conn: &Connection) -> Result<Value, ApiE
     let metadata_running = count_jobs(conn, Some("metadata"), Some("running"))?;
     let stale_running = thumb_stale_running
         + count_stale_running_jobs(conn, Some("metadata"), state.config.job_stale_running_sec)?;
-    let degraded = state.config.thumb_worker_expected
-        && state.config.thumb_job_mode == "queue"
-        && thumb_running == 0
-        && thumb_queued > 0;
+    let degraded = thumb_queue_is_degraded(
+        state.config.thumb_worker_expected,
+        &state.config.thumb_job_mode,
+        thumb_running,
+        thumb_stale_running,
+        thumb_queued,
+    );
 
     Ok(json!({
         "ready": root.is_some() && !syncing && sync_error.is_none(),
@@ -692,6 +695,17 @@ pub fn status_payload(state: &AppState, conn: &Connection) -> Result<Value, ApiE
     }))
 }
 
+fn thumb_queue_is_degraded(
+    worker_expected: bool,
+    mode: &str,
+    running: i64,
+    stale_running: i64,
+    queued: i64,
+) -> bool {
+    let active_running = running.saturating_sub(stale_running);
+    worker_expected && mode == "queue" && active_running == 0 && queued > 0
+}
+
 pub fn image_thumb_path(image: &ImageRecord) -> PathBuf {
     Path::new(&image.root_path).join(&image.thumb)
 }
@@ -706,4 +720,16 @@ pub fn validate_image_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::thumb_queue_is_degraded;
+
+    #[test]
+    fn stale_running_jobs_do_not_hide_a_degraded_thumbnail_queue() {
+        assert!(thumb_queue_is_degraded(true, "queue", 44, 44, 5));
+        assert!(!thumb_queue_is_degraded(true, "queue", 45, 44, 5));
+        assert!(!thumb_queue_is_degraded(true, "queue", 44, 44, 0));
+    }
 }
