@@ -617,37 +617,52 @@ test('format mismatch is a warning, stays in gallery, and does not increment err
   }
 });
 
-test('pending thumbnail 202 retries until a thumbnail is available', async ({ page }) => {
+test('pending thumbnail 202 admits once and polls only the cache resource', async ({ page }) => {
   await waitForGallery(page);
   const card = page.locator('.card[data-id]').first();
   const imageId = String(await card.getAttribute('data-id'));
   const thumbnail = fs.readFileSync(path.join(fixtureRoot(), 'batch-a', 'fixture-001.png'));
-  let requests = 0;
-  await page.route(`**/thumb/${imageId}*`, route => {
-    requests += 1;
-    if (requests <= 2) {
-      return route.fulfill({status: 202, json: {retry_after_ms: 10}});
-    }
+  let admissionRequests = 0;
+  let cachePolls = 0;
+  await page.route(`**/thumb-file/${imageId}.jpg*`, route => {
+    cachePolls += 1;
+    if (cachePolls < 2) return route.fulfill({status: 404, json: {detail: 'Not found'}});
     return route.fulfill({status: 200, contentType: 'image/png', body: thumbnail});
+  });
+  await page.route(`**/thumb/${imageId}*`, route => {
+    admissionRequests += 1;
+    return route.fulfill({status: 202, json: {retry_after_ms: 10}});
   });
 
   const image = card.locator('img');
-  await image.evaluate(element => element.dispatchEvent(new Event('error')));
-  await expect.poll(() => requests).toBeGreaterThanOrEqual(3);
+  await image.evaluate(element => {
+    element.classList.remove('loaded');
+    element.dispatchEvent(new Event('error'));
+  });
+  await expect.poll(() => admissionRequests).toBe(1);
+  await expect.poll(() => cachePolls).toBeGreaterThanOrEqual(2);
   await expect(image).toHaveClass(/loaded/);
+  await page.waitForTimeout(400);
+  expect(admissionRequests).toBe(1);
 });
 
-test('temporary thumbnail 404 falls back through 202 and later primary 200', async ({ page }) => {
+test('temporary thumbnail 404 uses one admission before later primary 200', async ({ page }) => {
   const [target] = await imageItems(page, 1);
   expect(target?.id).toBeTruthy();
   const imageId = target.id;
   const thumbnail = fs.readFileSync(path.join(fixtureRoot(), 'batch-a', 'fixture-001.png'));
   const primaryStatuses: number[] = [];
-  let fallbackRequests = 0;
-  let generated = false;
+  let admissionRequests = 0;
+  let admitted = false;
+  let cachePolls = 0;
 
   await page.route(`**/thumb-file/${imageId}.jpg*`, route => {
-    if (!generated) {
+    if (!admitted) {
+      primaryStatuses.push(404);
+      return route.fulfill({status: 404, headers: {'cache-control': 'no-store'}, json: {detail: 'Not found'}});
+    }
+    cachePolls += 1;
+    if (cachePolls < 2) {
       primaryStatuses.push(404);
       return route.fulfill({status: 404, headers: {'cache-control': 'no-store'}, json: {detail: 'Not found'}});
     }
@@ -655,52 +670,65 @@ test('temporary thumbnail 404 falls back through 202 and later primary 200', asy
     return route.fulfill({status: 200, contentType: 'image/png', body: thumbnail});
   });
   await page.route(`**/thumb/${imageId}*`, route => {
-    fallbackRequests += 1;
-    if (fallbackRequests <= 2) return route.fulfill({status: 202, json: {retry_after_ms: 10}});
-    generated = true;
-    return route.fulfill({status: 200, contentType: 'image/png', body: thumbnail});
+    admissionRequests += 1;
+    admitted = true;
+    return route.fulfill({status: 202, json: {retry_after_ms: 10}});
   });
 
   await waitForGallery(page);
   const card = page.locator(`.card[data-id="${imageId}"]`);
   await expect(card.locator('img')).toHaveClass(/loaded/);
-  expect(fallbackRequests).toBeGreaterThanOrEqual(3);
+  expect(admissionRequests).toBe(1);
+  expect(cachePolls).toBeGreaterThanOrEqual(2);
 
   const refreshed = page.waitForResponse(response => response.url().includes('/api/images?'));
   await page.locator('#sort-select').dispatchEvent('change');
   await refreshed;
   await expect(page.locator(`.card[data-id="${imageId}"] img`)).toHaveClass(/loaded/);
-  await expect.poll(() => primaryStatuses).toEqual([404, 200]);
+  expect(primaryStatuses[0]).toBe(404);
+  expect(primaryStatuses).toContain(200);
+  expect(admissionRequests).toBe(1);
 });
 
-test('unmounted thumbnail cancels its application retry timer', async ({ page }) => {
+test('unmounted thumbnail aborts its cache poll without another admission', async ({ page }) => {
   const [target] = await imageItems(page, 1);
   expect(target?.id).toBeTruthy();
   const imageId = target.id;
   const thumbnail = fs.readFileSync(path.join(fixtureRoot(), 'batch-a', 'fixture-001.png'));
-  let fallbackRequests = 0;
-  let fallbackPending = true;
-  await page.route(`**/thumb-file/${imageId}.jpg*`, route => route.fulfill({
-    status: 200,
-    contentType: 'image/png',
-    body: thumbnail,
-  }));
+  let admissionRequests = 0;
+  let readyAfterUnmount = false;
+  let releasePoll: () => void = () => undefined;
+  let markPollStarted: () => void = () => undefined;
+  const pollGate = new Promise<void>(resolve => { releasePoll = resolve; });
+  const pollStarted = new Promise<void>(resolve => { markPollStarted = resolve; });
+  await page.route(`**/thumb-file/${imageId}.jpg*`, async route => {
+    if (readyAfterUnmount) {
+      return route.fulfill({status: 200, contentType: 'image/png', body: thumbnail});
+    }
+    markPollStarted();
+    await pollGate;
+    return route.fulfill({status: 404, json: {detail: 'Not found'}});
+  });
   await page.route(`**/thumb/${imageId}*`, route => {
-    fallbackRequests += 1;
-    if (fallbackPending) return route.fulfill({status: 202, json: {retry_after_ms: 1000}});
-    return route.fulfill({status: 200, contentType: 'image/png', body: thumbnail});
+    admissionRequests += 1;
+    return route.fulfill({status: 202, json: {retry_after_ms: 10}});
   });
 
   await waitForGallery(page);
   const image = page.locator(`.card[data-id="${imageId}"] img`);
-  await image.evaluate(element => element.dispatchEvent(new Event('error')));
-  await expect.poll(() => fallbackRequests).toBe(1);
-  fallbackPending = false;
+  await image.evaluate(element => {
+    element.classList.remove('loaded');
+    element.dispatchEvent(new Event('error'));
+  });
+  await expect.poll(() => admissionRequests).toBe(1);
+  await pollStarted;
+  readyAfterUnmount = true;
   const refreshed = page.waitForResponse(response => response.url().includes('/api/images?'));
   await page.locator('#sort-select').dispatchEvent('change');
   await refreshed;
+  releasePoll();
   await page.waitForTimeout(250);
-  expect(fallbackRequests).toBe(1);
+  expect(admissionRequests).toBe(1);
 });
 
 test('/file 422 closes preview flow without a generic alert and removes the image', async ({ page }) => {

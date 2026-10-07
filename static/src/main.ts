@@ -93,6 +93,35 @@ interface MountedGalleryCard {
   signature: string;
 }
 
+type ThumbAdmissionClass = 'visible' | 'near';
+type GalleryScrollDirection = 'forward' | 'backward' | null;
+type ThumbLifecycleState = 'missing' | 'admitting' | 'polling';
+
+interface ThumbLifecycle {
+  imageId: string;
+  version: number;
+  image: HTMLImageElement;
+  primaryUrl: string;
+  admissionUrl: string;
+  state: ThumbLifecycleState;
+  generation: number;
+  startedAt: number;
+  pollAttempts: number;
+  timer: ReturnType<typeof setTimeout> | null;
+  controller: AbortController | null;
+}
+
+interface ThumbnailScrollState {
+  offset: number | null;
+  sampledAt: number | null;
+  velocity: number;
+  direction: GalleryScrollDirection;
+  scrolling: boolean;
+  fast: boolean;
+  fastSamples: number;
+  slowSamples: number;
+}
+
 type ProblemSeverity = 'all' | 'error' | 'warning';
 
 interface ProblemSummary {
@@ -819,12 +848,39 @@ let problemsListReloadQueued = false;
 let problemsPollTimer: ReturnType<typeof setInterval> | null = null;
 const problemRowRechecks = new Set<number>();
 const terminalThumbIds = new Set<string>();
-const thumbRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const thumbLifecycles = new Map<string, ThumbLifecycle>();
+const thumbnailScrollState: ThumbnailScrollState = {
+  offset: null,
+  sampledAt: null,
+  velocity: 0,
+  direction: null,
+  scrolling: false,
+  fast: false,
+  fastSamples: 0,
+  slowSamples: 0,
+};
+let thumbLifecycleGeneration = 0;
+let thumbnailAdmissionFrame: number | null = null;
+let thumbnailScrollSettleTimer: ReturnType<typeof setTimeout> | null = null;
 let terminalGalleryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 const PAGE = 48;
 const MASONRY_COL_MIN = 230;
 const GALLERY_OVERSCAN = 20;
 const CARD_BORDER_WIDTH = 1;
+const THUMB_VELOCITY_EMA_ALPHA = 0.35;
+const THUMB_FAST_ENTER_THRESHOLD = 1.25;
+const THUMB_FAST_EXIT_THRESHOLD = 0.55;
+const THUMB_FAST_ENTER_SAMPLES = 2;
+const THUMB_FAST_EXIT_SAMPLES = 2;
+const THUMB_SCROLL_SAMPLE_MAX_MS = 250;
+const THUMB_SCROLL_SETTLE_FALLBACK_MS = 180;
+const THUMB_NEAR_LOOKAHEAD_MIN_PX = 480;
+const THUMB_NEAR_LOOKAHEAD_VIEWPORTS = 0.75;
+const THUMB_POLL_INITIAL_DELAY_MS = 300;
+const THUMB_POLL_BACKOFF = 1.5;
+const THUMB_POLL_MAX_INTERVAL_MS = 2000;
+const THUMB_POLL_MAX_ATTEMPTS = 30;
+const THUMB_POLL_MAX_LIFETIME_MS = 45_000;
 const SORT_MODES: SortMode[] = ['path_asc', 'path_desc', 'date_desc', 'date_asc', 'size_desc', 'size_asc'];
 const DEFAULT_SORT_MODE: SortMode = 'date_desc';
 
@@ -1824,11 +1880,12 @@ function loadNextImagesPage(): Promise<void> {
   return load.promise;
 }
 
-function thumbnailUrls(img: ImageItem): {primary: string; fallback: string} {
+function thumbnailUrls(img: ImageItem): {primary: string; fallback: string; version: number} {
   const version = Number(img.mtime || 0);
   return {
     primary: `${img.thumb_url || `/thumb-file/${img.id}.jpg`}?v=${version}`,
     fallback: `/thumb/${img.id}?v=${version}`,
+    version,
   };
 }
 
@@ -1863,6 +1920,8 @@ function makeCard(
   bindDiagnosticCardRef(ph, initialDiagnosticRef);
   const sources = thumbnailUrls(img);
   ph.dataset.fallbackSrc = sources.fallback;
+  ph.dataset.primarySrc = sources.primary;
+  ph.dataset.thumbVersion = String(sources.version);
   ph.alt = name;
   ph.decoding = 'async';
   ph.loading = 'eager';
@@ -1892,9 +1951,8 @@ function makeCard(
   };
   ph.onerror = () => {
     galleryDiagnostics.primaryFailed(diagnosticCardRef(ph));
-    const fallback = ph.dataset.fallbackSrc;
-    if (fallback) {
-      void loadThumbWithRetry(ph, fallback);
+    if (ph.dataset.fallbackSrc && ph.dataset.primarySrc) {
+      registerMissingThumbnail(ph);
       return;
     }
     ph.classList.add('loaded');
@@ -1922,92 +1980,213 @@ function updateCardForImage(img: ImageItem): void {
   if (tags) tags.innerHTML = renderTagChips(img);
 }
 
-async function loadThumbWithRetry(img: HTMLImageElement, url: string, attempt = 0): Promise<void> {
-  const imageId = String(img.dataset.imageId || img.closest<HTMLElement>('.card[data-id]')?.dataset.id || '');
-  if (!imageId || terminalThumbIds.has(imageId)) return;
-  const diagnosticRef = diagnosticCardRef(img);
-  const diagnosticStartedAt = galleryDiagnostics.fallbackAttemptStarted(diagnosticRef);
-  thumbRetryTimers.delete(imageId);
-  const maxAttempts = 120;
-  try {
-    const r = await fetch(url, {cache: 'no-store'});
-    galleryDiagnostics.fallbackResponse(diagnosticRef, r.status, diagnosticStartedAt);
-    if (!img.isConnected || terminalThumbIds.has(imageId)) return;
-    if (r.status === 200) {
-      const objectUrl = URL.createObjectURL(await r.blob());
-      if (!img.isConnected || terminalThumbIds.has(imageId)) {
-        URL.revokeObjectURL(objectUrl);
-        return;
-      }
-      img.dataset.objectUrl = objectUrl;
-      img.onload = () => {
-        galleryDiagnostics.fallbackImageLoaded(
-          diagnosticRef,
-          img.complete && img.naturalWidth > 0,
-        );
-        img.classList.add('loaded');
-        URL.revokeObjectURL(objectUrl);
-        delete img.dataset.objectUrl;
-      };
-      img.onerror = () => {
-        galleryDiagnostics.fallbackImageFailed(diagnosticRef);
-        galleryDiagnostics.terminalThumbnailError(diagnosticRef, 'fallback_decode_error');
-        URL.revokeObjectURL(objectUrl);
-        delete img.dataset.objectUrl;
-        img.classList.add('loaded');
-        img.alt = 'Ошибка загрузки';
-      };
-      img.src = objectUrl;
+function currentThumbLifecycle(lifecycle: ThumbLifecycle): boolean {
+  return thumbLifecycles.get(lifecycle.imageId) === lifecycle
+    && lifecycle.image.isConnected
+    && lifecycle.image.dataset.thumbLifecycleGeneration === String(lifecycle.generation)
+    && !terminalThumbIds.has(lifecycle.imageId);
+}
+
+function cancelThumbLifecycle(imageId: string): void {
+  const lifecycle = thumbLifecycles.get(imageId);
+  if (!lifecycle) return;
+  if (lifecycle.timer) clearTimeout(lifecycle.timer);
+  lifecycle.timer = null;
+  lifecycle.controller?.abort();
+  lifecycle.controller = null;
+  thumbLifecycles.delete(imageId);
+}
+
+function registerMissingThumbnail(image: HTMLImageElement): void {
+  const imageId = String(image.dataset.imageId || image.closest<HTMLElement>('.card[data-id]')?.dataset.id || '');
+  const primaryUrl = String(image.dataset.primarySrc || '');
+  const admissionUrl = String(image.dataset.fallbackSrc || '');
+  const version = Number(image.dataset.thumbVersion || 0);
+  if (!imageId || !primaryUrl || !admissionUrl || terminalThumbIds.has(imageId)) return;
+  const existing = thumbLifecycles.get(imageId);
+  if (existing?.image === image && existing.version === version) return;
+  cancelThumbLifecycle(imageId);
+  const lifecycle: ThumbLifecycle = {
+    imageId,
+    version,
+    image,
+    primaryUrl,
+    admissionUrl,
+    state: 'missing',
+    generation: ++thumbLifecycleGeneration,
+    startedAt: 0,
+    pollAttempts: 0,
+    timer: null,
+    controller: null,
+  };
+  image.dataset.thumbLifecycleGeneration = String(lifecycle.generation);
+  thumbLifecycles.set(imageId, lifecycle);
+  scheduleThumbnailAdmissionEvaluation();
+}
+
+function setThumbnailFromBlob(lifecycle: ThumbLifecycle, blob: Blob): void {
+  if (!currentThumbLifecycle(lifecycle)) return;
+  const image = lifecycle.image;
+  const diagnosticRef = diagnosticCardRef(image);
+  const objectUrl = URL.createObjectURL(blob);
+  image.dataset.objectUrl = objectUrl;
+  image.onload = () => {
+    if (thumbLifecycles.get(lifecycle.imageId) !== lifecycle) {
+      URL.revokeObjectURL(objectUrl);
       return;
     }
-    if (r.status === 202 && attempt < maxAttempts) {
-      let retryAfter = 180;
-      try {
-        const p = await readJsonRecord(r);
-        retryAfter = Math.min(1500, Math.max(80, Number(p.retry_after_ms || retryAfter)));
-      } catch {}
-      const timer = setTimeout(() => {
-        thumbRetryTimers.delete(imageId);
-        if (img.isConnected && !terminalThumbIds.has(imageId)) void loadThumbWithRetry(img, url, attempt + 1);
-      }, retryAfter);
-      thumbRetryTimers.set(imageId, timer);
-      return;
-    }
-    if (r.status === 422) {
-      const payload = await readJsonRecord(r).catch((): JsonRecord => ({}));
-      if (payload.error === 'image_unavailable') {
-        galleryDiagnostics.terminalThumbnailUnavailable(diagnosticRef);
-        handleTerminalImageUnavailable(imageId);
-        return;
-      }
-    }
-    console.warn('Thumbnail request failed', {url, status: r.status, attempt});
-    galleryDiagnostics.terminalThumbnailError(
+    galleryDiagnostics.fallbackImageLoaded(
       diagnosticRef,
-      r.status === 202 ? 'fallback_202_exhausted' : `fallback_http_${r.status}`,
+      image.complete && image.naturalWidth > 0,
     );
+    image.classList.add('loaded');
+    URL.revokeObjectURL(objectUrl);
+    delete image.dataset.objectUrl;
+    thumbLifecycles.delete(lifecycle.imageId);
+    scheduleThumbnailAdmissionEvaluation();
+  };
+  image.onerror = () => {
+    galleryDiagnostics.fallbackImageFailed(diagnosticRef);
+    failThumbLifecycle(lifecycle, 'fallback_decode_error');
+    URL.revokeObjectURL(objectUrl);
+    delete image.dataset.objectUrl;
+  };
+  image.src = objectUrl;
+}
+
+function failThumbLifecycle(lifecycle: ThumbLifecycle, reason: string): void {
+  if (!currentThumbLifecycle(lifecycle)) return;
+  const image = lifecycle.image;
+  galleryDiagnostics.terminalThumbnailError(diagnosticCardRef(image), reason);
+  cancelThumbLifecycle(lifecycle.imageId);
+  image.classList.add('loaded');
+  image.alt = 'Ошибка загрузки';
+  scheduleThumbnailAdmissionEvaluation();
+}
+
+function unavailableThumbLifecycle(lifecycle: ThumbLifecycle): void {
+  if (!currentThumbLifecycle(lifecycle)) return;
+  galleryDiagnostics.terminalThumbnailUnavailable(diagnosticCardRef(lifecycle.image));
+  handleTerminalImageUnavailable(lifecycle.imageId);
+}
+
+function thumbAdmissionRequestUrl(lifecycle: ThumbLifecycle, admissionClass: ThumbAdmissionClass): string {
+  const url = new URL(lifecycle.admissionUrl, window.location.href);
+  url.searchParams.set('class', admissionClass);
+  return `${url.pathname}${url.search}`;
+}
+
+async function admitMissingThumbnail(
+  lifecycle: ThumbLifecycle,
+  admissionClass: ThumbAdmissionClass,
+): Promise<void> {
+  if (!currentThumbLifecycle(lifecycle) || lifecycle.state !== 'missing') return;
+  lifecycle.state = 'admitting';
+  lifecycle.startedAt = performance.now();
+  const controller = new AbortController();
+  lifecycle.controller = controller;
+  const diagnosticRef = diagnosticCardRef(lifecycle.image);
+  const diagnosticStartedAt = galleryDiagnostics.fallbackAttemptStarted(diagnosticRef);
+  const url = thumbAdmissionRequestUrl(lifecycle, admissionClass);
+  try {
+    const response = await fetch(url, {cache: 'no-store', signal: controller.signal});
+    galleryDiagnostics.fallbackResponse(diagnosticRef, response.status, diagnosticStartedAt);
+    if (!currentThumbLifecycle(lifecycle)) return;
+    if (response.status === 200) {
+      setThumbnailFromBlob(lifecycle, await response.blob());
+      return;
+    }
+    if (response.status === 202) {
+      let initialDelay = THUMB_POLL_INITIAL_DELAY_MS;
+      try {
+        const payload = await readJsonRecord(response);
+        initialDelay = Math.max(initialDelay, Number(payload.retry_after_ms || 0));
+      } catch {}
+      lifecycle.state = 'polling';
+      scheduleThumbFilePoll(lifecycle, Math.min(initialDelay, THUMB_POLL_MAX_INTERVAL_MS));
+      return;
+    }
+    if (response.status === 422) {
+      const payload = await readJsonRecord(response).catch((): JsonRecord => ({}));
+      if (payload.error === 'image_unavailable') {
+        unavailableThumbLifecycle(lifecycle);
+        return;
+      }
+    }
+    console.warn('Thumbnail admission failed', {url, status: response.status, admissionClass});
+    failThumbLifecycle(lifecycle, `fallback_http_${response.status}`);
   } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return;
     galleryDiagnostics.fallbackNetworkError(diagnosticRef);
-    galleryDiagnostics.terminalThumbnailError(diagnosticRef, 'fallback_network_error');
-    console.warn('Thumbnail request failed', {url, attempt, error});
+    console.warn('Thumbnail admission failed', {url, admissionClass, error});
+    failThumbLifecycle(lifecycle, 'fallback_network_error');
+  } finally {
+    if (lifecycle.controller === controller) lifecycle.controller = null;
   }
-  img.classList.add('loaded');
-  img.alt = 'Ошибка загрузки';
+}
+
+function scheduleThumbFilePoll(lifecycle: ThumbLifecycle, delay?: number): void {
+  if (!currentThumbLifecycle(lifecycle) || lifecycle.state !== 'polling') return;
+  const elapsed = performance.now() - lifecycle.startedAt;
+  if (lifecycle.pollAttempts >= THUMB_POLL_MAX_ATTEMPTS || elapsed >= THUMB_POLL_MAX_LIFETIME_MS) {
+    failThumbLifecycle(lifecycle, 'thumb_file_poll_exhausted');
+    return;
+  }
+  const nextDelay = delay ?? Math.min(
+    THUMB_POLL_MAX_INTERVAL_MS,
+    THUMB_POLL_INITIAL_DELAY_MS * THUMB_POLL_BACKOFF ** lifecycle.pollAttempts,
+  );
+  lifecycle.timer = setTimeout(() => {
+    lifecycle.timer = null;
+    void pollThumbFile(lifecycle);
+  }, nextDelay);
+}
+
+async function pollThumbFile(lifecycle: ThumbLifecycle): Promise<void> {
+  if (!currentThumbLifecycle(lifecycle) || lifecycle.state !== 'polling') return;
+  lifecycle.pollAttempts += 1;
+  const controller = new AbortController();
+  lifecycle.controller = controller;
+  const diagnosticRef = diagnosticCardRef(lifecycle.image);
+  const diagnosticStartedAt = galleryDiagnostics.fallbackAttemptStarted(diagnosticRef);
+  try {
+    const response = await fetch(lifecycle.primaryUrl, {cache: 'no-store', signal: controller.signal});
+    galleryDiagnostics.fallbackResponse(diagnosticRef, response.status, diagnosticStartedAt);
+    if (!currentThumbLifecycle(lifecycle)) return;
+    if (response.status === 200) {
+      setThumbnailFromBlob(lifecycle, await response.blob());
+      return;
+    }
+    if (response.status === 404) {
+      scheduleThumbFilePoll(lifecycle);
+      return;
+    }
+    if (response.status === 422) {
+      const payload = await readJsonRecord(response).catch((): JsonRecord => ({}));
+      if (payload.error === 'image_unavailable') {
+        unavailableThumbLifecycle(lifecycle);
+        return;
+      }
+    }
+    console.warn('Thumbnail cache poll failed', {url: lifecycle.primaryUrl, status: response.status});
+    failThumbLifecycle(lifecycle, `thumb_file_http_${response.status}`);
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return;
+    galleryDiagnostics.fallbackNetworkError(diagnosticRef);
+    if (currentThumbLifecycle(lifecycle)) scheduleThumbFilePoll(lifecycle);
+  } finally {
+    if (lifecycle.controller === controller) lifecycle.controller = null;
+  }
 }
 
 function acceptActiveImage(imageId: string): void {
   terminalThumbIds.delete(imageId);
-  const timer = thumbRetryTimers.get(imageId);
-  if (timer) clearTimeout(timer);
-  thumbRetryTimers.delete(imageId);
 }
 
 function handleTerminalImageUnavailable(imageId: string): void {
   if (!imageId || terminalThumbIds.has(imageId)) return;
   terminalThumbIds.add(imageId);
-  const timer = thumbRetryTimers.get(imageId);
-  if (timer) clearTimeout(timer);
-  thumbRetryTimers.delete(imageId);
+  cancelThumbLifecycle(imageId);
   if (activeTab().lastImageId === imageId || lightboxImages[lbIndex]?.id === imageId) {
     previewRequestToken += 1;
     closePreview(true);
@@ -3485,6 +3664,130 @@ function estimateVirtualCardSize(index: number, geometry: GalleryGeometry): numb
   return contentWidth / imageAspectRatio(image) + geometry.borderWidth * 2;
 }
 
+function updateThumbnailScrollState(
+  instance: Virtualizer<Window, HTMLDivElement>,
+  sync: boolean,
+): void {
+  const now = performance.now();
+  const offset = Number.isFinite(instance.scrollOffset) ? Number(instance.scrollOffset) : window.scrollY;
+  const previousOffset = thumbnailScrollState.offset;
+  const previousSampledAt = thumbnailScrollState.sampledAt;
+  const offsetChanged = previousOffset === null || Math.abs(offset - previousOffset) >= 0.5;
+  if (instance.scrollDirection) thumbnailScrollState.direction = instance.scrollDirection;
+  if (!sync) {
+    if (thumbnailScrollSettleTimer) clearTimeout(thumbnailScrollSettleTimer);
+    thumbnailScrollSettleTimer = null;
+    thumbnailScrollState.offset = offset;
+    thumbnailScrollState.sampledAt = now;
+    thumbnailScrollState.velocity = 0;
+    thumbnailScrollState.scrolling = false;
+    thumbnailScrollState.fast = false;
+    thumbnailScrollState.fastSamples = 0;
+    thumbnailScrollState.slowSamples = 0;
+    return;
+  }
+  thumbnailScrollState.scrolling = true;
+  if (offsetChanged || !thumbnailScrollSettleTimer) {
+    if (thumbnailScrollSettleTimer) clearTimeout(thumbnailScrollSettleTimer);
+    thumbnailScrollSettleTimer = setTimeout(() => {
+      thumbnailScrollSettleTimer = null;
+      thumbnailScrollState.velocity = 0;
+      thumbnailScrollState.scrolling = false;
+      thumbnailScrollState.fast = false;
+      thumbnailScrollState.fastSamples = 0;
+      thumbnailScrollState.slowSamples = 0;
+      reevaluateThumbnailAdmissions(instance);
+    }, THUMB_SCROLL_SETTLE_FALLBACK_MS);
+  }
+  if (previousOffset !== null && previousSampledAt !== null) {
+    const elapsed = now - previousSampledAt;
+    const delta = offset - previousOffset;
+    if (!instance.scrollDirection && delta !== 0) {
+      thumbnailScrollState.direction = delta > 0 ? 'forward' : 'backward';
+    }
+    if (elapsed > 0 && elapsed <= THUMB_SCROLL_SAMPLE_MAX_MS) {
+      const sample = Math.abs(delta) / elapsed;
+      thumbnailScrollState.velocity = thumbnailScrollState.velocity === 0
+        ? sample
+        : THUMB_VELOCITY_EMA_ALPHA * sample
+          + (1 - THUMB_VELOCITY_EMA_ALPHA) * thumbnailScrollState.velocity;
+      if (thumbnailScrollState.fast) {
+        thumbnailScrollState.slowSamples = thumbnailScrollState.velocity <= THUMB_FAST_EXIT_THRESHOLD
+          ? thumbnailScrollState.slowSamples + 1
+          : 0;
+        if (thumbnailScrollState.slowSamples >= THUMB_FAST_EXIT_SAMPLES) {
+          thumbnailScrollState.fast = false;
+          thumbnailScrollState.fastSamples = 0;
+        }
+      } else {
+        thumbnailScrollState.fastSamples = thumbnailScrollState.velocity >= THUMB_FAST_ENTER_THRESHOLD
+          ? thumbnailScrollState.fastSamples + 1
+          : 0;
+        if (thumbnailScrollState.fastSamples >= THUMB_FAST_ENTER_SAMPLES) {
+          thumbnailScrollState.fast = true;
+          thumbnailScrollState.slowSamples = 0;
+        }
+      }
+    }
+  }
+  thumbnailScrollState.offset = offset;
+  thumbnailScrollState.sampledAt = now;
+}
+
+function virtualItemIsNear(
+  item: VirtualItem,
+  geometry: GalleryGeometry,
+  direction: GalleryScrollDirection,
+): boolean {
+  const viewportStart = window.scrollY - geometry.scrollMargin;
+  const viewportEnd = viewportStart + window.innerHeight;
+  const itemStart = item.start - geometry.scrollMargin;
+  const itemEnd = item.end - geometry.scrollMargin;
+  const distance = Math.max(
+    THUMB_NEAR_LOOKAHEAD_MIN_PX,
+    window.innerHeight * THUMB_NEAR_LOOKAHEAD_VIEWPORTS,
+  );
+  if (direction === 'backward') {
+    return itemEnd < viewportStart && viewportStart - itemEnd <= distance;
+  }
+  return itemStart > viewportEnd && itemStart - viewportEnd <= distance;
+}
+
+function reevaluateThumbnailAdmissions(
+  instance: Virtualizer<Window, HTMLDivElement> | null = galleryVirtualizer,
+): void {
+  if (!instance || !galleryGeometry || thumbnailScrollState.fast) return;
+  const visible: ThumbLifecycle[] = [];
+  const near: ThumbLifecycle[] = [];
+  for (const item of instance.getVirtualItems()) {
+    const image = visibleImages[item.index];
+    if (!image) continue;
+    const lifecycle = thumbLifecycles.get(image.id);
+    if (!lifecycle || !currentThumbLifecycle(lifecycle)) continue;
+    if (virtualItemIsVisible(item, galleryGeometry)) {
+      visible.push(lifecycle);
+    } else if (
+      lifecycle.state === 'missing'
+      && virtualItemIsNear(item, galleryGeometry, thumbnailScrollState.direction)
+    ) {
+      near.push(lifecycle);
+    }
+  }
+  for (const lifecycle of visible) {
+    if (lifecycle.state === 'missing') void admitMissingThumbnail(lifecycle, 'visible');
+  }
+  if (visible.length > 0 || thumbnailScrollState.scrolling) return;
+  for (const lifecycle of near) void admitMissingThumbnail(lifecycle, 'near');
+}
+
+function scheduleThumbnailAdmissionEvaluation(): void {
+  if (thumbnailAdmissionFrame !== null) return;
+  thumbnailAdmissionFrame = requestAnimationFrame(() => {
+    thumbnailAdmissionFrame = null;
+    reevaluateThumbnailAdmissions();
+  });
+}
+
 function galleryVirtualizerOptions(geometry: GalleryGeometry): VirtualizerOptions<Window, HTMLDivElement> {
   return {
     count: visibleImages.length,
@@ -3495,12 +3798,14 @@ function galleryVirtualizerOptions(geometry: GalleryGeometry): VirtualizerOption
     observeElementRect: observeWindowRect,
     observeElementOffset: observeWindowOffset,
     onChange: (instance, sync) => {
+      updateThumbnailScrollState(instance, sync);
       galleryDiagnostics.virtualizerChanged(
         sync,
         Number.isFinite(instance.scrollOffset) ? Number(instance.scrollOffset) : null,
         instance.scrollDirection,
       );
       renderVirtualGalleryRange(instance);
+      reevaluateThumbnailAdmissions(instance);
       schedulePaginationPrefetch(instance);
     },
     lanes: geometry.laneCount,
@@ -3524,9 +3829,7 @@ function cardRenderSignature(image: ImageItem): string {
 }
 
 function clearThumbLifecycle(imageId: string, card: HTMLElement): void {
-  const timer = thumbRetryTimers.get(imageId);
-  if (timer) clearTimeout(timer);
-  thumbRetryTimers.delete(imageId);
+  cancelThumbLifecycle(imageId);
   const image = card.querySelector('img');
   if (image instanceof HTMLImageElement) {
     image.onload = null;
@@ -3534,6 +3837,7 @@ function clearThumbLifecycle(imageId: string, card: HTMLElement): void {
     const objectUrl = image.dataset.objectUrl;
     if (objectUrl) URL.revokeObjectURL(objectUrl);
     delete image.dataset.objectUrl;
+    delete image.dataset.thumbLifecycleGeneration;
   }
 }
 

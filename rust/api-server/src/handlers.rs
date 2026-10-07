@@ -40,6 +40,27 @@ pub struct ImagesRequest {
     include_total: bool,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct ThumbRequest {
+    #[serde(rename = "class")]
+    priority_class: Option<String>,
+}
+
+const THUMB_PRIORITY_BACKGROUND: i32 = 10;
+const THUMB_PRIORITY_LEGACY: i32 = 30;
+const THUMB_PRIORITY_NEAR: i32 = 40;
+const THUMB_PRIORITY_VISIBLE: i32 = 50;
+
+fn thumb_priority(query: &ThumbRequest) -> Result<i32, ApiError> {
+    match query.priority_class.as_deref() {
+        None => Ok(THUMB_PRIORITY_LEGACY),
+        Some("visible") => Ok(THUMB_PRIORITY_VISIBLE),
+        Some("near") => Ok(THUMB_PRIORITY_NEAR),
+        Some("background") => Ok(THUMB_PRIORITY_BACKGROUND),
+        Some(_) => Err(ApiError::bad_request("invalid thumbnail priority class")),
+    }
+}
+
 fn boolish<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: Deserializer<'de>,
@@ -621,8 +642,10 @@ pub async fn get_thumb_file(
 pub async fn get_thumb(
     State(state): State<Arc<AppState>>,
     Path(img_id): Path<String>,
+    Query(query): Query<ThumbRequest>,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
+    let priority = thumb_priority(&query)?;
     let client = state.connect()?;
     let image = get_image_record_for_delivery(&client, &img_id)?
         .ok_or_else(|| ApiError::not_found("Not found"))?;
@@ -655,7 +678,7 @@ pub async fn get_thumb(
             &image.path,
             &image.thumb,
             image.mtime,
-            30,
+            priority,
             state.config.thumb_max_attempts,
         );
         let (job, _) = match enqueue {
@@ -1046,9 +1069,13 @@ mod tests {
         let state = test_state(dir.path(), db_path.clone());
 
         for _ in 0..2 {
-            let response = get_thumb(State(state.clone()), Path("image-1".to_string()))
-                .await
-                .unwrap();
+            let response = get_thumb(
+                State(state.clone()),
+                Path("image-1".to_string()),
+                Query(ThumbRequest::default()),
+            )
+            .await
+            .unwrap();
             assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let payload: Value = serde_json::from_slice(&body).unwrap();
@@ -1145,6 +1172,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thumbnail_priority_classes_preserve_legacy_and_promote_queued_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        insert_delivery_image(&conn, dir.path(), &encoded(ImageFormat::Jpeg));
+        drop(conn);
+        let state = test_state(dir.path(), db_path);
+
+        for (priority_class, expected_priority) in [
+            (None, THUMB_PRIORITY_LEGACY),
+            (Some("near"), THUMB_PRIORITY_NEAR),
+            (Some("visible"), THUMB_PRIORITY_VISIBLE),
+        ] {
+            let response = get_thumb(
+                State(state.clone()),
+                Path("image-1".to_string()),
+                Query(ThumbRequest {
+                    priority_class: priority_class.map(str::to_string),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let conn = state.connect().unwrap();
+            let priority: i32 = conn
+                .query_row(
+                    "SELECT priority FROM jobs WHERE job_type = 'thumb'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(priority, expected_priority);
+            assert_eq!(count_sqlite_jobs(&conn, Some("thumb"), None).unwrap(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_thumbnail_priority_class_cannot_enqueue_arbitrary_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        insert_delivery_image(&conn, dir.path(), &encoded(ImageFormat::Jpeg));
+        drop(conn);
+        let state = test_state(dir.path(), db_path);
+
+        let error = get_thumb(
+            State(state.clone()),
+            Path("image-1".to_string()),
+            Query(ThumbRequest {
+                priority_class: Some("999999".to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        let conn = state.connect().unwrap();
+        assert_eq!(count_sqlite_jobs(&conn, Some("thumb"), None).unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn mismatch_warning_serves_thumb_and_uses_detected_original_mime() {
         for (format, detected, mime) in [
             (ImageFormat::Png, "png", "image/png"),
@@ -1176,9 +1263,13 @@ mod tests {
             drop(conn);
             let state = test_state(dir.path(), db_path);
 
-            let thumb_response = get_thumb(State(state.clone()), Path("image-1".to_string()))
-                .await
-                .unwrap();
+            let thumb_response = get_thumb(
+                State(state.clone()),
+                Path("image-1".to_string()),
+                Query(ThumbRequest::default()),
+            )
+            .await
+            .unwrap();
             assert_eq!(thumb_response.status(), StatusCode::OK);
             let file_response = get_file(State(state), Path("image-1".to_string()))
                 .await

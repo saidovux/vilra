@@ -282,3 +282,54 @@ test('stale cursor page cannot append after sort generation changes', async ({pa
   await expect(page.locator('.card[data-id^="stale-a-"]')).toHaveCount(0);
   await expect(page.locator('.card[data-id^="fresh-b-"]')).not.toHaveCount(0);
 });
+
+test('completed slow cursor page can trigger the next page while user remains near the end', async ({page}) => {
+  let releaseSlowPage: () => void = () => undefined;
+  let markSlowPageStarted: () => void = () => undefined;
+  const slowPageGate = new Promise<void>(resolve => { releaseSlowPage = resolve; });
+  const slowPageStarted = new Promise<void>(resolve => { markSlowPageStarted = resolve; });
+  const requestedOffsets: number[] = [];
+
+  await page.route('**/api/events', route => route.abort());
+  await page.route('**/api/session', async route => {
+    if (route.request().method() !== 'GET') return route.continue();
+    const response = await route.fetch();
+    const payload = await response.json();
+    return route.fulfill({response, json: {
+      ...payload,
+      tabs: [],
+      active_tab_id: null,
+      last_image_id: null,
+      scroll_top: 0,
+    }});
+  });
+  await page.route('**/api/images?**', async route => {
+    const url = new URL(route.request().url());
+    const offset = Math.max(0, Number(url.searchParams.get('cursor')) || 0);
+    requestedOffsets.push(offset);
+    if (offset === PAGE_SIZE) {
+      markSlowPageStarted();
+      await slowPageGate;
+    }
+    const end = Math.min(PAGE_SIZE * 3, offset + PAGE_SIZE);
+    return route.fulfill({json: {
+      items: Array.from({length: end - offset}, (_, index) => syntheticImage(offset + index)),
+      page: {
+        total: offset === 0 ? PAGE_SIZE * 3 : null,
+        next_cursor: end < PAGE_SIZE * 3 ? String(end) : null,
+        has_more: end < PAGE_SIZE * 3,
+      },
+    }});
+  });
+  await page.route('**/thumb-file/**', route => route.fulfill({status: 200, contentType: 'image/png', body: THUMBNAIL}));
+
+  await page.goto('/');
+  await expect(page.locator('.card[data-id]').first()).toBeVisible();
+  await slowPageStarted;
+  await page.evaluate(() => window.scrollTo({top: document.documentElement.scrollHeight}));
+  releaseSlowPage();
+
+  await expect.poll(() => requestedOffsets.includes(PAGE_SIZE * 2)).toBe(true);
+  expect(requestedOffsets.filter(offset => offset === PAGE_SIZE)).toHaveLength(1);
+  expect(requestedOffsets.filter(offset => offset === PAGE_SIZE * 2)).toHaveLength(1);
+});

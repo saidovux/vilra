@@ -301,17 +301,27 @@ test('late queue response cannot mutate a stopped report', async ({page}) => {
   expect(await diagnostics.reportJson()).toBe(before);
 });
 
-test('thumbnail lifecycle separates repeated 202 attempts, recovery, failure, remount, and visibility', async ({page}) => {
+test('thumbnail lifecycle separates one 202 admission, cache polling, failure, remount, and visibility', async ({page}) => {
   test.setTimeout(90_000);
   const synthetic = await installSyntheticMetadata(page);
   let releaseThumbnails: () => void = () => undefined;
   const thumbnailGate = new Promise<void>(resolve => { releaseThumbnails = resolve; });
   const fallbackAttempts = new Map<string, number>();
+  const admitted = new Set<string>();
+  const cachePollAttempts = new Map<string, number>();
   await page.route('**/thumb-file/**', async route => {
     await thumbnailGate;
     const path = new URL(route.request().url()).pathname;
     if (path.includes('00150')) await new Promise(resolve => setTimeout(resolve, 300));
-    if (path.includes('00000') || path.includes('00001')) {
+    if (path.includes('00000')) {
+      const count = (cachePollAttempts.get(path) || 0) + 1;
+      cachePollAttempts.set(path, count);
+      if (admitted.has(path.replace('/thumb-file/', '/thumb/').replace('.jpg', '')) && count >= 3) {
+        return route.fulfill({status: 200, contentType: 'image/png', body: THUMBNAIL});
+      }
+      return route.fulfill({status: 404, headers: {'cache-control': 'no-store'}, json: {detail: 'Not found'}});
+    }
+    if (path.includes('00001')) {
       return route.fulfill({status: 404, headers: {'cache-control': 'no-store'}, json: {detail: 'Not found'}});
     }
     return route.fulfill({status: 200, contentType: 'image/png', body: THUMBNAIL});
@@ -320,7 +330,8 @@ test('thumbnail lifecycle separates repeated 202 attempts, recovery, failure, re
     const path = new URL(route.request().url()).pathname;
     const count = (fallbackAttempts.get(path) || 0) + 1;
     fallbackAttempts.set(path, count);
-    if (path.includes('00000') && count <= 2) {
+    admitted.add(path);
+    if (path.includes('00000')) {
       return route.fulfill({status: 202, json: {retry_after_ms: 1}});
     }
     if (path.includes('00001')) {
@@ -348,7 +359,7 @@ test('thumbnail lifecycle separates repeated 202 attempts, recovery, failure, re
   const report = await diagnostics.report();
   const json = JSON.stringify(report);
 
-  expect(report.thumbnails.fallback_http_202).toBe(2);
+  expect(report.thumbnails.fallback_http_202).toBe(1);
   expect(report.thumbnails.mount_lifecycles_with_202).toBe(1);
   expect(report.thumbnails.mount_lifecycles_recovered).toBe(1);
   expect(report.thumbnails.mount_lifecycles_failed).toBeGreaterThanOrEqual(1);
