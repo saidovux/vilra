@@ -344,7 +344,10 @@ test('original opening is independent from thumbnail state', async ({ page }) =>
 
 test('sidebar exposes folder tags above physical libraries and filters by multiple tags', async ({ page }) => {
   await waitForGallery(page);
-  await page.locator('#folder-sidebar-toggle').click();
+  const sidebar = page.locator('#folder-sidebar');
+  if (await sidebar.evaluate(element => element.classList.contains('collapsed'))) {
+    await page.locator('#folder-sidebar-toggle').click();
+  }
   await expect(page.locator('#folder-sidebar')).not.toHaveClass(/collapsed/);
 
   const autoGroup = page.locator('.sidebar-tags-section');
@@ -445,9 +448,7 @@ test('Problems view lists live file issues and rechecks one stored path', async 
     }, {timeout: 15_000}).toBeGreaterThan(0);
 
     await waitForGallery(page);
-    await page.locator('#folder-sidebar-toggle').click();
-    await page.locator('#problems-nav').click();
-    await expect(page.locator('#problems-wrap')).toBeVisible();
+    await openProblems(page);
     expect((await page.locator('.problems-head').boundingBox())?.height).toBeLessThan(150);
     const row = page.locator('.problem-row').filter({hasText: 'e2e-broken.jpg'});
     await expect(row).toBeVisible({timeout: 15_000});

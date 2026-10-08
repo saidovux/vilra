@@ -964,7 +964,7 @@ let thumbnailAdmissionFrame: number | null = null;
 let thumbnailScrollSettleTimer: ReturnType<typeof setTimeout> | null = null;
 let terminalGalleryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 const PAGE = 48;
-const MASONRY_COL_MIN = 230;
+const MASONRY_COL_MIN = 218;
 const GALLERY_OVERSCAN = 20;
 const CARD_BORDER_WIDTH = 1;
 const THUMB_VELOCITY_EMA_ALPHA = 0.35;
@@ -1129,6 +1129,7 @@ function toggleFolderSidebar(force?: boolean): void {
   if (!sidebar) return;
   const open = force === undefined ? sidebar.classList.contains('collapsed') : Boolean(force);
   sidebar.classList.toggle('collapsed', !open);
+  requestAnimationFrame(handleGalleryResize);
 }
 
 function updateRootSummary(): void {
@@ -3599,11 +3600,13 @@ function renderPreviewMeta(img: ImageItem, loading: boolean): void {
   const resolution = `${img.width || '?'} × ${img.height || '?'}`;
   requiredHtml('preview-name').textContent = loading ? `Загрузка: ${name}` : name;
   requiredHtml('preview-size').textContent = fmtSize(img.size) || '—';
+  const previewMetaName = optionalHtml('preview-meta-name');
   const previewResolution = optionalHtml('preview-resolution');
   const previewFormat = optionalHtml('preview-format');
   const previewPath = optionalHtml('preview-path');
   const previewHudResolution = optionalHtml('preview-hud-resolution');
   const previewIndex = optionalHtml('preview-index');
+  if (previewMetaName) previewMetaName.textContent = name;
   if (previewResolution) previewResolution.textContent = resolution;
   if (previewFormat) previewFormat.textContent = imageFormat(img.path);
   if (previewPath) previewPath.textContent = img.path;
@@ -3665,7 +3668,7 @@ function renderPreviewFilmstrip(): void {
     });
     target.appendChild(button);
   }
-  const label = previewFilmMode === 'tag' ? 'ТОТ ЖЕ ТЕГ' : previewFilmMode === 'folder' ? 'ПАПКА' : 'РЯДОМ';
+  const label = previewFilmMode === 'tag' ? 'SAME TAG' : previewFilmMode === 'folder' ? 'FOLDER' : 'NEARBY';
   info.textContent = `${label} · ${items.length}`;
   requestAnimationFrame(() => {
     target.querySelector<HTMLElement>('.preview-film-item.active')?.scrollIntoView({inline: 'center', block: 'nearest'});
@@ -4580,6 +4583,9 @@ function runAction(actionEl: HTMLElement): void {
       break;
     case 'clear-image-selection':
       clearImageSelection();
+      break;
+    case 'close-preview':
+      closePreview();
       break;
     case 'close-graph':
       closeGraph();

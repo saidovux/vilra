@@ -22,7 +22,7 @@
   </section>
 
   <section id="gallery-screen" style="display:none;">
-    <aside id="folder-sidebar" class="collapsed" aria-label="Теги и библиотеки">
+    <aside id="folder-sidebar" aria-label="Теги и библиотеки">
       <div id="folder-sidebar-panel">
         <section class="sidebar-section sidebar-tags-section">
           <div class="sidebar-section-head">
@@ -198,10 +198,10 @@
           <option value="size_asc">Сначала маленькие</option>
         </select>
       </div>
-      <div id="selected-filter-tags" class="chip-row"></div>
     </div>
 
     <main id="gallery-wrap">
+      <div id="selected-filter-tags" class="chip-row"></div>
       <div id="gallery"></div>
       <div id="empty-state">
         <div>
@@ -212,12 +212,12 @@
     </main>
 
     <div id="selection-tray" aria-live="polite" aria-label="Действия над выбранными изображениями">
-      <span class="selection-count"><span id="selection-count">0</span> выбрано</span>
+      <span class="selection-count"><span id="selection-count">0</span> selected</span>
       <span class="selection-separator" aria-hidden="true"></span>
-      <button class="btn btn-ghost btn-sm" type="button" data-action="batch-add-tag">Теги</button>
-      <button class="btn btn-ghost btn-sm" type="button" disabled title="Связи появятся после отдельной реализации backend">Связать</button>
-      <button class="btn btn-ghost btn-sm" type="button" disabled title="Перемещение появится после отдельной реализации backend">Переместить</button>
-      <button class="btn btn-ghost btn-sm" type="button" disabled title="Пакетное удаление появится после отдельной реализации backend">Удалить</button>
+      <button class="btn btn-ghost btn-sm" type="button" data-action="batch-add-tag">Tags</button>
+      <button class="btn btn-ghost btn-sm" type="button" disabled title="Links require a separate backend implementation">Link</button>
+      <button class="btn btn-ghost btn-sm" type="button" disabled title="Move requires a separate backend implementation">Move</button>
+      <button class="btn btn-ghost btn-sm" type="button" disabled title="Batch removal requires a separate backend implementation">Remove</button>
       <button class="btn btn-ghost icon-btn" type="button" data-action="clear-image-selection" title="Снять выделение">×</button>
     </div>
 
@@ -275,7 +275,8 @@
         <button id="preview-inspector-toggle" class="btn btn-ghost btn-sm preview-toolbar-button" type="button" data-action="toggle-preview-chrome" title="Скрыть интерфейс Viewer · I">
           Inspector <span class="preview-kbd">I</span>
         </button>
-        <a id="preview-open" href="#" target="_blank" class="btn btn-ghost btn-sm preview-toolbar-button">Оригинал</a>
+        <a id="preview-open" href="#" target="_blank" class="btn btn-ghost btn-sm preview-toolbar-button">Original</a>
+        <button id="preview-viewer-close" class="btn btn-ghost icon-btn" type="button" data-action="close-preview" title="Закрыть · Esc">×</button>
       </div>
     </header>
 
@@ -293,7 +294,7 @@
         <span>·</span>
         <span id="preview-hud-resolution">—</span>
         <span>·</span>
-        <span>колесо — масштаб</span>
+        <span>wheel zooms toward cursor</span>
       </div>
     </main>
 
@@ -304,21 +305,23 @@
       </div>
 
       <section class="preview-inspector-section">
-        <div class="preview-section-label">Файл</div>
+        <div class="preview-section-label">File</div>
         <div class="preview-meta-grid">
-          <span class="preview-meta-key">Разрешение</span>
+          <span class="preview-meta-key">Name</span>
+          <span id="preview-meta-name" class="preview-meta-value">—</span>
+          <span class="preview-meta-key">Resolution</span>
           <span id="preview-resolution" class="preview-meta-value">—</span>
-          <span class="preview-meta-key">Размер</span>
+          <span class="preview-meta-key">Size</span>
           <span id="preview-size" class="preview-meta-value">—</span>
-          <span class="preview-meta-key">Формат</span>
+          <span class="preview-meta-key">Format</span>
           <span id="preview-format" class="preview-meta-value">—</span>
-          <span class="preview-meta-key">Путь</span>
+          <span class="preview-meta-key">Path</span>
           <span id="preview-path" class="preview-meta-value preview-path-value">—</span>
         </div>
       </section>
 
       <section id="preview-tag-panel" class="preview-inspector-section">
-        <div class="preview-section-label">Теги</div>
+        <div class="preview-section-label">Tags</div>
         <div id="preview-tag-list" class="preview-tag-group">
           <div id="preview-auto-tags" class="chip-row preview-tag-source"></div>
           <div id="preview-user-tags" class="chip-row preview-tag-source"></div>
@@ -331,7 +334,20 @@
             <input id="preview-tag-input" type="text" placeholder="Добавить тег" autocomplete="off">
           </div>
           <button id="preview-tag-pick" class="btn btn-ghost btn-sm" data-action="toggle-preview-tag-dropdown" title="Выбрать из списка">▾</button>
-          <button class="btn btn-primary btn-sm" data-action="add-tag-from-preview-input">Добавить</button>
+          <button class="btn btn-primary btn-sm" data-action="add-tag-from-preview-input" title="Добавить тег">+</button>
+        </div>
+      </section>
+
+      <section class="preview-inspector-section">
+        <div class="preview-section-label">Notes</div>
+        <textarea class="preview-notes-field" aria-label="Notes" disabled></textarea>
+      </section>
+
+      <section class="preview-inspector-section">
+        <div class="preview-section-label">Links</div>
+        <div class="preview-linked-summary">
+          <span>Linked images</span>
+          <button class="btn btn-ghost" type="button" disabled>0 linked</button>
         </div>
       </section>
     </aside>
@@ -339,9 +355,11 @@
     <footer id="preview-filmstrip">
       <div class="preview-film-head">
         <div id="preview-film-modes">
-          <button class="active" type="button" data-action="set-preview-film-mode" data-mode="nearby">Рядом</button>
-          <button type="button" data-action="set-preview-film-mode" data-mode="tag">Тот же тег</button>
-          <button type="button" data-action="set-preview-film-mode" data-mode="folder">Папка</button>
+          <button class="active" type="button" data-action="set-preview-film-mode" data-mode="nearby">Nearby</button>
+          <button type="button" disabled title="Similar images require a separate backend implementation">Similar</button>
+          <button type="button" data-action="set-preview-film-mode" data-mode="tag">Same tag</button>
+          <button type="button" data-action="set-preview-film-mode" data-mode="folder">Folder</button>
+          <button type="button" disabled title="Linked images require a separate backend implementation">Linked</button>
         </div>
         <span id="preview-film-info">0</span>
       </div>

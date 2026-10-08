@@ -140,6 +140,8 @@ test('TanStack virtual masonry stays bounded through pagination, reverse scroll,
   await expect(page.locator('#gallery-screen')).toBeVisible();
   await expect(page.locator('.card[data-id]').first()).toBeVisible();
   await expect(page.locator('#count-text')).toContainText(String(TOTAL_IMAGES));
+  await page.locator('#folder-sidebar-toggle').click();
+  await expect(page.locator('#folder-sidebar')).toHaveClass(/collapsed/);
 
   const initial = await gallerySnapshot(page);
   expect(initial.cards).toBeLessThanOrEqual(DOM_CARD_LIMIT);

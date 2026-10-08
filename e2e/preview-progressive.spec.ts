@@ -171,3 +171,141 @@ test('closing during original load releases media and late completion cannot mut
   await expect(page.locator('#preview-modal-image')).toHaveAttribute('data-state', 'idle');
   await expect(page.locator('#preview-modal')).not.toHaveAttribute('data-image-id', /.+/);
 });
+
+test('viewer controls preserve Fit, zoom, explicit chrome, navigation, filmstrip, and Escape behavior', async ({page}) => {
+  const fixture = await installPreviewFixture(page);
+  await openFixture(page);
+
+  await page.locator('.card[data-id="preview-a"]').click();
+  const modal = page.locator('#preview-modal');
+  await expect(modal).toBeVisible();
+  await expect(page.locator('#zoom-level')).toHaveText('FIT');
+  await expect(page.locator('#preview-modal-thumbnail')).toHaveCSS('object-fit', 'contain');
+  await expect(page.locator('#preview-modal-image')).toHaveCSS('object-fit', 'contain');
+  await expect(page.locator('#preview-film-modes button')).toHaveText([
+    'Nearby',
+    'Similar',
+    'Same tag',
+    'Folder',
+    'Linked',
+  ]);
+  await expect(page.locator('#preview-film-modes button').first()).toBeVisible();
+
+  await page.locator('[data-action="preview-one-to-one"]').click();
+  await expect(page.locator('#zoom-level')).toHaveText('100%');
+  await page.locator('[data-action="preview-zoom"][data-factor="1.2"]').click();
+  await expect(page.locator('#zoom-level')).toHaveText('120%');
+  await page.locator('[data-action="preview-zoom"][data-factor="0.833333"]').click();
+  await expect(page.locator('#zoom-level')).toHaveText('100%');
+  await page.locator('[data-action="preview-fit"]').click();
+  await expect(page.locator('#zoom-level')).toHaveText('FIT');
+
+  const stage = page.locator('#preview-image-stage');
+  const stageBox = await stage.boundingBox();
+  expect(stageBox).toBeTruthy();
+  await stage.dispatchEvent('wheel', {
+    deltaY: -100,
+    clientX: stageBox!.x + stageBox!.width / 2,
+    clientY: stageBox!.y + stageBox!.height / 2,
+  });
+  await expect(page.locator('#zoom-level')).not.toHaveText('FIT');
+
+  await page.locator('#preview-inspector-toggle').click();
+  await expect(modal).toHaveClass(/preview-chrome-hidden/);
+  await expect(page.locator('#preview-toolbar')).toHaveCSS('opacity', '0');
+  await expect(page.locator('#preview-inspector')).toHaveCSS('opacity', '0');
+  await expect(page.locator('#preview-filmstrip')).toHaveCSS('opacity', '0');
+  await page.waitForTimeout(800);
+  await expect(modal).toHaveClass(/preview-chrome-hidden/);
+  await page.keyboard.press('i');
+  await expect(modal).not.toHaveClass(/preview-chrome-hidden/);
+
+  await page.locator('#preview-next').click();
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-b');
+  await page.locator('#preview-prev').click();
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-a');
+  await page.locator('.preview-film-item[title="preview-c.png"]').click();
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-c');
+
+  fixture.controls.get('preview-a')?.resolve();
+  fixture.controls.get('preview-b')?.resolve();
+  fixture.controls.get('preview-c')?.resolve();
+  await page.keyboard.press('Escape');
+  await expect(modal).not.toBeVisible();
+});
+
+test('multi-select keeps cards mounted and exposes the literal selection tray', async ({page}) => {
+  await installPreviewFixture(page);
+  await openFixture(page);
+
+  await page.locator('.card[data-id="preview-a"]').click({modifiers: ['Control']});
+  await expect(page.locator('#selection-tray')).toBeVisible();
+  await expect(page.locator('#selection-count')).toHaveText('1');
+  await expect(page.locator('#selection-tray')).toContainText('selected');
+  await expect(page.locator('#selection-tray')).toContainText('Tags');
+  await expect(page.locator('#selection-tray')).toContainText('Link');
+  await expect(page.locator('#selection-tray')).toContainText('Move');
+  await expect(page.locator('#selection-tray')).toContainText('Remove');
+
+  await page.locator('.card[data-id="preview-b"]').click();
+  await expect(page.locator('#selection-count')).toHaveText('2');
+  await expect(page.locator('.card.selected')).toHaveCount(2);
+  await page.locator('[data-action="clear-image-selection"]').click();
+  await expect(page.locator('#selection-tray')).not.toBeVisible();
+  await expect(page.locator('.card.selected')).toHaveCount(0);
+});
+
+for (const viewport of [
+  {width: 1366, height: 768},
+  {width: 1920, height: 1080},
+]) {
+  test(`V3.1 shell and viewer geometry matches ${viewport.width}x${viewport.height}`, async ({page}) => {
+    await installPreviewFixture(page);
+    await page.setViewportSize(viewport);
+    await openFixture(page);
+
+    const box = async (selector: string) => {
+      const value = await page.locator(selector).boundingBox();
+      expect(value, selector).toBeTruthy();
+      return value!;
+    };
+    const closeTo = (actual: number, expected: number) => expect(Math.abs(actual - expected)).toBeLessThanOrEqual(1);
+
+    const topbar = await box('#topbar');
+    const filter = await box('#filter-bar');
+    const sidebar = await box('#folder-sidebar');
+    const chips = await box('#selected-filter-tags');
+    closeTo(topbar.y, 0);
+    closeTo(topbar.height, 46);
+    closeTo(filter.y, 46);
+    closeTo(filter.height, 48);
+    closeTo(sidebar.x, 0);
+    closeTo(sidebar.y, 94);
+    closeTo(sidebar.width, 276);
+    closeTo(chips.x, 276);
+    closeTo(chips.y, 94);
+    closeTo(chips.height, 34);
+
+    await page.locator('.card[data-id="preview-a"]').click();
+    const toolbar = await box('#preview-toolbar');
+    const stage = await box('#preview-stage-viewport');
+    const inspector = await box('#preview-inspector');
+    const filmstrip = await box('#preview-filmstrip');
+    const zoom = await box('.preview-zoom-cluster');
+    closeTo(toolbar.y, 0);
+    closeTo(toolbar.height, 44);
+    closeTo(stage.x, 0);
+    closeTo(stage.y, 44);
+    closeTo(stage.width, viewport.width - 292);
+    closeTo(stage.height, viewport.height - 44 - 92);
+    closeTo(inspector.x, viewport.width - 292);
+    closeTo(inspector.y, 44);
+    closeTo(inspector.width, 292);
+    closeTo(inspector.height, viewport.height - 44);
+    closeTo(filmstrip.x, 0);
+    closeTo(filmstrip.y, viewport.height - 92);
+    closeTo(filmstrip.width, viewport.width - 292);
+    closeTo(filmstrip.height, 92);
+    closeTo(zoom.width, 160);
+  });
+}
