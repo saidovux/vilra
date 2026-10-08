@@ -1545,14 +1545,10 @@ body.modal-open { overflow: hidden; }
 
 #problems-wrap {
   display: none;
-  width: min(1180px, calc(100% - 24px));
-  margin: 112px auto 40px;
-  padding: 0 4px;
+  width: 100%;
+  margin: 0;
+  padding: 14px;
 }
-body.problems-view #problems-wrap { display: block; }
-body.problems-view #gallery-wrap,
-body.problems-view #filter-bar,
-body.problems-view #scroll-top-btn { display: none; }
 .problems-head,
 .problems-toolbar,
 .problem-row,
@@ -1628,7 +1624,6 @@ body.problems-view #scroll-top-btn { display: none; }
 .problems-footer { padding: 14px 0; text-align: center; }
 
 @media (max-width: 760px) {
-  #problems-wrap { margin-top: 142px; }
   .problems-toolbar { grid-template-columns: 1fr; }
   #problems-search { justify-self: stretch; max-width: none; }
   .problems-filters { overflow-x: auto; }
@@ -1922,26 +1917,31 @@ html.chrome-hidden #filter-bar {
 }
 
 #settings-panel {
-  position: fixed;
-  inset: 0;
-  z-index: 1300;
+  position: static;
+  inset: auto;
+  z-index: auto;
+  width: 100%;
   display: none;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  background: rgba(0,0,0,.72);
-  backdrop-filter: blur(18px);
+  padding: 0;
+  min-height: 100vh;
+  background: #050505;
+  backdrop-filter: none;
 }
-#settings-panel.open { display: flex; }
+#settings-panel.open { display: block; }
+#gallery-screen.settings-active > #folder-sidebar,
+#gallery-screen.settings-active > #topbar,
+#gallery-screen.settings-active > #filter-bar,
+#gallery-screen.settings-active > #gallery-wrap,
+#gallery-screen.settings-active > #selection-tray,
+#gallery-screen.settings-active > #scroll-top-btn { display: none; }
 .settings-workspace {
-  width: min(1160px, 100%);
-  height: min(760px, calc(100vh - 48px));
+  width: 100%;
+  min-height: 100vh;
+  height: 100vh;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: rgba(10,10,10,.88);
-  box-shadow: 0 28px 100px rgba(0,0,0,.78);
+  grid-template-columns: 220px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  background: #050505;
   overflow: hidden;
 }
 .settings-head,
@@ -1954,6 +1954,8 @@ html.chrome-hidden #filter-bar {
   border-bottom: 1px solid var(--border);
   background: rgba(0,0,0,.34);
 }
+.settings-head { grid-column: 1 / -1; grid-row: 1; }
+.settings-back { min-width: 96px; }
 .settings-head h2,
 .graph-head h2 {
   margin: 0;
@@ -1968,14 +1970,22 @@ html.chrome-hidden #filter-bar {
   letter-spacing: .08em;
 }
 .settings-tabs {
+  grid-column: 1;
+  grid-row: 2;
+  min-height: 0;
   display: flex;
+  flex-direction: column;
   gap: 6px;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
+  padding: 12px;
+  border-right: 1px solid var(--border);
   background: rgba(0,0,0,.24);
 }
 .settings-tab {
   min-height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: rgba(17,17,17,.76);
@@ -1989,6 +1999,8 @@ html.chrome-hidden #filter-bar {
   color: var(--text);
 }
 .settings-body {
+  grid-column: 2;
+  grid-row: 2;
   min-height: 0;
   overflow: hidden;
 }
@@ -2003,6 +2015,7 @@ html.chrome-hidden #filter-bar {
   display: grid;
   align-content: start;
 }
+#problems-wrap.settings-panel-page.active { display: block; }
 .settings-section {
   display: grid;
   gap: 10px;
@@ -2242,14 +2255,9 @@ html.chrome-hidden #filter-bar {
     grid-column: 1 / -1;
   }
   .sort-select { width: 100%; }
-  #settings-panel,
-  #graph-overlay {
-    padding: 8px;
-  }
-  .settings-workspace,
-  #graph-panel {
-    height: calc(100vh - 16px);
-  }
+  #graph-overlay { padding: 8px; }
+  .settings-workspace { grid-template-columns: 164px minmax(0, 1fr); }
+  #graph-panel { height: calc(100vh - 16px); }
   .settings-grid,
   .tag-admin-toolbar,
   .graph-toolbar {
@@ -2296,7 +2304,9 @@ html.chrome-hidden #filter-bar {
 
 :root {
   --v31-toolbar-h: 46px;
-  --v31-filter-h: 48px;
+  --v31-filter-controls-h: 48px;
+  --v31-filter-tags-h: 34px;
+  --v31-filter-h: calc(var(--v31-filter-controls-h) + var(--v31-filter-tags-h));
   --v31-sidebar-w: 276px;
   --v31-viewer-toolbar-h: 44px;
   --v31-inspector-w: 292px;
@@ -2348,7 +2358,7 @@ body { background: #000; font-size: 12px; }
 
 #filter-bar {
   top: var(--v31-toolbar-h); min-height: var(--v31-filter-h); height: var(--v31-filter-h);
-  display: block; padding: 7px 10px; border-bottom-color: #1e1e1e;
+  display: block; padding: 7px 10px 0; border-bottom-color: #1e1e1e;
   background: #060606; backdrop-filter: none;
 }
 #filter-bar .filter-head {
@@ -2403,8 +2413,8 @@ body { background: #000; font-size: 12px; }
 }
 #folder-sidebar:not(.collapsed) ~ #gallery-wrap { margin-left: var(--v31-sidebar-w); }
 #selected-filter-tags {
-  position: sticky; z-index: 4; top: calc(var(--v31-toolbar-h) + var(--v31-filter-h));
-  min-height: 34px; height: 34px; padding: 6px 10px; overflow: hidden;
+  position: static; min-height: var(--v31-filter-tags-h); height: var(--v31-filter-tags-h);
+  margin: 10px -10px 0; padding: 6px 10px; overflow: hidden;
   border: 0; border-bottom: 1px solid #181818; border-radius: 0;
   background: rgba(0,0,0,.94); backdrop-filter: none;
 }
@@ -2604,7 +2614,7 @@ body.image-selection-mode .card-select, .card:hover .card-select, .card.selected
 }
 
 #preview-modal.preview-chrome-hidden #preview-viewer-grid {
-  grid-template-columns: 1fr; grid-template-rows: 0 minmax(0, 1fr) 0;
+  grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr);
 }
 #preview-modal.preview-chrome-hidden #preview-toolbar,
 #preview-modal.preview-chrome-hidden #preview-inspector,
@@ -2614,7 +2624,9 @@ body.image-selection-mode .card-select, .card:hover .card-select, .card.selected
 #preview-modal.preview-chrome-hidden #preview-next {
   opacity: 0; pointer-events: none;
 }
-#preview-modal.preview-chrome-hidden #preview-stage-viewport { grid-column: 1 / -1; grid-row: 2; }
+#preview-modal.preview-chrome-hidden #preview-stage-viewport {
+  position: absolute; inset: 0; width: 100%; height: 100%; grid-column: 1; grid-row: 1;
+}
 
 #quickMenu {
   position: fixed; z-index: 1290; width: 180px; display: none; padding: 5px;

@@ -72,11 +72,8 @@ function problemFixture(id: number, severity: 'error' | 'warning' = 'error', nam
 }
 
 async function openProblems(page: Page): Promise<void> {
-  const sidebar = page.locator('#folder-sidebar');
-  if (await sidebar.evaluate(element => element.classList.contains('collapsed'))) {
-    await page.locator('#folder-sidebar-toggle').click();
-  }
-  await page.locator('#problems-nav').click();
+  if (!await page.locator('#settings-panel').isVisible()) await page.locator('#settings-toggle').click();
+  await page.locator('[data-settings-tab="problems"]').click();
   await expect(page.locator('#problems-wrap')).toBeVisible();
 }
 
@@ -434,7 +431,7 @@ test('folder tag setting pauses sync and destructive cleanup preserves user tags
   }
 });
 
-test('Problems view lists live file issues and rechecks one stored path', async ({ page }) => {
+test('Settings workspace contains Problems and rechecks one stored path', async ({ page }) => {
   await page.setViewportSize({width: 1366, height: 768});
   const root = fixtureRoot();
   const broken = path.join(root, 'e2e-broken.jpg');
@@ -449,6 +446,21 @@ test('Problems view lists live file issues and rechecks one stored path', async 
 
     await waitForGallery(page);
     await openProblems(page);
+    await expect(page.locator('#settings-panel')).toBeVisible();
+    await expect(page.locator('.settings-workspace')).not.toHaveAttribute('aria-modal', 'true');
+    await expect(page.locator('body')).not.toHaveClass(/modal-open/);
+    await expect(page.locator('#gallery-wrap')).not.toBeVisible();
+    await expect(page.locator('#folder-sidebar')).not.toBeVisible();
+    await expect(page.locator('#filter-bar')).not.toBeVisible();
+    await expect(page.locator('#problems-nav')).toHaveCount(0);
+    await expect(page.locator('.settings-tabs')).toHaveCSS('flex-direction', 'column');
+    await expect(page.locator('.settings-tab')).toHaveText(['Общее', 'Теги', 'Граф', /Проблемы/]);
+    const workspaceBox = await page.locator('#settings-panel').boundingBox();
+    expect(workspaceBox).toBeTruthy();
+    expect(Math.abs(workspaceBox!.x)).toBeLessThanOrEqual(1);
+    expect(Math.abs(workspaceBox!.y)).toBeLessThanOrEqual(1);
+    expect(Math.abs(workspaceBox!.width - 1366)).toBeLessThanOrEqual(1);
+    expect(Math.abs(workspaceBox!.height - 768)).toBeLessThanOrEqual(1);
     expect((await page.locator('.problems-head').boundingBox())?.height).toBeLessThan(150);
     const row = page.locator('.problem-row').filter({hasText: 'e2e-broken.jpg'});
     await expect(row).toBeVisible({timeout: 15_000});
@@ -461,8 +473,11 @@ test('Problems view lists live file issues and rechecks one stored path', async 
     fs.rmSync(broken, {force: true});
     await expect(row).toHaveCount(0, {timeout: 15_000});
 
-    await page.locator('#gallery-nav').click();
+    await page.locator('.settings-back').click();
     await expect(page.locator('#gallery-wrap')).toBeVisible();
+    await page.locator('#settings-toggle').click();
+    await expect(page.locator('#problems-wrap')).toBeVisible();
+    await page.locator('.settings-back').click();
   } finally {
     fs.rmSync(broken, {force: true});
   }
@@ -573,7 +588,8 @@ test('changed safety-poll summary refreshes an open Problems list', async ({ pag
 test('Problems refresh does not restore a preview closed by view navigation', async ({ page }) => {
   await waitForGallery(page);
   await clickCardAndExpectPreview(page, 0);
-  await page.evaluate(() => (document.querySelector('#problems-nav') as HTMLElement).click());
+  await page.evaluate(() => (document.querySelector('#settings-toggle') as HTMLElement).click());
+  await page.locator('[data-settings-tab="problems"]').click();
   await expect(page.locator('#problems-wrap')).toBeVisible();
   await expect(page.locator('#preview-modal')).not.toBeVisible();
 
@@ -582,7 +598,7 @@ test('Problems refresh does not restore a preview closed by view navigation', as
   await refreshed;
   await expect(page.locator('#preview-modal')).not.toBeVisible();
 
-  await page.evaluate(() => (document.querySelector('#gallery-nav') as HTMLElement).click());
+  await page.locator('.settings-back').click();
   await expect(page.locator('#gallery-wrap')).toBeVisible();
   await expect(page.locator('#sort-select')).toHaveValue('path_asc');
   await expect(page.locator('#preview-modal')).not.toBeVisible();
@@ -611,7 +627,7 @@ test('format mismatch is a warning, stays in gallery, and does not increment err
     await expect(row).toBeVisible();
     await expect(row.locator('.problem-severity')).toContainText('Внимание');
     await expect(page.locator('#problems-badge')).toHaveText('2');
-    await page.locator('#gallery-nav').click();
+    await page.locator('.settings-back').click();
     await expect(page.locator('.card[data-id]').filter({hasText: 'warning-content.jpg'})).toBeVisible();
   } finally {
     fs.rmSync(mismatch, {force: true});

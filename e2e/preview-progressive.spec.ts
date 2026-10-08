@@ -172,7 +172,7 @@ test('closing during original load releases media and late completion cannot mut
   await expect(page.locator('#preview-modal')).not.toHaveAttribute('data-image-id', /.+/);
 });
 
-test('viewer controls preserve Fit, zoom, explicit chrome, navigation, filmstrip, and Escape behavior', async ({page}) => {
+test('viewer controls preserve Fit, zoom, persistent focus navigation, filmstrip, and Escape behavior', async ({page}) => {
   const fixture = await installPreviewFixture(page);
   await openFixture(page);
 
@@ -215,10 +215,35 @@ test('viewer controls preserve Fit, zoom, explicit chrome, navigation, filmstrip
   await expect(page.locator('#preview-toolbar')).toHaveCSS('opacity', '0');
   await expect(page.locator('#preview-inspector')).toHaveCSS('opacity', '0');
   await expect(page.locator('#preview-filmstrip')).toHaveCSS('opacity', '0');
-  await page.waitForTimeout(800);
+  await expect(page.locator('#preview-prev')).toHaveCSS('opacity', '0');
+  await expect(page.locator('#preview-next')).toHaveCSS('opacity', '0');
+  const focusStage = await page.locator('#preview-stage-viewport').boundingBox();
+  const viewport = page.viewportSize();
+  expect(focusStage).toBeTruthy();
+  expect(viewport).toBeTruthy();
+  expect(Math.abs(focusStage!.x)).toBeLessThanOrEqual(1);
+  expect(Math.abs(focusStage!.y)).toBeLessThanOrEqual(1);
+  expect(Math.abs(focusStage!.width - viewport!.width)).toBeLessThanOrEqual(1);
+  expect(Math.abs(focusStage!.height - viewport!.height)).toBeLessThanOrEqual(1);
+  const focusedImageStage = await page.locator('#preview-image-stage').boundingBox();
+  expect(focusedImageStage!.width).toBeGreaterThan(1);
+  expect(focusedImageStage!.height).toBeGreaterThan(1);
+
+  await page.keyboard.press('ArrowRight');
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-b');
   await expect(modal).toHaveClass(/preview-chrome-hidden/);
+  await page.keyboard.press('ArrowRight');
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-c');
+  await expect(modal).toHaveClass(/preview-chrome-hidden/);
+  await page.locator('.preview-film-item[title="preview-a.png"]').evaluate((button: HTMLElement) => button.click());
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-a');
+  await expect(modal).toHaveClass(/preview-chrome-hidden/);
+
   await page.keyboard.press('i');
   await expect(modal).not.toHaveClass(/preview-chrome-hidden/);
+  const normalImageStage = await page.locator('#preview-image-stage').boundingBox();
+  expect(normalImageStage!.width).toBeLessThanOrEqual(1.1);
+  expect(normalImageStage!.height).toBeLessThanOrEqual(1.1);
 
   await page.locator('#preview-next').click();
   await expect(modal).toHaveAttribute('data-image-id', 'preview-b');
@@ -232,6 +257,10 @@ test('viewer controls preserve Fit, zoom, explicit chrome, navigation, filmstrip
   fixture.controls.get('preview-c')?.resolve();
   await page.keyboard.press('Escape');
   await expect(modal).not.toBeVisible();
+  await page.locator('.card[data-id="preview-b"]').click();
+  await expect(modal).toBeVisible();
+  await expect(modal).not.toHaveClass(/preview-chrome-hidden/);
+  await page.keyboard.press('Escape');
 });
 
 test('viewer quick actions open for the current image by right click and Space', async ({page}) => {
@@ -318,13 +347,23 @@ for (const viewport of [
     closeTo(topbar.y, 0);
     closeTo(topbar.height, 46);
     closeTo(filter.y, 46);
-    closeTo(filter.height, 48);
+    closeTo(filter.height, 82);
     closeTo(sidebar.x, 0);
-    closeTo(sidebar.y, 94);
+    closeTo(sidebar.y, 128);
     closeTo(sidebar.width, 276);
-    closeTo(chips.x, 276);
-    closeTo(chips.y, 94);
+    expect(await page.locator('#selected-filter-tags').evaluate(element => element.parentElement?.id)).toBe('filter-bar');
+    await expect(page.locator('#selected-filter-tags')).not.toHaveCSS('position', 'sticky');
+    closeTo(chips.x, 0);
+    closeTo(chips.y, 93);
+    closeTo(chips.width, viewport.width);
     closeTo(chips.height, 34);
+
+    await page.locator('#gallery').evaluate(element => { element.style.minHeight = '1800px'; });
+    await page.evaluate(() => window.scrollTo({top: 420}));
+    await page.waitForFunction(() => document.body.classList.contains('chrome-hidden'));
+    await expect(page.locator('#filter-bar')).toHaveCSS('opacity', '0');
+    await page.evaluate(() => window.scrollTo({top: 0}));
+    await page.waitForFunction(() => !document.body.classList.contains('chrome-hidden'));
 
     await page.locator('.card[data-id="preview-a"]').click();
     const toolbar = await box('#preview-toolbar');

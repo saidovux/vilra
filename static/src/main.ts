@@ -14,7 +14,8 @@ import {
 
 type MatchMode = 'any' | 'all';
 type SortMode = 'path_asc' | 'path_desc' | 'date_desc' | 'date_asc' | 'size_desc' | 'size_asc';
-type SettingsTab = 'general' | 'tags' | 'graph';
+type SettingsTab = 'general' | 'tags' | 'graph' | 'problems';
+type AppWorkspace = 'gallery' | 'settings';
 type GraphScope = 'current' | 'all';
 type TagAdminSort = 'name' | 'image_count' | 'user_count' | 'auto_count';
 type TagKind = 'include' | 'exclude';
@@ -720,7 +721,7 @@ class PreviewModal {
     if (!Number.isFinite(fill) || fill <= 0 || fill > 1) fill = PREVIEW_MODAL_DEFAULTS.initialViewportFill;
     const scaleX = (this.containerWidth * fill) / this.imageWidth;
     const scaleY = (this.containerHeight * fill) / this.imageHeight;
-    const fitScale = Math.min(scaleX, scaleY, 1);
+    const fitScale = Math.min(scaleX, scaleY, previewFocusMode ? this.maxScale : 1);
     this.minScale = Math.min(Number(this.options.minScale), fitScale);
     this.scale = clamp(fitScale, this.minScale, this.maxScale);
     this.fitMode = true;
@@ -913,6 +914,7 @@ const mountedGalleryCards = new Map<string, MountedGalleryCard>();
 let previewModal: PreviewModal | null = null;
 let lightboxImages: ImageItem[] = [];
 let previewFilmMode: 'nearby' | 'tag' | 'folder' = 'nearby';
+let previewFocusMode = false;
 const selectedImageIds = new Set<string>();
 let previewRequestToken = 0;
 let suppressPreviewCloseClear = false;
@@ -929,7 +931,7 @@ let lastLiveSequence = 0;
 let liveRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
 let liveFolderRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let liveTagRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-let activeView: 'gallery' | 'problems' = 'gallery';
+let activeWorkspace: AppWorkspace = 'gallery';
 let problemsSummary: ProblemSummary = {total: 0, errors: 0, warnings: 0, latestUpdatedAt: null};
 let problemsSeverity: ProblemSeverity = 'all';
 let problemsItems: ProblemItem[] = [];
@@ -1167,14 +1169,27 @@ function renderFolderTree(): void {
 function toggleSettings(force?: boolean): void {
   const panel = requiredHtml('settings-panel');
   const open = force === undefined ? !panel.classList.contains('open') : Boolean(force);
+  if (open === (activeWorkspace === 'settings')) return;
+  if (open) {
+    saveActiveScroll();
+    showChrome();
+    suppressedPreviewRestoreId = activeTab().lastImageId;
+    closePreview(false);
+    closeGraph();
+  }
+  activeWorkspace = open ? 'settings' : 'gallery';
+  requiredHtml('gallery-screen').classList.toggle('settings-active', open);
   panel.classList.toggle('open', open);
   panel.setAttribute('aria-hidden', open ? 'false' : 'true');
-  if (open) document.body.classList.add('modal-open');
-  else if (!requiredHtml('graph-overlay').classList.contains('open')) document.body.classList.remove('modal-open');
   if (open) {
-    showChrome();
     setSettingsTab(settingsActiveTab || 'general');
     renderFolderTagSyncSetting();
+    window.scrollTo({top: 0});
+  } else {
+    requestAnimationFrame(() => {
+      window.scrollTo({top: activeTab().scrollTop || 0});
+      handleGalleryResize();
+    });
   }
 }
 
@@ -1222,14 +1237,17 @@ async function deleteAllAutoTags(): Promise<void> {
 }
 
 function setSettingsTab(tab: SettingsTab | string | undefined): void {
-  settingsActiveTab = tab === 'tags' || tab === 'graph' || tab === 'general' ? tab : 'general';
+  settingsActiveTab = tab === 'tags' || tab === 'graph' || tab === 'problems' || tab === 'general' ? tab : 'general';
   document.querySelectorAll<HTMLElement>('.settings-tab').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.settingsTab === settingsActiveTab);
   });
   document.querySelectorAll<HTMLElement>('.settings-panel-page').forEach(panel => {
-    panel.classList.toggle('active', panel.dataset.settingsPanel === settingsActiveTab);
+    const active = panel.dataset.settingsPanel === settingsActiveTab;
+    panel.classList.toggle('active', active);
+    panel.setAttribute('aria-hidden', active ? 'false' : 'true');
   });
   if (settingsActiveTab === 'tags') renderTagAdmin();
+  if (settingsActiveTab === 'problems' && activeWorkspace === 'settings') scheduleProblemsRefresh();
 }
 
 function showGallery(): void {
@@ -1653,7 +1671,7 @@ function scheduleProblemsRefresh(includeList = true): void {
       } catch (error) {
         console.warn('Problems summary refresh failed', error);
       }
-      if ((refreshList || summaryChanged) && activeView === 'problems') {
+      if ((refreshList || summaryChanged) && activeWorkspace === 'settings' && settingsActiveTab === 'problems') {
         await loadProblems(true);
       }
     } while (problemsRefreshQueued);
@@ -1662,30 +1680,12 @@ function scheduleProblemsRefresh(includeList = true): void {
 }
 
 function showProblemsView(): void {
-  if (activeView === 'problems') return;
-  saveActiveScroll();
-  showChrome();
-  suppressedPreviewRestoreId = activeTab().lastImageId;
-  closePreview(false);
-  closeGraph();
-  toggleSettings(false);
-  activeView = 'problems';
-  document.body.classList.add('problems-view');
-  requiredHtml('problems-wrap').setAttribute('aria-hidden', 'false');
-  requiredHtml('gallery-nav').classList.remove('active');
-  requiredHtml('problems-nav').classList.add('active');
-  window.scrollTo({top: 0});
-  scheduleProblemsRefresh();
+  toggleSettings(true);
+  setSettingsTab('problems');
 }
 
 function showGalleryView(): void {
-  if (activeView === 'gallery') return;
-  activeView = 'gallery';
-  document.body.classList.remove('problems-view');
-  requiredHtml('problems-wrap').setAttribute('aria-hidden', 'true');
-  requiredHtml('gallery-nav').classList.add('active');
-  requiredHtml('problems-nav').classList.remove('active');
-  setTimeout(() => window.scrollTo({top: activeTab().scrollTop || 0}), 0);
+  toggleSettings(false);
 }
 
 function setProblemsFilter(value: string | undefined): void {
@@ -2468,7 +2468,7 @@ function updateTabTitle(tab: GalleryTab): void {
 }
 
 function saveActiveScroll(): void {
-  if (!tabs.length) return;
+  if (!tabs.length || activeWorkspace !== 'gallery') return;
   activeTab().scrollTop = window.scrollY || document.documentElement.scrollTop || 0;
 }
 
@@ -2945,7 +2945,6 @@ function updateScrollTopButton(): void {
 
 function hasActiveModal(): boolean {
   return Boolean(
-    requiredHtml('settings-panel').classList.contains('open') ||
     requiredHtml('tag-overlay').classList.contains('open') ||
     requiredHtml('graph-overlay').classList.contains('open') ||
     (previewModal && previewModal.isOpen)
@@ -3015,7 +3014,6 @@ function ensureGraphState(): GraphState {
 
 function openGraph(scope: GraphScope | null = null): void {
   const state = ensureGraphState();
-  if (requiredHtml('settings-panel').classList.contains('open')) toggleSettings(false);
   state.open = true;
   if (scope) state.scope = scope;
   requiredHtml('graph-overlay').classList.add('open');
@@ -3033,9 +3031,7 @@ function closeGraph(): void {
   graphState.raf = null;
   requiredHtml('graph-overlay').classList.remove('open');
   requiredHtml('graph-overlay').setAttribute('aria-hidden', 'true');
-  if (!requiredHtml('settings-panel').classList.contains('open')) {
-    document.body.classList.remove('modal-open');
-  }
+  document.body.classList.remove('modal-open');
 }
 
 function setGraphScope(scope: string | undefined): void {
@@ -3490,12 +3486,13 @@ function openLightbox(idx: number, persist = true, sourceList: ImageItem[] = vis
     });
     return;
   }
+  const navigatingOpenViewer = Boolean(previewModal?.isOpen);
+  if (!navigatingOpenViewer) setPreviewFocusMode(false);
   lightboxImages = nextSource;
   if (persist) suppressedPreviewRestoreId = null;
   togglePreviewTagDropdown(false);
   closePreviewQuickMenu();
   previewFilmMode = 'nearby';
-  requiredHtml('preview-modal').classList.remove('preview-chrome-hidden');
   lbIndex = idx;
   const img = lightboxImages[lbIndex];
   activeTab().lastImageId = img.id;
@@ -3570,7 +3567,7 @@ function handlePreviewClosed(): void {
   document.body.style.overflow = '';
   togglePreviewTagDropdown(false);
   closePreviewQuickMenu();
-  requiredHtml('preview-modal').classList.remove('preview-chrome-hidden');
+  setPreviewFocusMode(false);
   lightboxImages = [];
   if (!suppressPreviewCloseClear && tabs.length && activeTab().lastImageId) {
     activeTab().lastImageId = null;
@@ -3682,12 +3679,17 @@ function setPreviewFilmMode(mode: string | undefined): void {
   renderPreviewFilmstrip();
 }
 
-function togglePreviewChrome(): void {
+function setPreviewFocusMode(enabled: boolean): void {
+  previewFocusMode = enabled;
   const modal = requiredHtml('preview-modal');
-  const hidden = modal.classList.toggle('preview-chrome-hidden');
+  modal.classList.toggle('preview-chrome-hidden', previewFocusMode);
   const button = optionalHtml('preview-inspector-toggle');
-  if (button) button.title = hidden ? 'Показать интерфейс Viewer · I' : 'Скрыть интерфейс Viewer · I';
-  requestAnimationFrame(() => previewModal?.refreshLayout());
+  if (button) button.title = previewFocusMode ? 'Показать интерфейс Viewer · I' : 'Скрыть интерфейс Viewer · I';
+  if (previewModal?.isOpen) requestAnimationFrame(() => previewModal?.fit());
+}
+
+function togglePreviewFocusMode(): void {
+  setPreviewFocusMode(!previewFocusMode);
 }
 
 function openPreviewQuickMenu(clientX: number, clientY: number): void {
@@ -3852,7 +3854,7 @@ function updateImageTags(id: string, updated: JsonRecord): void {
 }
 
 function restorePreviewIfNeeded(): void {
-  if (activeView !== 'gallery') return;
+  if (activeWorkspace !== 'gallery') return;
   const tab = activeTab();
   if (!tab.lastImageId) return;
   if (tab.lastImageId === suppressedPreviewRestoreId) return;
@@ -3861,8 +3863,14 @@ function restorePreviewIfNeeded(): void {
 
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
-    if (graphState && graphState.open) closeGraph();
-    if (requiredHtml('settings-panel').classList.contains('open')) toggleSettings(false);
+    if (graphState && graphState.open) {
+      closeGraph();
+      return;
+    }
+    if (activeWorkspace === 'settings') {
+      toggleSettings(false);
+      return;
+    }
   }
   if (!previewModal || !previewModal.isOpen) return;
   if (isTextEntryTarget(e.target)) return;
@@ -3870,7 +3878,7 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'ArrowRight') previewNav(1);
   else if (e.key.toLowerCase() === 'i') {
     e.preventDefault();
-    togglePreviewChrome();
+    togglePreviewFocusMode();
   } else if (e.code === 'Space') {
     e.preventDefault();
     openPreviewQuickMenu(window.innerWidth / 2 - 90, window.innerHeight / 2 - 120);
@@ -4744,7 +4752,7 @@ function runAction(actionEl: HTMLElement): void {
       toggleFolderSidebar();
       break;
     case 'toggle-preview-chrome':
-      togglePreviewChrome();
+      togglePreviewFocusMode();
       break;
     case 'toggle-preview-tag-dropdown':
       togglePreviewTagDropdown();
@@ -4779,21 +4787,12 @@ requiredHtml('tag-overlay').addEventListener('click', e => {
   if (e.target === requiredHtml('tag-overlay')) closeTagManager();
 });
 
-requiredHtml('settings-panel').addEventListener('click', e => {
-  if (e.target === requiredHtml('settings-panel')) toggleSettings(false);
-});
-
 requiredHtml('graph-overlay').addEventListener('click', e => {
   if (e.target === requiredHtml('graph-overlay')) closeGraph();
 });
 
 document.addEventListener('click', e => {
   const targetNode = e.target instanceof Node ? e.target : null;
-  const settings = requiredHtml('settings-panel');
-  const settingsToggle = requiredHtml('settings-toggle');
-  if (targetNode && settings.classList.contains('open') && !settings.contains(targetNode) && targetNode !== settingsToggle && !settingsToggle.contains(targetNode)) {
-    toggleSettings(false);
-  }
   const filterWrap = document.querySelector('.filter-input-wrap');
   if (targetNode && filterWrap && !filterWrap.contains(targetNode)) {
     filterSuggestionOpen = false;
@@ -4832,10 +4831,9 @@ initPreview();
 initPreviewQuickMenu();
 galleryDiagnostics.install({
   captureMountedCards: captureMountedCardsForDiagnostics,
-  isGalleryActive: () => activeView === 'gallery'
+  isGalleryActive: () => activeWorkspace === 'gallery'
     && !previewModal?.isOpen
     && !graphState?.open
-    && !requiredHtml('settings-panel').classList.contains('open'),
 });
 initFilterInput();
 initFishInputs();

@@ -51,10 +51,6 @@
             <button id="gallery-nav" class="sidebar-view-row active" type="button" data-action="show-gallery-view">
               <span>Галерея</span>
             </button>
-            <button id="problems-nav" class="sidebar-view-row" type="button" data-action="show-problems-view">
-              <span>Проблемы</span>
-              <span id="problems-badge" class="problems-badge muted">0</span>
-            </button>
           </nav>
         </section>
       </div>
@@ -75,18 +71,22 @@
     </header>
 
     <div id="settings-panel" aria-hidden="true">
-      <section class="settings-workspace" role="dialog" aria-modal="true" aria-label="Настройки">
+      <section class="settings-workspace" aria-label="Настройки">
         <header class="settings-head">
           <div>
             <div class="settings-kicker">Vilra</div>
             <h2>Настройки</h2>
           </div>
-          <button class="btn btn-ghost icon-btn" type="button" data-action="toggle-settings" data-open="false" title="Закрыть">×</button>
+          <button class="btn btn-ghost settings-back" type="button" data-action="toggle-settings" data-open="false" title="Назад в галерею">← Галерея</button>
         </header>
         <nav class="settings-tabs" aria-label="Разделы настроек">
           <button class="settings-tab active" type="button" data-action="set-settings-tab" data-settings-tab="general">Общее</button>
           <button class="settings-tab" type="button" data-action="set-settings-tab" data-settings-tab="tags">Теги</button>
           <button class="settings-tab" type="button" data-action="set-settings-tab" data-settings-tab="graph">Граф</button>
+          <button class="settings-tab" type="button" data-action="set-settings-tab" data-settings-tab="problems">
+            <span>Проблемы</span>
+            <span id="problems-badge" class="problems-badge muted">0</span>
+          </button>
         </nav>
         <div class="settings-body">
           <section class="settings-panel-page active" data-settings-panel="general">
@@ -169,6 +169,28 @@
               <div class="settings-note">Теги показаны ромбами. Фото показаны маленькими кругами без превью и имен.</div>
             </div>
           </section>
+          <section id="problems-wrap" class="settings-panel-page" data-settings-panel="problems" aria-hidden="true">
+            <header class="problems-head">
+              <div>
+                <div class="problems-kicker">Диагностика библиотеки</div>
+                <h1>Проблемы файлов</h1>
+              </div>
+              <button id="problems-recheck-all" class="btn btn-primary" type="button" data-action="recheck-all-problems">Проверить все</button>
+            </header>
+            <div class="problems-toolbar">
+              <div class="problems-filters" role="group" aria-label="Фильтр проблем">
+                <button class="problems-filter active" type="button" data-action="set-problems-filter" data-severity="all">Все <span id="problems-total">0</span></button>
+                <button class="problems-filter" type="button" data-action="set-problems-filter" data-severity="error">Ошибки <span id="problems-errors">0</span></button>
+                <button class="problems-filter" type="button" data-action="set-problems-filter" data-severity="warning">Предупреждения <span id="problems-warnings">0</span></button>
+              </div>
+              <input id="problems-search" type="search" placeholder="Поиск по имени или пути" autocomplete="off">
+            </div>
+            <div id="problems-feedback" class="problems-feedback" aria-live="polite"></div>
+            <div id="problems-list"></div>
+            <div class="problems-footer">
+              <button id="problems-load-more" class="btn btn-ghost" type="button" data-action="load-more-problems" hidden>Загрузить ещё</button>
+            </div>
+          </section>
         </div>
       </section>
     </div>
@@ -198,10 +220,10 @@
           <option value="size_asc">Сначала маленькие</option>
         </select>
       </div>
+      <div id="selected-filter-tags" class="chip-row"></div>
     </div>
 
     <main id="gallery-wrap">
-      <div id="selected-filter-tags" class="chip-row"></div>
       <div id="gallery"></div>
       <div id="empty-state">
         <div>
@@ -220,29 +242,6 @@
       <button class="btn btn-ghost btn-sm" type="button" disabled title="Batch removal requires a separate backend implementation">Remove</button>
       <button class="btn btn-ghost icon-btn" type="button" data-action="clear-image-selection" title="Снять выделение">×</button>
     </div>
-
-    <main id="problems-wrap" aria-hidden="true">
-      <header class="problems-head">
-        <div>
-          <div class="problems-kicker">Диагностика библиотеки</div>
-          <h1>Проблемы файлов</h1>
-        </div>
-        <button id="problems-recheck-all" class="btn btn-primary" type="button" data-action="recheck-all-problems">Проверить все</button>
-      </header>
-      <div class="problems-toolbar">
-        <div class="problems-filters" role="group" aria-label="Фильтр проблем">
-          <button class="problems-filter active" type="button" data-action="set-problems-filter" data-severity="all">Все <span id="problems-total">0</span></button>
-          <button class="problems-filter" type="button" data-action="set-problems-filter" data-severity="error">Ошибки <span id="problems-errors">0</span></button>
-          <button class="problems-filter" type="button" data-action="set-problems-filter" data-severity="warning">Предупреждения <span id="problems-warnings">0</span></button>
-        </div>
-        <input id="problems-search" type="search" placeholder="Поиск по имени или пути" autocomplete="off">
-      </div>
-      <div id="problems-feedback" class="problems-feedback" aria-live="polite"></div>
-      <div id="problems-list"></div>
-      <div class="problems-footer">
-        <button id="problems-load-more" class="btn btn-ghost" type="button" data-action="load-more-problems" hidden>Загрузить ещё</button>
-      </div>
-    </main>
 
     <button id="scroll-top-btn" type="button" data-action="scroll-to-top" title="Наверх">↑</button>
   </section>
