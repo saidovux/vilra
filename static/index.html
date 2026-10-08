@@ -60,7 +60,10 @@
       </div>
     </aside>
     <header id="topbar">
-      <button id="folder-sidebar-toggle" type="button" data-action="toggle-folder-sidebar" title="Навигация">☰</button>
+      <button id="folder-sidebar-toggle" class="vilra-brand-button" type="button" data-action="toggle-folder-sidebar" title="Показать или скрыть навигацию">
+        <span class="vilra-brand-mark" aria-hidden="true">V</span>
+        <span class="vilra-brand-name">Vilra</span>
+      </button>
       <div id="tabbar">
         <div id="tabs"></div>
         <button id="add-tab-btn" class="btn btn-ghost icon-btn" data-action="add-tab" title="Новая вкладка">+</button>
@@ -208,6 +211,16 @@
       </div>
     </main>
 
+    <div id="selection-tray" aria-live="polite" aria-label="Действия над выбранными изображениями">
+      <span class="selection-count"><span id="selection-count">0</span> выбрано</span>
+      <span class="selection-separator" aria-hidden="true"></span>
+      <button class="btn btn-ghost btn-sm" type="button" data-action="batch-add-tag">Теги</button>
+      <button class="btn btn-ghost btn-sm" type="button" disabled title="Связи появятся после отдельной реализации backend">Связать</button>
+      <button class="btn btn-ghost btn-sm" type="button" disabled title="Перемещение появится после отдельной реализации backend">Переместить</button>
+      <button class="btn btn-ghost btn-sm" type="button" disabled title="Пакетное удаление появится после отдельной реализации backend">Удалить</button>
+      <button class="btn btn-ghost icon-btn" type="button" data-action="clear-image-selection" title="Снять выделение">×</button>
+    </div>
+
     <main id="problems-wrap" aria-hidden="true">
       <header class="problems-head">
         <div>
@@ -235,38 +248,105 @@
   </section>
 </div>
 
-<div id="preview-modal">
-  <button id="preview-close" class="btn btn-ghost icon-btn" title="Закрыть">×</button>
-  <button id="preview-prev" title="Назад" data-action="preview-nav" data-dir="-1">‹</button>
-  <div id="preview-image-stage">
-    <img id="preview-modal-thumbnail" alt="" draggable="false">
-    <img id="preview-modal-image" alt="" draggable="false">
-  </div>
-  <button id="preview-next" title="Вперед" data-action="preview-nav" data-dir="1">›</button>
-  <div id="preview-dock">
-    <div class="preview-info">
-      <div id="preview-name"></div>
-      <div class="preview-meta">
-        <span id="preview-size"></span>
-        <span id="zoom-level">100%</span>
-      </div>
-      <a id="preview-open" href="#" target="_blank" class="btn btn-ghost btn-sm">Оригинал</a>
-    </div>
-    <div id="preview-tag-panel">
-      <div id="preview-tag-list" class="preview-tag-group">
-        <div id="preview-auto-tags" class="chip-row preview-tag-source"></div>
-        <div id="preview-user-tags" class="chip-row preview-tag-source"></div>
-      </div>
-      <div class="preview-user-tools">
-        <div id="preview-tag-dropdown"></div>
-        <div class="fish-field">
-          <div id="preview-tag-ghost" class="fish-ghost"></div>
-          <input id="preview-tag-input" type="text" placeholder="Добавить тег" autocomplete="off">
+<div id="preview-modal" aria-hidden="true">
+  <div id="preview-viewer-grid">
+    <header id="preview-toolbar">
+      <div class="preview-file-bar">
+        <button id="preview-close" class="btn btn-ghost icon-btn" type="button" title="Назад в галерею · Esc">←</button>
+        <div class="preview-file-copy">
+          <div id="preview-name"></div>
+          <span id="preview-index">0 / 0</span>
         </div>
-        <button id="preview-tag-pick" class="btn btn-ghost btn-sm" data-action="toggle-preview-tag-dropdown" title="Выбрать из списка">▾</button>
-        <button class="btn btn-primary btn-sm" data-action="add-tag-from-preview-input">Добавить</button>
       </div>
-    </div>
+
+      <div class="preview-toolbar-spacer"></div>
+
+      <div class="preview-toolbar-actions">
+        <div class="preview-zoom-cluster" aria-label="Масштаб изображения">
+          <button class="preview-zoom-preset" type="button" data-action="preview-fit" title="Вписать · F">FIT</button>
+          <button class="preview-zoom-preset" type="button" data-action="preview-one-to-one" title="100% · 1">1:1</button>
+          <button class="preview-zoom-step" type="button" data-action="preview-zoom" data-factor="0.833333" title="Уменьшить · −">−</button>
+          <span id="zoom-level" class="preview-zoom-value">FIT</span>
+          <button class="preview-zoom-step" type="button" data-action="preview-zoom" data-factor="1.2" title="Увеличить · +">+</button>
+        </div>
+
+        <span class="preview-toolbar-separator" aria-hidden="true"></span>
+
+        <button id="preview-inspector-toggle" class="btn btn-ghost btn-sm preview-toolbar-button" type="button" data-action="toggle-preview-chrome" title="Скрыть интерфейс Viewer · I">
+          Inspector <span class="preview-kbd">I</span>
+        </button>
+        <a id="preview-open" href="#" target="_blank" class="btn btn-ghost btn-sm preview-toolbar-button">Оригинал</a>
+      </div>
+    </header>
+
+    <main id="preview-stage-viewport">
+      <div id="preview-image-stage">
+        <img id="preview-modal-thumbnail" alt="" draggable="false">
+        <img id="preview-modal-image" alt="" draggable="false">
+      </div>
+
+      <button id="preview-prev" class="preview-nav-glyph" type="button" title="Предыдущее · ←" data-action="preview-nav" data-dir="-1">‹</button>
+      <button id="preview-next" class="preview-nav-glyph" type="button" title="Следующее · →" data-action="preview-nav" data-dir="1">›</button>
+
+      <div id="preview-stage-hud">
+        <span id="preview-hud-mode">FIT</span>
+        <span>·</span>
+        <span id="preview-hud-resolution">—</span>
+        <span>·</span>
+        <span>колесо — масштаб</span>
+      </div>
+    </main>
+
+    <aside id="preview-inspector" aria-label="Inspector">
+      <div class="preview-inspector-head">
+        <strong>Inspector</strong>
+        <button class="btn btn-ghost icon-btn" type="button" data-action="toggle-preview-chrome" title="Скрыть интерфейс Viewer · I">×</button>
+      </div>
+
+      <section class="preview-inspector-section">
+        <div class="preview-section-label">Файл</div>
+        <div class="preview-meta-grid">
+          <span class="preview-meta-key">Разрешение</span>
+          <span id="preview-resolution" class="preview-meta-value">—</span>
+          <span class="preview-meta-key">Размер</span>
+          <span id="preview-size" class="preview-meta-value">—</span>
+          <span class="preview-meta-key">Формат</span>
+          <span id="preview-format" class="preview-meta-value">—</span>
+          <span class="preview-meta-key">Путь</span>
+          <span id="preview-path" class="preview-meta-value preview-path-value">—</span>
+        </div>
+      </section>
+
+      <section id="preview-tag-panel" class="preview-inspector-section">
+        <div class="preview-section-label">Теги</div>
+        <div id="preview-tag-list" class="preview-tag-group">
+          <div id="preview-auto-tags" class="chip-row preview-tag-source"></div>
+          <div id="preview-user-tags" class="chip-row preview-tag-source"></div>
+        </div>
+
+        <div class="preview-user-tools">
+          <div id="preview-tag-dropdown"></div>
+          <div class="fish-field">
+            <div id="preview-tag-ghost" class="fish-ghost"></div>
+            <input id="preview-tag-input" type="text" placeholder="Добавить тег" autocomplete="off">
+          </div>
+          <button id="preview-tag-pick" class="btn btn-ghost btn-sm" data-action="toggle-preview-tag-dropdown" title="Выбрать из списка">▾</button>
+          <button class="btn btn-primary btn-sm" data-action="add-tag-from-preview-input">Добавить</button>
+        </div>
+      </section>
+    </aside>
+
+    <footer id="preview-filmstrip">
+      <div class="preview-film-head">
+        <div id="preview-film-modes">
+          <button class="active" type="button" data-action="set-preview-film-mode" data-mode="nearby">Рядом</button>
+          <button type="button" data-action="set-preview-film-mode" data-mode="tag">Тот же тег</button>
+          <button type="button" data-action="set-preview-film-mode" data-mode="folder">Папка</button>
+        </div>
+        <span id="preview-film-info">0</span>
+      </div>
+      <div id="preview-film-items" aria-label="Навигация по изображениям"></div>
+    </footer>
   </div>
 </div>
 

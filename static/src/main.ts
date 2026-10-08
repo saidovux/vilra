@@ -221,6 +221,7 @@ interface GraphState {
 
 interface PreviewModalOptions {
   modalId: string;
+  viewportId: string;
   stageId: string;
   thumbnailId: string;
   imageId: string;
@@ -265,13 +266,15 @@ interface TagChipOptions {
  * Required HTML contract:
  * - #preview-modal            (overlay root)
  * - #preview-close            (close button)
- * - #preview-image-stage      (positioned zoom/pan surface)
+ * - #preview-stage-viewport   (fixed Viewer viewport)
+ * - #preview-image-stage      (positioned zoom/pan surface inside viewport)
  * - #preview-modal-thumbnail  (temporary thumbnail)
  * - #preview-modal-image      (full-quality original)
  * - #zoom-level               (zoom label, e.g. "100%")
  */
 const PREVIEW_MODAL_DEFAULTS: PreviewModalOptions = {
   modalId: "preview-modal",
+  viewportId: "preview-stage-viewport",
   stageId: "preview-image-stage",
   thumbnailId: "preview-modal-thumbnail",
   imageId: "preview-modal-image",
@@ -279,7 +282,7 @@ const PREVIEW_MODAL_DEFAULTS: PreviewModalOptions = {
   zoomId: "zoom-level",
   minScale: 0.1,
   maxScale: 10,
-  initialViewportFill: 0.6,
+  initialViewportFill: 0.97,
   messageType: "web-tools:preview-modal",
   postToParent: true
 };
@@ -454,6 +457,7 @@ function isTextEntryTarget(target: EventTarget | null): boolean {
 class PreviewModal {
   readonly options: PreviewModalOptions;
   readonly modal: HTMLElement;
+  readonly viewport: HTMLElement;
   readonly stage: HTMLElement;
   readonly thumbnail: HTMLImageElement;
   readonly image: HTMLImageElement;
@@ -461,6 +465,7 @@ class PreviewModal {
   readonly zoomLevel: HTMLElement;
   readonly onClosed?: () => void;
   isOpen = false;
+  fitMode = true;
   scale = 1;
   minScale: number;
   maxScale: number;
@@ -489,10 +494,12 @@ class PreviewModal {
   private readonly boundBackdropClick = this.handleBackdropClick.bind(this);
   private readonly boundCloseClick = this.close.bind(this);
   private readonly boundResize = this.handleResize.bind(this);
+  private readonly boundDoubleClick = this.handleDoubleClick.bind(this);
 
   constructor(options: Partial<PreviewModalOptions> = {}, onClosed?: () => void) {
     this.options = {...PREVIEW_MODAL_DEFAULTS, ...options};
     this.modal = requireElement(this.options.modalId, HTMLElement, "Preview modal element is missing");
+    this.viewport = requireElement(this.options.viewportId, HTMLElement, "Preview viewport element is missing");
     this.stage = requireElement(this.options.stageId, HTMLElement, "Preview image stage is missing");
     this.thumbnail = requireElement(this.options.thumbnailId, HTMLImageElement, "Preview thumbnail is missing");
     this.image = requireElement(this.options.imageId, HTMLImageElement, "Preview original image is missing");
@@ -521,6 +528,7 @@ class PreviewModal {
     this.stage.addEventListener("mousemove", this.boundMouseMove);
     this.stage.addEventListener("mouseup", this.boundMouseUp);
     this.stage.addEventListener("mouseleave", this.boundMouseUp);
+    this.stage.addEventListener("dblclick", this.boundDoubleClick);
     window.addEventListener("resize", this.boundResize);
   }
 
@@ -529,7 +537,30 @@ class PreviewModal {
   }
 
   private handleKeyDown(event: KeyboardEvent): void {
-    if (event.key === "Escape" && this.isOpen) this.close();
+    if (!this.isOpen || isTextEntryTarget(event.target)) return;
+    if (event.key === "Escape") {
+      this.close();
+      return;
+    }
+    if (event.key.toLowerCase() === "f") {
+      event.preventDefault();
+      this.fit();
+      return;
+    }
+    if (event.key === "1") {
+      event.preventDefault();
+      this.oneToOne();
+      return;
+    }
+    if (event.key === "+" || event.key === "=") {
+      event.preventDefault();
+      this.zoomBy(1.2);
+      return;
+    }
+    if (event.key === "-") {
+      event.preventDefault();
+      this.zoomBy(1 / 1.2);
+    }
   }
 
   open(source: PreviewImageRequest): void {
@@ -537,19 +568,10 @@ class PreviewModal {
     const generation = this.generation;
     this.imageWidth = Math.max(1, source.width);
     this.imageHeight = Math.max(1, source.height);
-    this.containerWidth = window.innerWidth;
-    this.containerHeight = window.innerHeight;
-    let fill = Number(this.options.initialViewportFill);
-    if (!Number.isFinite(fill) || fill <= 0 || fill > 1) fill = PREVIEW_MODAL_DEFAULTS.initialViewportFill;
-    const targetWidth = this.containerWidth * fill;
-    const targetHeight = this.containerHeight * fill;
-    const scaleX = targetWidth / this.imageWidth;
-    const scaleY = targetHeight / this.imageHeight;
-    const fitScale = Math.min(scaleX, scaleY);
-    this.minScale = Math.min(Number(this.options.minScale), fitScale);
-    this.scale = clamp(fitScale, this.minScale, this.maxScale);
-    this.offsetX = (this.containerWidth - this.imageWidth * this.scale) / 2;
-    this.offsetY = (this.containerHeight - this.imageHeight * this.scale) / 2;
+    this.modal.style.display = "block";
+    this.modal.setAttribute("aria-hidden", "false");
+    this.isOpen = true;
+    this.fit();
     this.modal.dataset.imageId = source.imageId;
     this.stage.dataset.imageId = source.imageId;
     this.stage.dataset.originalState = "loading";
@@ -558,8 +580,6 @@ class PreviewModal {
     this.thumbnail.alt = source.alt;
     this.image.dataset.state = "loading";
     this.image.alt = source.alt;
-    this.modal.style.display = "flex";
-    this.isOpen = true;
     this.notifyShell(true);
     this.render();
 
@@ -599,6 +619,8 @@ class PreviewModal {
   close(): void {
     const wasOpen = this.isOpen;
     this.modal.style.display = "none";
+    this.modal.setAttribute("aria-hidden", "true");
+    this.modal.classList.remove("preview-chrome-hidden");
     this.isOpen = false;
     this.isDragging = false;
     this.hasDragged = false;
@@ -685,8 +707,62 @@ class PreviewModal {
     if (this.isCurrent(generation, source.imageId)) this.thumbnail.dataset.state = "error";
   }
 
+  private measureViewport(): void {
+    const rect = this.viewport.getBoundingClientRect();
+    this.containerWidth = Math.max(1, rect.width);
+    this.containerHeight = Math.max(1, rect.height);
+  }
+
+  fit(): void {
+    if (!this.isOpen) return;
+    this.measureViewport();
+    let fill = Number(this.options.initialViewportFill);
+    if (!Number.isFinite(fill) || fill <= 0 || fill > 1) fill = PREVIEW_MODAL_DEFAULTS.initialViewportFill;
+    const scaleX = (this.containerWidth * fill) / this.imageWidth;
+    const scaleY = (this.containerHeight * fill) / this.imageHeight;
+    const fitScale = Math.min(scaleX, scaleY, 1);
+    this.minScale = Math.min(Number(this.options.minScale), fitScale);
+    this.scale = clamp(fitScale, this.minScale, this.maxScale);
+    this.fitMode = true;
+    this.offsetX = (this.containerWidth - this.imageWidth * this.scale) / 2;
+    this.offsetY = (this.containerHeight - this.imageHeight * this.scale) / 2;
+    this.render();
+  }
+
+  oneToOne(): void {
+    if (!this.isOpen) return;
+    this.measureViewport();
+    this.fitMode = false;
+    this.scale = clamp(1, this.minScale, this.maxScale);
+    this.offsetX = (this.containerWidth - this.imageWidth * this.scale) / 2;
+    this.offsetY = (this.containerHeight - this.imageHeight * this.scale) / 2;
+    this.constrainOffset();
+    this.render();
+  }
+
+  zoomBy(factor: number): void {
+    if (!this.isOpen || !Number.isFinite(factor) || factor <= 0) return;
+    this.measureViewport();
+    this.zoomAt(this.containerWidth / 2, this.containerHeight / 2, factor);
+  }
+
+  refreshLayout(): void {
+    if (!this.isOpen) return;
+    if (this.fitMode) {
+      this.fit();
+      return;
+    }
+    this.handleResize();
+  }
+
   private adoptNaturalDimensions(width: number, height: number): void {
     if (width <= 0 || height <= 0 || (width === this.imageWidth && height === this.imageHeight)) return;
+    if (this.fitMode) {
+      this.imageWidth = width;
+      this.imageHeight = height;
+      this.fit();
+      return;
+    }
     const centerX = (this.containerWidth / 2 - this.offsetX) / (this.imageWidth * this.scale);
     const centerY = (this.containerHeight / 2 - this.offsetY) / (this.imageHeight * this.scale);
     this.imageWidth = width;
@@ -698,11 +774,12 @@ class PreviewModal {
   }
 
   private zoomAt(mouseX: number, mouseY: number, factor: number): void {
-    const newScale = this.scale * factor;
-    if (newScale < this.minScale || newScale > this.maxScale) return;
+    const newScale = clamp(this.scale * factor, this.minScale, this.maxScale);
+    if (Math.abs(newScale - this.scale) < 0.0001) return;
     const canvasX = (mouseX - this.offsetX) / this.scale;
     const canvasY = (mouseY - this.offsetY) / this.scale;
     this.scale = newScale;
+    this.fitMode = false;
     this.offsetX = mouseX - canvasX * this.scale;
     this.offsetY = mouseY - canvasY * this.scale;
     this.constrainOffset();
@@ -711,12 +788,23 @@ class PreviewModal {
 
   private handleWheel(event: WheelEvent): void {
     event.preventDefault();
-    const delta = event.deltaY > 0 ? 0.9 : 1.1;
-    this.zoomAt(event.clientX, event.clientY, delta);
+    const viewportRect = this.viewport.getBoundingClientRect();
+    const mouseX = event.clientX - viewportRect.left;
+    const mouseY = event.clientY - viewportRect.top;
+    this.zoomAt(mouseX, mouseY, event.deltaY > 0 ? 0.9 : 1.1);
+  }
+
+  private handleDoubleClick(event: MouseEvent): void {
+    event.preventDefault();
+    if (this.fitMode) this.oneToOne();
+    else this.fit();
   }
 
   private handleMouseDown(event: MouseEvent): void {
     if (event.button !== 0) return;
+    const scaledWidth = this.imageWidth * this.scale;
+    const scaledHeight = this.imageHeight * this.scale;
+    if (scaledWidth <= this.containerWidth && scaledHeight <= this.containerHeight) return;
     this.isDragging = true;
     this.hasDragged = false;
     this.dragStartX = event.clientX;
@@ -743,19 +831,24 @@ class PreviewModal {
     this.lastY = event.clientY;
   }
 
-  private handleMouseUp(event: MouseEvent): void {
+  private handleMouseUp(): void {
     if (!this.isDragging) return;
-    if (!this.hasDragged) this.zoomAt(event.clientX, event.clientY, 1.5);
     this.isDragging = false;
-    this.stage.style.cursor = "grab";
+    this.hasDragged = false;
+    this.render();
   }
 
   private handleResize(): void {
     if (!this.isOpen) return;
-    const centerX = (this.containerWidth / 2 - this.offsetX) / (this.imageWidth * this.scale);
-    const centerY = (this.containerHeight / 2 - this.offsetY) / (this.imageHeight * this.scale);
-    this.containerWidth = window.innerWidth;
-    this.containerHeight = window.innerHeight;
+    if (this.fitMode) {
+      this.fit();
+      return;
+    }
+    const oldWidth = this.containerWidth;
+    const oldHeight = this.containerHeight;
+    const centerX = (oldWidth / 2 - this.offsetX) / (this.imageWidth * this.scale);
+    const centerY = (oldHeight / 2 - this.offsetY) / (this.imageHeight * this.scale);
+    this.measureViewport();
     this.offsetX = this.containerWidth / 2 - centerX * this.imageWidth * this.scale;
     this.offsetY = this.containerHeight / 2 - centerY * this.imageHeight * this.scale;
     this.constrainOffset();
@@ -783,7 +876,12 @@ class PreviewModal {
     this.stage.style.height = `${scaledHeight}px`;
     this.stage.style.left = `${this.offsetX}px`;
     this.stage.style.top = `${this.offsetY}px`;
-    this.zoomLevel.textContent = `${Math.round(this.scale * 100)}%`;
+    const zoomText = this.fitMode ? "FIT" : `${Math.round(this.scale * 100)}%`;
+    this.zoomLevel.textContent = zoomText;
+    const hudMode = optionalHtml("preview-hud-mode");
+    if (hudMode) hudMode.textContent = zoomText;
+    const canPan = scaledWidth > this.containerWidth || scaledHeight > this.containerHeight;
+    this.stage.style.cursor = this.isDragging ? "grabbing" : (canPan ? "grab" : "default");
   }
 }
 
@@ -814,6 +912,8 @@ let activePageLoad: {requestId: number; promise: Promise<void>} | null = null;
 const mountedGalleryCards = new Map<string, MountedGalleryCard>();
 let previewModal: PreviewModal | null = null;
 let lightboxImages: ImageItem[] = [];
+let previewFilmMode: 'nearby' | 'tag' | 'folder' = 'nearby';
+const selectedImageIds = new Set<string>();
 let previewRequestToken = 0;
 let suppressPreviewCloseClear = false;
 let suppressedPreviewRestoreId: string | null = null;
@@ -1905,6 +2005,61 @@ function diagnosticCardRef(image: HTMLImageElement | null): DiagnosticCardRef | 
     : null;
 }
 
+function updateImageSelectionUi(): void {
+  const validIds = new Set(allImages.map(image => image.id));
+  for (const imageId of [...selectedImageIds]) {
+    if (!validIds.has(imageId)) selectedImageIds.delete(imageId);
+  }
+  document.body.classList.toggle('image-selection-mode', selectedImageIds.size > 0);
+  optionalHtml('selection-tray')?.classList.toggle('open', selectedImageIds.size > 0);
+  const count = optionalHtml('selection-count');
+  if (count) count.textContent = String(selectedImageIds.size);
+  for (const [imageId, mounted] of mountedGalleryCards) {
+    mounted.card.classList.toggle('selected', selectedImageIds.has(imageId));
+  }
+}
+
+function toggleImageSelection(imageId: string): void {
+  if (!imageId) return;
+  if (selectedImageIds.has(imageId)) selectedImageIds.delete(imageId);
+  else selectedImageIds.add(imageId);
+  updateImageSelectionUi();
+}
+
+function clearImageSelection(): void {
+  selectedImageIds.clear();
+  updateImageSelectionUi();
+}
+
+async function addTagToSelectedImages(): Promise<void> {
+  if (!selectedImageIds.size) return;
+  const raw = window.prompt('Добавить тег к выбранным изображениям:');
+  const value = raw ? findDisplayTag(raw.trim()) : '';
+  if (!value) return;
+  const targets = allImages.filter(image => selectedImageIds.has(image.id));
+  const failures: string[] = [];
+  await Promise.all(targets.map(async image => {
+    const userTags = dedupeDisplayTags([...(image.user_tags || []), value]);
+    try {
+      const response = await fetch(`/api/tag/${image.id}`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({tags: userTags})
+      });
+      if (!response.ok) throw new Error(await readError(response));
+      updateImageTags(image.id, await readJsonRecord(response));
+    } catch (error) {
+      failures.push(`${fileName(image.path)}: ${errorMessage(error)}`);
+    }
+  }));
+  await refreshTagPool();
+  if (failures.length) {
+    alert(`Не удалось обновить ${failures.length} изображений.\n${failures.slice(0, 5).join('\n')}`);
+    return;
+  }
+  clearImageSelection();
+}
+
 function makeCard(
   img: ImageItem,
   highPriority = false,
@@ -1939,9 +2094,26 @@ function makeCard(
     <div class="card-name">${escHtml(name)}</div>
     <div class="card-tags">${renderTagChips(img)}</div>
   `;
+  const selectButton = document.createElement('button');
+  selectButton.className = 'card-select';
+  selectButton.type = 'button';
+  selectButton.title = 'Выбрать изображение';
+  selectButton.textContent = '✓';
+  card.classList.toggle('selected', selectedImageIds.has(img.id));
   card.appendChild(ph);
   card.appendChild(overlay);
-  card.addEventListener('click', () => openLightboxById(img.id));
+  card.appendChild(selectButton);
+  selectButton.addEventListener('click', event => {
+    event.stopPropagation();
+    toggleImageSelection(img.id);
+  });
+  card.addEventListener('click', event => {
+    if (event.ctrlKey || event.metaKey || selectedImageIds.size > 0) {
+      toggleImageSelection(img.id);
+      return;
+    }
+    openLightboxById(img.id);
+  });
   ph.onload = () => {
     galleryDiagnostics.primaryLoaded(
       diagnosticCardRef(ph),
@@ -2186,6 +2358,8 @@ function acceptActiveImage(imageId: string): void {
 function handleTerminalImageUnavailable(imageId: string): void {
   if (!imageId || terminalThumbIds.has(imageId)) return;
   terminalThumbIds.add(imageId);
+  selectedImageIds.delete(imageId);
+  updateImageSelectionUi();
   cancelThumbLifecycle(imageId);
   if (activeTab().lastImageId === imageId || lightboxImages[lbIndex]?.id === imageId) {
     previewRequestToken += 1;
@@ -2214,6 +2388,7 @@ async function refreshTagPool() {
 }
 
 function addTab() {
+  clearImageSelection();
   saveActiveScroll();
   const tab = makeDefaultTab();
   tabs.push(tab);
@@ -2226,6 +2401,7 @@ function addTab() {
 
 function switchTab(id: string): void {
   if (id === activeTabId) return;
+  clearImageSelection();
   saveActiveScroll();
   activeTabId = id;
   closePreview(false);
@@ -2236,6 +2412,7 @@ function switchTab(id: string): void {
 }
 
 function closeTab(id: string): void {
+  clearImageSelection();
   if (tabs.length <= 1) {
     tabs = [makeDefaultTab()];
     activeTabId = tabs[0].id;
@@ -3315,6 +3492,8 @@ function openLightbox(idx: number, persist = true, sourceList: ImageItem[] = vis
   lightboxImages = nextSource;
   if (persist) suppressedPreviewRestoreId = null;
   togglePreviewTagDropdown(false);
+  previewFilmMode = 'nearby';
+  requiredHtml('preview-modal').classList.remove('preview-chrome-hidden');
   lbIndex = idx;
   const img = lightboxImages[lbIndex];
   activeTab().lastImageId = img.id;
@@ -3388,6 +3567,7 @@ function handlePreviewClosed(): void {
   previewRequestToken += 1;
   document.body.style.overflow = '';
   togglePreviewTagDropdown(false);
+  requiredHtml('preview-modal').classList.remove('preview-chrome-hidden');
   lightboxImages = [];
   if (!suppressPreviewCloseClear && tabs.length && activeTab().lastImageId) {
     activeTab().lastImageId = null;
@@ -3402,12 +3582,107 @@ function previewNav(dir: number): void {
   openLightbox(lbIndex, true, source);
 }
 
+function imageFormat(path: string): string {
+  const name = fileName(path);
+  const dot = name.lastIndexOf('.');
+  return dot >= 0 ? name.slice(dot + 1).toUpperCase() : '—';
+}
+
+function imageParentPath(path: string): string {
+  const normalized = String(path || '').replace(/\\/g, '/');
+  const slash = normalized.lastIndexOf('/');
+  return slash >= 0 ? normalized.slice(0, slash + 1) : normalized;
+}
+
 function renderPreviewMeta(img: ImageItem, loading: boolean): void {
   const name = fileName(img.path);
+  const resolution = `${img.width || '?'} × ${img.height || '?'}`;
   requiredHtml('preview-name').textContent = loading ? `Загрузка: ${name}` : name;
-  requiredHtml('preview-size').textContent = `${fmtSize(img.size)} · ${img.width || '?'}×${img.height || '?'}`;
+  requiredHtml('preview-size').textContent = fmtSize(img.size) || '—';
+  const previewResolution = optionalHtml('preview-resolution');
+  const previewFormat = optionalHtml('preview-format');
+  const previewPath = optionalHtml('preview-path');
+  const previewHudResolution = optionalHtml('preview-hud-resolution');
+  const previewIndex = optionalHtml('preview-index');
+  if (previewResolution) previewResolution.textContent = resolution;
+  if (previewFormat) previewFormat.textContent = imageFormat(img.path);
+  if (previewPath) previewPath.textContent = img.path;
+  if (previewHudResolution) previewHudResolution.textContent = resolution;
+  if (previewIndex) previewIndex.textContent = `${lbIndex + 1} / ${(lightboxImages.length ? lightboxImages : visibleImages).length}`;
   requiredAnchor('preview-open').href = `/file/${img.id}`;
   renderPreviewTags(img);
+  renderPreviewFilmstrip();
+}
+
+function previewFilmCandidates(): ImageItem[] {
+  const source = lightboxImages.length ? lightboxImages : visibleImages;
+  const current = source[lbIndex];
+  if (!current) return [];
+  if (previewFilmMode === 'tag') {
+    const tags = new Set((current.tags || []).map(normalizeTag));
+    if (!tags.size) return [current];
+    return source.filter(image => (image.tags || []).some(tag => tags.has(normalizeTag(tag))));
+  }
+  if (previewFilmMode === 'folder') {
+    const folder = imageParentPath(current.path);
+    return source.filter(image => imageParentPath(image.path) === folder);
+  }
+  const start = Math.max(0, lbIndex - 7);
+  const end = Math.min(source.length, lbIndex + 8);
+  return source.slice(start, end);
+}
+
+function renderPreviewFilmstrip(): void {
+  const target = optionalHtml('preview-film-items');
+  const info = optionalHtml('preview-film-info');
+  const modes = optionalHtml('preview-film-modes');
+  if (!target || !info || !modes) return;
+  modes.querySelectorAll<HTMLElement>('button[data-mode]').forEach(button => {
+    button.classList.toggle('active', button.dataset.mode === previewFilmMode);
+  });
+  const items = previewFilmCandidates();
+  const current = (lightboxImages.length ? lightboxImages : visibleImages)[lbIndex];
+  target.replaceChildren();
+  for (const image of items) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `preview-film-item${image.id === current?.id ? ' active' : ''}`;
+    button.title = fileName(image.path);
+    const thumbnail = document.createElement('img');
+    thumbnail.alt = '';
+    thumbnail.decoding = 'async';
+    thumbnail.loading = 'eager';
+    thumbnail.src = thumbnailUrls(image).primary;
+    thumbnail.onerror = () => {
+      button.classList.add('missing');
+      thumbnail.removeAttribute('src');
+    };
+    button.appendChild(thumbnail);
+    button.addEventListener('click', () => {
+      const source = lightboxImages.length ? lightboxImages : visibleImages;
+      const nextIndex = source.findIndex(item => item.id === image.id);
+      if (nextIndex >= 0) void openLightbox(nextIndex, true, source);
+    });
+    target.appendChild(button);
+  }
+  const label = previewFilmMode === 'tag' ? 'ТОТ ЖЕ ТЕГ' : previewFilmMode === 'folder' ? 'ПАПКА' : 'РЯДОМ';
+  info.textContent = `${label} · ${items.length}`;
+  requestAnimationFrame(() => {
+    target.querySelector<HTMLElement>('.preview-film-item.active')?.scrollIntoView({inline: 'center', block: 'nearest'});
+  });
+}
+
+function setPreviewFilmMode(mode: string | undefined): void {
+  previewFilmMode = mode === 'tag' || mode === 'folder' ? mode : 'nearby';
+  renderPreviewFilmstrip();
+}
+
+function togglePreviewChrome(): void {
+  const modal = requiredHtml('preview-modal');
+  const hidden = modal.classList.toggle('preview-chrome-hidden');
+  const button = optionalHtml('preview-inspector-toggle');
+  if (button) button.title = hidden ? 'Показать интерфейс Viewer · I' : 'Скрыть интерфейс Viewer · I';
+  requestAnimationFrame(() => previewModal?.refreshLayout());
 }
 
 function renderPreviewTags(img: ImageItem): void {
@@ -3527,6 +3802,10 @@ document.addEventListener('keydown', e => {
   if (isTextEntryTarget(e.target)) return;
   if (e.key === 'ArrowLeft') previewNav(-1);
   else if (e.key === 'ArrowRight') previewNav(1);
+  else if (e.key.toLowerCase() === 'i') {
+    e.preventDefault();
+    togglePreviewChrome();
+  }
 });
 
 function saveSessionSoon(): void {
@@ -4287,6 +4566,9 @@ function runAction(actionEl: HTMLElement): void {
     case 'add-tab':
       addTab();
       break;
+    case 'batch-add-tag':
+      void addTagToSelectedImages();
+      break;
     case 'add-tag-from-preview-input':
       addTagFromPreviewInput();
       break;
@@ -4295,6 +4577,9 @@ function runAction(actionEl: HTMLElement): void {
       break;
     case 'clear-active-filters':
       clearActiveFilters();
+      break;
+    case 'clear-image-selection':
+      clearImageSelection();
       break;
     case 'close-graph':
       closeGraph();
@@ -4350,6 +4635,15 @@ function runAction(actionEl: HTMLElement): void {
     case 'pick-folder':
       pickFolder();
       break;
+    case 'preview-fit':
+      previewModal?.fit();
+      break;
+    case 'preview-one-to-one':
+      previewModal?.oneToOne();
+      break;
+    case 'preview-zoom':
+      previewModal?.zoomBy(Number(actionEl.dataset.factor || 1));
+      break;
     case 'preview-nav':
       previewNav(Number(actionEl.dataset.dir || 0));
       break;
@@ -4365,6 +4659,9 @@ function runAction(actionEl: HTMLElement): void {
     case 'set-match-mode':
       setMatchMode(actionEl.dataset.mode);
       break;
+    case 'set-preview-film-mode':
+      setPreviewFilmMode(actionEl.dataset.mode);
+      break;
     case 'set-settings-tab':
       setSettingsTab(actionEl.dataset.settingsTab);
       break;
@@ -4373,6 +4670,9 @@ function runAction(actionEl: HTMLElement): void {
       break;
     case 'toggle-folder-sidebar':
       toggleFolderSidebar();
+      break;
+    case 'toggle-preview-chrome':
+      togglePreviewChrome();
       break;
     case 'toggle-preview-tag-dropdown':
       togglePreviewTagDropdown();
