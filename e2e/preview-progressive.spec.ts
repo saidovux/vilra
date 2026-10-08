@@ -234,6 +234,46 @@ test('viewer controls preserve Fit, zoom, explicit chrome, navigation, filmstrip
   await expect(modal).not.toBeVisible();
 });
 
+test('viewer quick actions open for the current image by right click and Space', async ({page}) => {
+  const fixture = await installPreviewFixture(page);
+  await openFixture(page);
+
+  await page.locator('.card[data-id="preview-a"]').click();
+  const modal = page.locator('#preview-modal');
+  const menu = page.locator('#quickMenu');
+  await modal.click({button: 'right', position: {x: 320, y: 240}});
+  await expect(menu).toBeVisible();
+  await expect(menu).toHaveAttribute('data-image-id', 'preview-a');
+  await expect(menu.locator('button')).toHaveText([
+    'Tag',
+    'Note',
+    'Link',
+    'Similar',
+    'Reveal in folder',
+    'Original',
+    'Delete',
+  ]);
+
+  await menu.locator('[data-quick-action="Tag"]').click();
+  await expect(menu).not.toBeVisible();
+  await expect(page.locator('#preview-tag-input')).toBeFocused();
+
+  await page.locator('#preview-next').click();
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-b');
+  await page.keyboard.press('Space');
+  await expect(menu).toBeVisible();
+  await expect(menu).toHaveAttribute('data-image-id', 'preview-b');
+  await page.keyboard.press('Escape');
+  await expect(menu).not.toBeVisible();
+  await expect(modal).toBeVisible();
+
+  await page.keyboard.press('ArrowRight');
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-c');
+  fixture.controls.forEach(control => control.resolve());
+  await page.keyboard.press('Escape');
+  await expect(modal).not.toBeVisible();
+});
+
 test('multi-select keeps cards mounted and exposes the literal selection tray', async ({page}) => {
   await installPreviewFixture(page);
   await openFixture(page);

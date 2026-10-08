@@ -3493,6 +3493,7 @@ function openLightbox(idx: number, persist = true, sourceList: ImageItem[] = vis
   lightboxImages = nextSource;
   if (persist) suppressedPreviewRestoreId = null;
   togglePreviewTagDropdown(false);
+  closePreviewQuickMenu();
   previewFilmMode = 'nearby';
   requiredHtml('preview-modal').classList.remove('preview-chrome-hidden');
   lbIndex = idx;
@@ -3568,6 +3569,7 @@ function handlePreviewClosed(): void {
   previewRequestToken += 1;
   document.body.style.overflow = '';
   togglePreviewTagDropdown(false);
+  closePreviewQuickMenu();
   requiredHtml('preview-modal').classList.remove('preview-chrome-hidden');
   lightboxImages = [];
   if (!suppressPreviewCloseClear && tabs.length && activeTab().lastImageId) {
@@ -3686,6 +3688,67 @@ function togglePreviewChrome(): void {
   const button = optionalHtml('preview-inspector-toggle');
   if (button) button.title = hidden ? 'Показать интерфейс Viewer · I' : 'Скрыть интерфейс Viewer · I';
   requestAnimationFrame(() => previewModal?.refreshLayout());
+}
+
+function openPreviewQuickMenu(clientX: number, clientY: number): void {
+  if (!previewModal?.isOpen) return;
+  const menu = requiredHtml('quickMenu');
+  const imageId = previewModal.modal.dataset.imageId;
+  if (!imageId) return;
+  const maxLeft = window.innerWidth - 190;
+  const maxTop = window.innerHeight - 260;
+  menu.style.left = `${Math.min(maxLeft, clientX)}px`;
+  menu.style.top = `${Math.min(maxTop, clientY)}px`;
+  menu.dataset.imageId = imageId;
+  menu.classList.add('open');
+  menu.setAttribute('aria-hidden', 'false');
+}
+
+function closePreviewQuickMenu(): void {
+  const menu = optionalHtml('quickMenu');
+  if (!menu) return;
+  menu.classList.remove('open');
+  menu.setAttribute('aria-hidden', 'true');
+  delete menu.dataset.imageId;
+}
+
+function runPreviewQuickAction(action: string | undefined): void {
+  const menu = requiredHtml('quickMenu');
+  const imageId = menu.dataset.imageId;
+  if (!imageId || imageId !== previewModal?.modal.dataset.imageId) {
+    closePreviewQuickMenu();
+    return;
+  }
+  closePreviewQuickMenu();
+  if (action === 'Tag') {
+    requiredInput('preview-tag-input').focus();
+  } else if (action === 'Original') {
+    requiredAnchor('preview-open').click();
+  }
+}
+
+function initPreviewQuickMenu(): void {
+  const menu = requiredHtml('quickMenu');
+  const modal = requiredHtml('preview-modal');
+  modal.addEventListener('contextmenu', event => {
+    if (!previewModal?.isOpen) return;
+    event.preventDefault();
+    openPreviewQuickMenu(event.clientX, event.clientY);
+  });
+  menu.querySelectorAll<HTMLElement>('[data-quick-action]').forEach(button => {
+    button.addEventListener('click', () => runPreviewQuickAction(button.dataset.quickAction));
+  });
+  document.addEventListener('click', event => {
+    const target = event.target instanceof Node ? event.target : null;
+    if (target && !menu.contains(target)) closePreviewQuickMenu();
+  });
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && menu.classList.contains('open')) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      closePreviewQuickMenu();
+    }
+  }, true);
 }
 
 function renderPreviewTags(img: ImageItem): void {
@@ -3808,6 +3871,9 @@ document.addEventListener('keydown', e => {
   else if (e.key.toLowerCase() === 'i') {
     e.preventDefault();
     togglePreviewChrome();
+  } else if (e.code === 'Space') {
+    e.preventDefault();
+    openPreviewQuickMenu(window.innerWidth / 2 - 90, window.innerHeight / 2 - 120);
   }
 });
 
@@ -4763,6 +4829,7 @@ document.addEventListener('visibilitychange', () => {
 
 initActionBindings();
 initPreview();
+initPreviewQuickMenu();
 galleryDiagnostics.install({
   captureMountedCards: captureMountedCardsForDiagnostics,
   isGalleryActive: () => activeView === 'gallery'
