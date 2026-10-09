@@ -97,6 +97,43 @@ async function openFixture(page: Page): Promise<void> {
   await expect(page.locator('.card[data-id="preview-a"]')).toBeVisible();
 }
 
+test('Vilra selects disable native appearance and keep dark platform-independent styling', async ({page}) => {
+  await installPreviewFixture(page);
+  await openFixture(page);
+
+  const selectStyle = async (selector: string) => page.locator(selector).evaluate(element => {
+    const style = getComputedStyle(element);
+    return {
+      appearance: style.getPropertyValue('appearance'),
+      webkitAppearance: style.getPropertyValue('-webkit-appearance'),
+      backgroundColor: style.backgroundColor,
+      backgroundImage: style.backgroundImage,
+      color: style.color,
+    };
+  });
+
+  const gallerySort = page.locator('#sort-select');
+  await expect(gallerySort).toHaveCount(1);
+  expect(await gallerySort.locator('option').evaluateAll(options => options.map(option => (option as HTMLOptionElement).value)))
+    .toEqual(['date_desc', 'date_asc', 'path_asc', 'path_desc', 'size_desc', 'size_asc']);
+
+  await page.locator('#settings-toggle').click();
+  await page.locator('[data-settings-tab="tags"]').click();
+  const tagSort = page.locator('#tag-admin-sort');
+  await expect(tagSort).toBeVisible();
+  expect(await tagSort.locator('option').evaluateAll(options => options.map(option => (option as HTMLOptionElement).value)))
+    .toEqual(['name', 'image_count', 'user_count', 'auto_count']);
+
+  for (const selector of ['#sort-select', '#tag-admin-sort']) {
+    const style = await selectStyle(selector);
+    expect(style.appearance).toBe('none');
+    expect(style.webkitAppearance).toBe('none');
+    expect(style.backgroundColor).toBe('rgb(11, 11, 11)');
+    expect(style.backgroundImage).not.toBe('none');
+    expect(style.color).toBe('rgb(255, 255, 255)');
+  }
+});
+
 test('preview opens thumbnail-first, upgrades to native original, and creates no natural-size canvas', async ({page}) => {
   const fixture = await installPreviewFixture(page);
   await openFixture(page);

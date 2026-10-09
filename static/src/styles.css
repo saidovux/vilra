@@ -1176,17 +1176,7 @@ body.modal-open { overflow: hidden; }
   position: relative;
   min-width: 0;
 }
-.sort-select {
-  min-height: 32px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: rgba(10,10,10,.42);
-  color: var(--text);
-  padding: 0 28px 0 10px;
-  outline: none;
-  cursor: pointer;
-}
-.sort-select:focus { border-color: var(--accent); }
+.vilra-select:focus { border-color: var(--accent); }
 #selected-filter-tags {
   min-height: 30px;
   padding: 7px;
@@ -2058,14 +2048,6 @@ html.chrome-hidden #filter-bar {
   display: grid;
   grid-template-columns: minmax(180px, 1fr) minmax(150px, auto);
 }
-.tag-admin-toolbar select {
-  min-height: 32px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--panel-2);
-  color: var(--text);
-  padding: 0 10px;
-}
 #tag-admin-list {
   max-height: none;
   min-height: 0;
@@ -2371,7 +2353,28 @@ body { background: #000; font-size: 12px; }
 #filter-bar .match-toggle button.active { background: #e8e8e8; color: #090909; }
 #filter-bar .btn { height: 30px; min-height: 30px; padding: 0 10px; }
 #filter-tag-input { height: 30px; min-height: 30px; border-radius: 4px; background: #090909; }
-.sort-select { height: 30px; min-height: 30px; border-radius: 4px; background: #0b0b0b; }
+.vilra-select {
+  appearance: none;
+  -webkit-appearance: none;
+  color-scheme: dark;
+  height: 30px;
+  min-height: 30px;
+  padding: 0 28px 0 10px;
+  border: 1px solid #292929;
+  border-radius: 4px;
+  outline: none;
+  background-color: #0b0b0b;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath fill='%23888888' d='M0 0h8L4 5z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  background-size: 8px 5px;
+  color: var(--text);
+  cursor: pointer;
+}
+.vilra-select option {
+  background-color: #0b0b0b;
+  color: var(--text);
+}
 
 #folder-sidebar {
   inset: calc(var(--v31-toolbar-h) + var(--v31-filter-h)) auto 0 0; z-index: 170;
