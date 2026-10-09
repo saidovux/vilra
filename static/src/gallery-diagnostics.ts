@@ -1,7 +1,14 @@
 /**
- * Opt-in, bounded diagnostics for real Tauri/WebKitGTK gallery scrolling.
+ * Opt-in, bounded diagnostics for real desktop gallery scrolling.
  * The module observes the existing pipeline; it does not schedule image work.
  */
+
+import {
+  desktopRuntimeKind,
+  diagnosticRuntimeLabel,
+  invokeTauriCommand,
+  supportsNativeDiagnosticsPersistence,
+} from './desktop-runtime';
 
 export type DiagnosticState = 'off' | 'recording' | 'stopped' | 'exported';
 export type DiagnosticPageKind = 'refresh' | 'cursor';
@@ -566,7 +573,7 @@ class GalleryDiagnostics {
     this.attachResourceObserver();
     this.refreshTimer = setInterval(() => this.renderPanel(), 1_000);
     this.queueTimer = setInterval(() => { void this.sampleQueue(this.generation); }, QUEUE_SAMPLE_MS);
-    if (isTauriRuntime()) {
+    if (supportsNativeDiagnosticsPersistence()) {
       this.nativeSessionPromise = this.beginNativeSession(this.generation);
       this.checkpointTimer = setInterval(
         () => this.scheduleCheckpoint(this.generation),
@@ -599,9 +606,11 @@ class GalleryDiagnostics {
     this.snapshotJson = JSON.stringify(snapshot, null, 2);
     this.cards.clear();
     this.activePages.clear();
-    this.persistenceNotice = isTauriRuntime()
+    this.persistenceNotice = supportsNativeDiagnosticsPersistence()
       ? 'Сохранение JSON и Markdown…'
-      : 'Нативное автосохранение доступно в диагностической AppImage.';
+      : desktopRuntimeKind() === 'electron'
+        ? 'Нативное автосохранение не поддерживается в Electron Round 1; JSON можно скопировать.'
+        : 'Нативное автосохранение доступно в диагностической AppImage.';
     this.renderPanel();
     const generation = this.generation;
     const snapshotJson = this.snapshotJson;
@@ -692,7 +701,7 @@ class GalleryDiagnostics {
   }
 
   private scheduleCheckpoint(generation: number, immediate = false): void {
-    if (!isTauriRuntime() || generation !== this.generation || this.currentState !== 'recording') return;
+    if (!supportsNativeDiagnosticsPersistence() || generation !== this.generation || this.currentState !== 'recording') return;
     if (this.deferredCheckpointTimer !== null || this.checkpointInFlight) return;
     const delay = immediate ? 0 : (performance.now() <= this.frameActiveUntil ? 1_500 : 0);
     this.deferredCheckpointTimer = setTimeout(() => {
@@ -732,7 +741,7 @@ class GalleryDiagnostics {
   }
 
   private async saveFinalReport(generation: number, reportJson: string): Promise<void> {
-    if (!isTauriRuntime()) return;
+    if (!supportsNativeDiagnosticsPersistence()) return;
     await this.checkpointSavePromise;
     const session = await this.nativeSessionPromise;
     if (!session) return;
@@ -758,7 +767,7 @@ class GalleryDiagnostics {
   }
 
   private async loadNativeStatus(): Promise<void> {
-    if (!isTauriRuntime() || this.currentState === 'recording') return;
+    if (!supportsNativeDiagnosticsPersistence() || this.currentState === 'recording') return;
     try {
       const status = await nativeInvoke<NativeDiagnosticStatus>('gallery_diagnostics_status');
       this.diagnosticsDir = status.diagnostics_dir;
@@ -1407,7 +1416,7 @@ class GalleryDiagnostics {
         duration_ms: rounded(durationMs),
         interval_target_ms: INTERVAL_MS,
         viewport: {width: window.innerWidth, height: window.innerHeight},
-        runtime: isTauriRuntime() ? 'Tauri/WebKitGTK' : 'browser',
+        runtime: diagnosticRuntimeLabel(),
       },
       depth: {
         loaded_metadata_count: this.loadedMetadataCount,
@@ -1632,17 +1641,8 @@ class GalleryDiagnostics {
   }
 }
 
-function isTauriRuntime(): boolean {
-  return Boolean((window as Window & {__TAURI_INTERNALS__?: unknown}).__TAURI_INTERNALS__);
-}
-
 async function nativeInvoke<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
-  const tauri = window as Window & {
-    __TAURI__?: {core?: {invoke?: (name: string, input?: Record<string, unknown>) => Promise<T>}};
-  };
-  const invoke = tauri.__TAURI__?.core?.invoke;
-  if (!invoke) throw new Error('Native diagnostics persistence is unavailable');
-  return invoke(command, args);
+  return invokeTauriCommand<T>(command, args);
 }
 
 declare global {

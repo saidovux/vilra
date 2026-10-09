@@ -11,6 +11,11 @@ import {
   type DiagnosticCardRef,
   type DiagnosticPageOutcome,
 } from './gallery-diagnostics';
+import {
+  isDesktopRuntime,
+  pickFolderNative,
+  revealFileNative,
+} from './desktop-runtime';
 
 type MatchMode = 'any' | 'all';
 type SortMode = 'path_asc' | 'path_desc' | 'date_desc' | 'date_asc' | 'size_desc' | 'size_asc';
@@ -1068,29 +1073,8 @@ async function openFolder(pathOverride = '') {
 
 async function pickFolder() {
   try {
-    const tauriWindow = window as Window & {
-      __TAURI_INTERNALS__?: unknown;
-      __TAURI__?: {
-        dialog?: {
-          open?: (options: {
-            directory: boolean;
-            multiple: boolean;
-            title: string;
-            defaultPath?: string;
-          }) => Promise<string | string[] | null>;
-        };
-      };
-    };
-    if (tauriWindow.__TAURI_INTERNALS__) {
-      const openDialog = tauriWindow.__TAURI__?.dialog?.open;
-      if (!openDialog) throw new Error('Нативный диалог выбора папки недоступен');
-      const selected = await openDialog({
-        directory: true,
-        multiple: false,
-        title: 'Выберите папку с изображениями',
-        ...(getFolderInputValue() ? {defaultPath: getFolderInputValue()} : {})
-      });
-      const path = Array.isArray(selected) ? selected[0] : selected;
+    if (isDesktopRuntime()) {
+      const path = await pickFolderNative(getFolderInputValue());
       if (path) {
         setFolderInputValues(path);
         await openFolder(path);
@@ -1115,7 +1099,7 @@ async function pickFolder() {
     setFolderInputValues(path);
     await openFolder(path);
   } catch (e) {
-    if ((window as Window & {__TAURI_INTERNALS__?: unknown}).__TAURI_INTERNALS__) {
+    if (isDesktopRuntime()) {
       alert('Не удалось открыть проводник: ' + errorMessage(e));
       return;
     }
@@ -1620,7 +1604,7 @@ function renderProblems(): void {
         <div class="problem-inline-error" data-problem-error="${problem.id}"></div>
       </div>
       <div class="problem-actions">
-        <button class="btn btn-ghost btn-sm" type="button" data-action="reveal-problem" data-problem-id="${problem.id}">${isTauriRuntime() ? 'Показать в папке' : 'Копировать путь'}</button>
+        <button class="btn btn-ghost btn-sm" type="button" data-action="reveal-problem" data-problem-id="${problem.id}">${isDesktopRuntime() ? 'Показать в папке' : 'Копировать путь'}</button>
         <button class="btn btn-ghost btn-sm" type="button" data-action="recheck-problem" data-problem-id="${problem.id}" ${problemRowRechecks.has(problem.id) ? 'disabled' : ''}>${problemRowRechecks.has(problem.id) ? 'Проверка…' : 'Проверить'}</button>
       </div>
     </article>
@@ -1809,21 +1793,14 @@ async function recheckAllProblems(): Promise<void> {
   }
 }
 
-function isTauriRuntime(): boolean {
-  return Boolean((window as Window & {__TAURI_INTERNALS__?: unknown}).__TAURI_INTERNALS__);
-}
-
 async function revealProblem(issueId: number): Promise<void> {
   const problem = problemsItems.find(item => item.id === issueId);
   if (!problem) return;
   const errorTarget = document.querySelector<HTMLElement>(`[data-problem-error="${issueId}"]`);
   if (errorTarget) errorTarget.textContent = '';
   try {
-    if (isTauriRuntime()) {
-      const tauri = window as Window & {__TAURI__?: {core?: {invoke?: (command: string, args: JsonRecord) => Promise<unknown>}}};
-      const invoke = tauri.__TAURI__?.core?.invoke;
-      if (!invoke) throw new Error('Native file reveal is unavailable');
-      await invoke('reveal_problem', {issueId});
+    if (isDesktopRuntime()) {
+      await revealFileNative(issueId, problem.absolutePath);
     } else {
       await navigator.clipboard.writeText(problem.absolutePath);
       if (errorTarget) errorTarget.textContent = 'Путь скопирован.';

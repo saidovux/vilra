@@ -9,6 +9,10 @@
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed",
     "test:sqlite-stress": "node scripts/sqlite-lock-stress.mjs",
+    "electron:prepare": "npm run build:frontend && node node_modules/electron/install.js && node scripts/prepare-electron-sidecars.mjs",
+    "electron:dev": "npm run electron:prepare && node scripts/run-electron.mjs",
+    "electron:smoke": "npm run electron:prepare && node scripts/run-electron.mjs --smoke",
+    "electron:check": "node --check electron/main.cjs && node --check electron/preload.cjs && node --check scripts/run-electron.mjs && node --test electron/*.test.cjs",
     "tauri": "tauri",
     "tauri:prepare": "npm run build:frontend && node scripts/prepare-tauri-sidecars.mjs",
     "tauri:dev": "tauri dev",
@@ -17,6 +21,7 @@
   "devDependencies": {
     "@playwright/test": "^1.55.0",
     "@tauri-apps/cli": "^2.11.0",
+    "electron": "^44.7.0",
     "esbuild": "^0.23.1",
     "typescript": "^5.6.3"
   },
