@@ -383,10 +383,10 @@ test('viewer HJKL pans one shared constrained image transform', async ({page}) =
 
   await page.keyboard.press('j');
   const down = await stage.boundingBox();
-  expect(down!.y).toBeGreaterThan(right!.y + 10);
+  expect(down!.y).toBeLessThan(right!.y - 10);
   await page.keyboard.press('k');
   const up = await stage.boundingBox();
-  expect(up!.y).toBeLessThan(down!.y - 10);
+  expect(up!.y).toBeGreaterThan(down!.y + 10);
 
   const beforeModifiedKeys = await stage.boundingBox();
   await stage.dispatchEvent('keydown', {key: 'h', ctrlKey: true, bubbles: true, cancelable: true});

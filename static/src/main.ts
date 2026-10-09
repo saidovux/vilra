@@ -3991,10 +3991,10 @@ function dispatchCommand(command: AppCommand, context: ShortcutContext): void {
       previewModal?.panBy(-VIEWER_KEYBOARD_PAN_STEP, 0);
       break;
     case 'viewer.panDown':
-      previewModal?.panBy(0, VIEWER_KEYBOARD_PAN_STEP);
+      previewModal?.panBy(0, -VIEWER_KEYBOARD_PAN_STEP);
       break;
     case 'viewer.panUp':
-      previewModal?.panBy(0, -VIEWER_KEYBOARD_PAN_STEP);
+      previewModal?.panBy(0, VIEWER_KEYBOARD_PAN_STEP);
       break;
     case 'viewer.panRight':
       previewModal?.panBy(VIEWER_KEYBOARD_PAN_STEP, 0);
