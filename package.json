@@ -2,6 +2,7 @@
   "name": "vilra-frontend",
   "private": true,
   "version": "0.2.0",
+  "main": "electron/main.cjs",
   "scripts": {
     "build:frontend": "tsc --noEmit && mkdir -p static/dist && esbuild static/src/main.ts --bundle --platform=browser --format=iife --target=es2020 --outfile=static/dist/app.js && cp static/src/styles.css static/app.css",
     "typecheck": "tsc --noEmit",
@@ -12,7 +13,9 @@
     "electron:prepare": "npm run build:frontend && node node_modules/electron/install.js && node scripts/prepare-electron-sidecars.mjs",
     "electron:dev": "npm run electron:prepare && node scripts/run-electron.mjs",
     "electron:smoke": "npm run electron:prepare && node scripts/run-electron.mjs --smoke",
-    "electron:check": "node --check electron/main.cjs && node --check electron/preload.cjs && node --check scripts/run-electron.mjs && node --test electron/*.test.cjs",
+    "electron:package:prepare": "node scripts/prepare-electron-package.mjs",
+    "electron:build": "npm run electron:prepare && npm run electron:package:prepare && electron-builder --config electron-builder.yml --linux AppImage --x64",
+    "electron:check": "node --check electron/main.cjs && node --check electron/preload.cjs && node --check scripts/run-electron.mjs && node --check scripts/electron-build-context.mjs && node --check scripts/prepare-electron-package.mjs && node --test electron/*.test.cjs",
     "tauri": "tauri",
     "tauri:prepare": "npm run build:frontend && node scripts/prepare-tauri-sidecars.mjs",
     "tauri:dev": "tauri dev",
@@ -22,6 +25,7 @@
     "@playwright/test": "^1.55.0",
     "@tauri-apps/cli": "^2.11.0",
     "electron": "^44.7.0",
+    "electron-builder": "^26.15.3",
     "esbuild": "^0.23.1",
     "typescript": "^5.6.3"
   },

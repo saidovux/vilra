@@ -13,3 +13,5 @@ rust/**/target/
 src-tauri/gen/
 src-tauri/binaries/*
 !src-tauri/binaries/.gitkeep
+dist-electron/
+electron/package-resources/

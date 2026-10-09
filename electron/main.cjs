@@ -5,6 +5,7 @@ const net = require('node:net');
 const path = require('node:path');
 const readline = require('node:readline');
 
+const {resolveRuntimeBuildId, resolveRuntimeLayout} = require('./runtime-layout.cjs');
 const {resolveSqlitePath} = require('./runtime-paths.cjs');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -21,6 +22,7 @@ let shuttingDown = false;
 let allowQuit = false;
 let fatalExitStarted = false;
 let mainWindow = null;
+let cachedRuntimeLayout = null;
 
 function hostTriple() {
   const override = String(process.env.ELECTRON_TARGET_TRIPLE || '').trim();
@@ -42,12 +44,22 @@ function targetRoot() {
     : path.join(REPO_ROOT, 'rust', 'thumb-worker', 'target');
 }
 
-function sidecarPath(name) {
-  const extension = process.platform === 'win32' ? '.exe' : '';
-  return path.join(targetRoot(), hostTriple(), 'release', `${name}${extension}`);
+function runtimeLayout() {
+  if (!cachedRuntimeLayout) {
+    cachedRuntimeLayout = resolveRuntimeLayout({
+      isPackaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+      repoRoot: REPO_ROOT,
+      targetRoot: app.isPackaged ? null : targetRoot(),
+      targetTriple: app.isPackaged ? null : hostTriple(),
+      platform: process.platform,
+      env: process.env,
+    });
+  }
+  return cachedRuntimeLayout;
 }
 
-function buildId() {
+function developmentBuildId() {
   const head = execFileSync('git', ['rev-parse', '--short=12', 'HEAD'], {
     cwd: REPO_ROOT,
     encoding: 'utf8',
@@ -59,10 +71,8 @@ function buildId() {
   return `${head}${dirty ? '-dirty' : ''}`;
 }
 
-function staticDirectory() {
-  const configured = String(process.env.TAGIMAGE_STATIC_DIR || '').trim();
-  if (!configured) return path.join(REPO_ROOT, 'static');
-  return path.isAbsolute(configured) ? configured : path.resolve(REPO_ROOT, configured);
+function runtimeBuildId() {
+  return resolveRuntimeBuildId(runtimeLayout(), developmentBuildId);
 }
 
 function sidecarEnvironment(sqlitePath, staticDir, apiPort) {
@@ -71,7 +81,7 @@ function sidecarEnvironment(sqlitePath, staticDir, apiPort) {
     TAGIMAGE_SQLITE_PATH: sqlitePath,
     TAGIMAGE_STATIC_DIR: staticDir,
     TAGIMAGE_PACKAGED_RUNTIME: '1',
-    VILRA_BUILD_ID: buildId(),
+    VILRA_BUILD_ID: runtimeBuildId(),
     IMGVIEWER_RUST_API: '1',
     IMGVIEWER_RUST_API_HOST: '127.0.0.1',
     IMGVIEWER_RUST_API_PORT: String(apiPort),
@@ -109,7 +119,11 @@ async function waitForSpawn(child, name) {
 async function runDatabaseInit(executable, env, logDir) {
   const name = 'imgviewer-api-server-init';
   const logStream = openLog(logDir, name);
-  const child = spawn(executable, ['--init-db'], {cwd: REPO_ROOT, env, stdio: ['ignore', 'pipe', 'pipe']});
+  const child = spawn(executable, ['--init-db'], {
+    cwd: runtimeLayout().workingDirectory,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
   pipeOutput(name, child.stdout, logStream, false);
   pipeOutput(name, child.stderr, logStream, true);
   try {
@@ -127,10 +141,14 @@ async function runDatabaseInit(executable, env, logDir) {
 
 async function spawnSidecar(name, args, env, logDir) {
   if (shuttingDown) throw new Error(`Runtime shutdown started before spawning ${name}`);
-  const executable = sidecarPath(name);
+  const executable = runtimeLayout().sidecarPath(name);
   if (!fs.existsSync(executable)) throw new Error(`Missing Electron sidecar: ${executable}`);
   const logStream = openLog(logDir, name);
-  const child = spawn(executable, args, {cwd: REPO_ROOT, env, stdio: ['ignore', 'pipe', 'pipe']});
+  const child = spawn(executable, args, {
+    cwd: runtimeLayout().workingDirectory,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
   pipeOutput(name, child.stdout, logStream, false);
   pipeOutput(name, child.stderr, logStream, true);
   child.once('exit', (code, signal) => {
@@ -301,7 +319,8 @@ async function createMainWindow(port) {
 
 async function startRuntime() {
   const sqlitePath = resolveSqlitePath();
-  const staticDir = staticDirectory();
+  const layout = runtimeLayout();
+  const staticDir = layout.staticDirectory;
   if (!fs.existsSync(path.join(staticDir, 'index.html'))) {
     throw new Error(`Frontend index is missing from ${staticDir}`);
   }
@@ -315,7 +334,7 @@ async function startRuntime() {
   console.log(`[electron] static=${staticDir}`);
   console.log(`[electron] api=${localOrigin}`);
 
-  await runDatabaseInit(sidecarPath('imgviewer-api-server'), env, logDir);
+  await runDatabaseInit(layout.sidecarPath('imgviewer-api-server'), env, logDir);
   await spawnSidecar(
     'imgviewer-api-server',
     ['--host', '127.0.0.1', '--port', String(apiPort)],

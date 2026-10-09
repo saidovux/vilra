@@ -1,0 +1,30 @@
+appId: app.tagimage.desktop.electron
+productName: Vilra
+asar: true
+directories:
+  output: dist-electron
+files:
+  - electron/main.cjs
+  - electron/preload.cjs
+  - electron/runtime-layout.cjs
+  - electron/runtime-paths.cjs
+  - package.json
+extraResources:
+  - from: electron/package-resources/bin
+    to: bin
+    filter:
+      - "**/*"
+  - from: electron/package-resources/static
+    to: static
+    filter:
+      - "**/*"
+  - from: electron/package-resources/build-info.json
+    to: build-info.json
+linux:
+  target:
+    - target: AppImage
+      arch:
+        - x64
+  artifactName: Vilra-Electron_${version}_amd64.${ext}
+  icon: src-tauri/icons/icon.png
+  category: Graphics
