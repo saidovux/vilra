@@ -259,6 +259,78 @@ test('explicit Gallery Focus and sidebar controls preserve the visible virtual a
   await expect(page.locator('#filter-bar')).toBeVisible();
 });
 
+test('loaded Chromium thumbnail stays paint-ready across virtual remount and hover', async ({page}) => {
+  const targetId = 'synthetic-00000';
+  let targetRequests = 0;
+  page.on('request', request => {
+    if (new URL(request.url()).pathname === `/thumb-file/${targetId}.jpg`) targetRequests += 1;
+  });
+  await installSyntheticGallery(page);
+  await page.setViewportSize({width: 1366, height: 768});
+  await page.goto('/');
+  await page.locator('html').evaluate(element => { element.style.scrollBehavior = 'auto'; });
+
+  const targetSlot = page.locator(`.virtual-card-slot[data-id="${targetId}"]`);
+  const targetCard = targetSlot.locator('.card');
+  const targetImage = targetCard.locator('img');
+  await expect(targetImage).toHaveClass(/loaded/);
+
+  const assertPaintReady = async () => {
+    const state = await targetImage.evaluate(image => {
+      const slot = image.closest<HTMLElement>('.virtual-card-slot');
+      const style = getComputedStyle(image);
+      return {
+        complete: image.complete,
+        naturalWidth: image.naturalWidth,
+        loaded: image.classList.contains('loaded'),
+        opacity: style.opacity,
+        display: style.display,
+        visibility: style.visibility,
+        slotWillChange: slot ? getComputedStyle(slot).willChange : '',
+        slotTransform: slot?.style.transform || '',
+        source: image.currentSrc,
+      };
+    });
+    expect(state).toMatchObject({
+      complete: true,
+      loaded: true,
+      opacity: '1',
+      display: 'block',
+      visibility: 'visible',
+      slotWillChange: 'auto',
+    });
+    expect(state.naturalWidth).toBeGreaterThan(0);
+    expect(state.slotTransform).toMatch(/^translate3d\(/);
+    expect(state.source).toContain(`/thumb-file/${targetId}.jpg`);
+    return state.source;
+  };
+
+  const assertHoverDoesNotReload = async () => {
+    await targetImage.evaluate(image => {
+      image.dataset.hoverProbeLoads = '0';
+      image.addEventListener('load', () => {
+        image.dataset.hoverProbeLoads = String(Number(image.dataset.hoverProbeLoads || 0) + 1);
+      });
+    });
+    const requestsBeforeHover = targetRequests;
+    const sourceBeforeHover = await assertPaintReady();
+    await targetCard.hover();
+    await page.evaluate(() => new Promise<void>(resolve => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    }));
+    expect(await targetImage.getAttribute('data-hover-probe-loads')).toBe('0');
+    expect(targetRequests).toBe(requestsBeforeHover);
+    expect(await assertPaintReady()).toBe(sourceBeforeHover);
+  };
+
+  await assertHoverDoesNotReload();
+  await page.evaluate(() => window.scrollTo({top: 12_000}));
+  await expect(targetSlot).toHaveCount(0);
+  await page.evaluate(() => window.scrollTo({top: 0}));
+  await expect(targetImage).toHaveClass(/loaded/);
+  await assertHoverDoesNotReload();
+});
+
 test('TanStack virtual masonry stays bounded through pagination, reverse scroll, and resize', async ({page}, testInfo) => {
   test.setTimeout(180_000);
   const state = await installSyntheticGallery(page);

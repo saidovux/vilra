@@ -388,7 +388,6 @@ input::placeholder { color: var(--faint); }
 .virtual-card-slot {
   position: absolute;
   inset: 0 auto auto 0;
-  will-change: transform;
 }
 .card {
   display: block;
