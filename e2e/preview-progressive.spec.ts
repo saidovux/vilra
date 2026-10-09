@@ -15,19 +15,24 @@ type PreviewFixture = {
   originalRequests: string[];
 };
 
+type PreviewFixtureOptions = {
+  width?: number;
+  height?: number;
+};
+
 function deferred(): Deferred {
   let resolve = () => {};
   const promise = new Promise<void>(done => { resolve = done; });
   return {promise, resolve};
 }
 
-function image(id: string, index: number) {
+function image(id: string, index: number, options: PreviewFixtureOptions = {}) {
   return {
     id,
     path: `preview/${id}.png`,
     thumb_url: `/thumb-file/${id}.jpg`,
-    width: 1,
-    height: 1,
+    width: options.width ?? 1,
+    height: options.height ?? 1,
     size: 1024 + index,
     mtime: 100 - index,
     tags: [],
@@ -42,7 +47,7 @@ async function fulfillOriginal(route: Route, wait: Deferred): Promise<void> {
   await route.fulfill({status: 200, contentType: 'image/png', body: IMAGE_BYTES}).catch(() => undefined);
 }
 
-async function installPreviewFixture(page: Page): Promise<PreviewFixture> {
+async function installPreviewFixture(page: Page, options: PreviewFixtureOptions = {}): Promise<PreviewFixture> {
   const ids = ['preview-a', 'preview-b', 'preview-c'];
   const controls = new Map(ids.map(id => [id, deferred()]));
   const originalRequests: string[] = [];
@@ -65,9 +70,10 @@ async function installPreviewFixture(page: Page): Promise<PreviewFixture> {
     }});
   });
   await page.route('**/api/images?**', route => route.fulfill({status: 200, json: {
-    items: ids.map(image),
+    items: ids.map((id, index) => image(id, index, options)),
     page: {total: ids.length, next_cursor: null, has_more: false},
   }}));
+  await page.route('**/api/tags', route => route.fulfill({status: 200, json: {tags: ['hiking']}}));
   await page.route('**/thumb-file/preview-*.jpg*', route => route.fulfill({
     status: 200,
     contentType: 'image/png',
@@ -239,9 +245,31 @@ test('viewer Focus and Inspector controls preserve layout state through navigati
 
   await expect(page.locator('#preview-focus-toggle')).toContainText('Focus');
   await expect(page.locator('#preview-focus-toggle')).toContainText('Tab');
+  await page.keyboard.press('1');
+  await expect(page.locator('#zoom-level')).toHaveText('100%');
+  await page.keyboard.press('Shift+=');
+  await expect(page.locator('#zoom-level')).toHaveText('120%');
+  await page.keyboard.press('-');
+  await expect(page.locator('#zoom-level')).toHaveText('100%');
+  await page.keyboard.press('=');
+  await expect(page.locator('#zoom-level')).toHaveText('120%');
+  await page.keyboard.press('f');
+  await expect(page.locator('#zoom-level')).toHaveText('FIT');
   await page.keyboard.press('i');
+  await expect(page.locator('#zoom-level')).toHaveText('120%');
+  await page.keyboard.press('o');
+  await expect(page.locator('#zoom-level')).toHaveText('100%');
+  await page.keyboard.press('Shift+f');
+  await expect(page.locator('#zoom-level')).toHaveText('FIT');
   await expect(modal).not.toHaveClass(/preview-focus-mode/);
   await expect(page.locator('#preview-inspector')).toBeVisible();
+
+  await modal.dispatchEvent('keydown', {key: 'i', ctrlKey: true, bubbles: true, cancelable: true});
+  await modal.dispatchEvent('keydown', {key: 'o', altKey: true, bubbles: true, cancelable: true});
+  await modal.dispatchEvent('keydown', {key: 'p', metaKey: true, bubbles: true, cancelable: true});
+  await modal.dispatchEvent('keydown', {key: 'n', ctrlKey: true, bubbles: true, cancelable: true});
+  await expect(page.locator('#zoom-level')).toHaveText('FIT');
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-a');
 
   await page.keyboard.press('Control+b');
   await expect(modal).toHaveClass(/preview-inspector-hidden/);
@@ -278,11 +306,11 @@ test('viewer Focus and Inspector controls preserve layout state through navigati
   expect(focusedImageStage!.width).toBeGreaterThan(1);
   expect(focusedImageStage!.height).toBeGreaterThan(1);
 
-  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('p');
   await expect(modal).toHaveAttribute('data-image-id', 'preview-b');
   await expect(modal).toHaveClass(/preview-focus-mode/);
   await expect(modal).toHaveClass(/preview-inspector-hidden/);
-  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('p');
   await expect(modal).toHaveAttribute('data-image-id', 'preview-c');
   await expect(modal).toHaveClass(/preview-focus-mode/);
 
@@ -300,8 +328,14 @@ test('viewer Focus and Inspector controls preserve layout state through navigati
   expect(Math.abs(focusInspector!.x - (viewport!.width - 292))).toBeLessThanOrEqual(1);
   expect(Math.abs(focusInspector!.y)).toBeLessThanOrEqual(1);
   expect(Math.abs(focusInspector!.height - viewport!.height)).toBeLessThanOrEqual(1);
+  await page.keyboard.press('n');
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-b');
+  await expect(modal).toHaveClass(/preview-focus-mode/);
+  await expect(modal).not.toHaveClass(/preview-inspector-hidden/);
   await page.keyboard.press('ArrowRight');
-  await expect(modal).toHaveAttribute('data-image-id', 'preview-a');
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-c');
+  await page.keyboard.press('ArrowLeft');
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-b');
   await expect(modal).toHaveClass(/preview-focus-mode/);
   await expect(modal).not.toHaveClass(/preview-inspector-hidden/);
 
@@ -327,6 +361,43 @@ test('viewer Focus and Inspector controls preserve layout state through navigati
   await page.keyboard.press('Escape');
 });
 
+test('viewer HJKL pans one shared constrained image transform', async ({page}) => {
+  await installPreviewFixture(page, {width: 1600, height: 1200});
+  await openFixture(page);
+
+  await page.locator('.card[data-id="preview-a"]').click();
+  await page.keyboard.press('1');
+  await expect(page.locator('#zoom-level')).toHaveText('100%');
+  const stage = page.locator('#preview-image-stage');
+  const initial = await stage.boundingBox();
+  expect(initial).toBeTruthy();
+  expect(initial!.width).toBeGreaterThan(page.viewportSize()!.width);
+  expect(initial!.height).toBeGreaterThan(page.viewportSize()!.height);
+
+  await page.keyboard.press('h');
+  const left = await stage.boundingBox();
+  expect(left!.x).toBeLessThan(initial!.x - 10);
+  await page.keyboard.press('l');
+  const right = await stage.boundingBox();
+  expect(right!.x).toBeGreaterThan(left!.x + 10);
+
+  await page.keyboard.press('j');
+  const down = await stage.boundingBox();
+  expect(down!.y).toBeGreaterThan(right!.y + 10);
+  await page.keyboard.press('k');
+  const up = await stage.boundingBox();
+  expect(up!.y).toBeLessThan(down!.y - 10);
+
+  const beforeModifiedKeys = await stage.boundingBox();
+  await stage.dispatchEvent('keydown', {key: 'h', ctrlKey: true, bubbles: true, cancelable: true});
+  await stage.dispatchEvent('keydown', {key: 'j', altKey: true, bubbles: true, cancelable: true});
+  await stage.dispatchEvent('keydown', {key: 'k', metaKey: true, bubbles: true, cancelable: true});
+  await stage.dispatchEvent('keydown', {key: 'L', shiftKey: true, bubbles: true, cancelable: true});
+  const afterModifiedKeys = await stage.boundingBox();
+  expect(afterModifiedKeys!.x).toBeCloseTo(beforeModifiedKeys!.x, 1);
+  expect(afterModifiedKeys!.y).toBeCloseTo(beforeModifiedKeys!.y, 1);
+});
+
 test('app layout shortcuts do not intercept text controls or contenteditable', async ({page}) => {
   await installPreviewFixture(page);
   await openFixture(page);
@@ -350,6 +421,23 @@ test('app layout shortcuts do not intercept text controls or contenteditable', a
   });
   await page.keyboard.press('Tab');
   await expect(gallery).not.toHaveClass(/gallery-focus-mode/);
+
+  await page.locator('.card[data-id="preview-a"]').click();
+  const modal = page.locator('#preview-modal');
+  const previewInput = page.locator('#preview-tag-input');
+  await previewInput.focus();
+  const zoomBeforeTyping = await page.locator('#zoom-level').textContent();
+  await page.keyboard.type('hijklopn');
+  await expect(previewInput).toHaveValue('hijklopn');
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-a');
+  await expect(page.locator('#zoom-level')).toHaveText(zoomBeforeTyping || 'FIT');
+  await expect(modal).not.toHaveClass(/preview-focus-mode/);
+
+  await previewInput.fill('hik');
+  await expect(page.locator('#preview-tag-ghost')).toContainText('hiking');
+  await page.keyboard.press('Tab');
+  await expect(previewInput).toHaveValue('hiking');
+  await expect(modal).not.toHaveClass(/preview-focus-mode/);
 });
 
 test('viewer quick actions open for the current image by right click and Space', async ({page}) => {

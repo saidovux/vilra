@@ -155,6 +155,31 @@ async function loadAllSyntheticPages(page: Page, state: SyntheticState): Promise
   expect(state.servedThrough).toBe(TOTAL_IMAGES);
 }
 
+test('Gallery j and k scroll natively while modified variants stay unhandled', async ({page}) => {
+  await installSyntheticGallery(page);
+  await page.setViewportSize({width: 1366, height: 768});
+  await page.goto('/');
+  await page.locator('html').evaluate(element => { element.style.scrollBehavior = 'auto'; });
+  await expect(page.locator('.card[data-id]').first()).toBeVisible();
+  await page.evaluate(() => {
+    window.scrollTo({top: 1200});
+    (document.activeElement as HTMLElement | null)?.blur();
+  });
+  const beforeDown = await page.evaluate(() => window.scrollY);
+  await page.keyboard.press('j');
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(beforeDown);
+  const beforeUp = await page.evaluate(() => window.scrollY);
+  await page.keyboard.press('k');
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeLessThan(beforeUp);
+
+  const beforeModifiedKeys = await page.evaluate(() => window.scrollY);
+  await page.locator('body').dispatchEvent('keydown', {key: 'j', ctrlKey: true, bubbles: true, cancelable: true});
+  await page.locator('body').dispatchEvent('keydown', {key: 'j', altKey: true, bubbles: true, cancelable: true});
+  await page.locator('body').dispatchEvent('keydown', {key: 'j', metaKey: true, bubbles: true, cancelable: true});
+  await page.locator('body').dispatchEvent('keydown', {key: 'J', shiftKey: true, bubbles: true, cancelable: true});
+  expect(await page.evaluate(() => window.scrollY)).toBe(beforeModifiedKeys);
+});
+
 test('explicit Gallery Focus and sidebar controls preserve the visible virtual anchor', async ({page}) => {
   await installSyntheticGallery(page);
   await page.setViewportSize({width: 1366, height: 768});

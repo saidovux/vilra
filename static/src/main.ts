@@ -16,6 +16,26 @@ type MatchMode = 'any' | 'all';
 type SortMode = 'path_asc' | 'path_desc' | 'date_desc' | 'date_asc' | 'size_desc' | 'size_asc';
 type SettingsTab = 'general' | 'tags' | 'graph' | 'problems';
 type AppWorkspace = 'gallery' | 'settings';
+type ShortcutContext = 'gallery' | 'viewer' | 'settings' | 'graph' | 'blocked';
+type AppCommand =
+  | 'ui.toggleFocus'
+  | 'ui.toggleSidePanel'
+  | 'gallery.moveDown'
+  | 'gallery.moveUp'
+  | 'viewer.panLeft'
+  | 'viewer.panDown'
+  | 'viewer.panUp'
+  | 'viewer.panRight'
+  | 'viewer.zoomIn'
+  | 'viewer.zoomOut'
+  | 'viewer.nextImage'
+  | 'viewer.previousImage'
+  | 'viewer.fit'
+  | 'viewer.actualSize'
+  | 'viewer.quickMenu'
+  | 'viewer.close'
+  | 'settings.close'
+  | 'graph.close';
 type GraphScope = 'current' | 'all';
 type TagAdminSort = 'name' | 'image_count' | 'user_count' | 'auto_count';
 type TagKind = 'include' | 'exclude';
@@ -494,7 +514,6 @@ class PreviewModal {
   private readonly boundMouseDown = this.handleMouseDown.bind(this);
   private readonly boundMouseMove = this.handleMouseMove.bind(this);
   private readonly boundMouseUp = this.handleMouseUp.bind(this);
-  private readonly boundKeyDown = this.handleKeyDown.bind(this);
   private readonly boundBackdropClick = this.handleBackdropClick.bind(this);
   private readonly boundCloseClick = this.close.bind(this);
   private readonly boundResize = this.handleResize.bind(this);
@@ -526,7 +545,6 @@ class PreviewModal {
   private initEventListeners(): void {
     this.closeBtn.addEventListener("click", this.boundCloseClick);
     this.modal.addEventListener("click", this.boundBackdropClick);
-    document.addEventListener("keydown", this.boundKeyDown);
     this.stage.addEventListener("wheel", this.boundWheel, { passive: false });
     this.stage.addEventListener("mousedown", this.boundMouseDown);
     this.stage.addEventListener("mousemove", this.boundMouseMove);
@@ -538,33 +556,6 @@ class PreviewModal {
 
   private handleBackdropClick(event: MouseEvent): void {
     if (event.target === this.modal) this.close();
-  }
-
-  private handleKeyDown(event: KeyboardEvent): void {
-    if (!this.isOpen || isTextEntryTarget(event.target)) return;
-    if (event.key === "Escape") {
-      this.close();
-      return;
-    }
-    if (event.key.toLowerCase() === "f") {
-      event.preventDefault();
-      this.fit();
-      return;
-    }
-    if (event.key === "1") {
-      event.preventDefault();
-      this.oneToOne();
-      return;
-    }
-    if (event.key === "+" || event.key === "=") {
-      event.preventDefault();
-      this.zoomBy(1.2);
-      return;
-    }
-    if (event.key === "-") {
-      event.preventDefault();
-      this.zoomBy(1 / 1.2);
-    }
   }
 
   open(source: PreviewImageRequest): void {
@@ -748,6 +739,14 @@ class PreviewModal {
     if (!this.isOpen || !Number.isFinite(factor) || factor <= 0) return;
     this.measureViewport();
     this.zoomAt(this.containerWidth / 2, this.containerHeight / 2, factor);
+  }
+
+  panBy(dx: number, dy: number): void {
+    if (!this.isOpen || !Number.isFinite(dx) || !Number.isFinite(dy)) return;
+    this.offsetX += dx;
+    this.offsetY += dy;
+    this.constrainOffset();
+    this.render();
   }
 
   refreshLayout(): void {
@@ -978,6 +977,8 @@ const PAGE = 48;
 const MASONRY_COL_MIN = 218;
 const GALLERY_OVERSCAN = 20;
 const CARD_BORDER_WIDTH = 1;
+const GALLERY_KEYBOARD_SCROLL_STEP = 96;
+const VIEWER_KEYBOARD_PAN_STEP = 80;
 const THUMB_VELOCITY_EMA_ALPHA = 0.35;
 const THUMB_FAST_ENTER_THRESHOLD = 1.25;
 const THUMB_FAST_EXIT_THRESHOLD = 0.55;
@@ -3918,43 +3919,127 @@ function restorePreviewIfNeeded(): void {
   if (previewModal && !previewModal.isOpen) openLightboxById(tab.lastImageId, false);
 }
 
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') {
-    if (graphState && graphState.open) {
-      closeGraph();
-      return;
-    }
-    if (activeWorkspace === 'settings') {
-      toggleSettings(false);
-      return;
-    }
+function resolveShortcutContext(): ShortcutContext {
+  if (graphState?.open) return 'graph';
+  if (activeWorkspace === 'settings') return 'settings';
+  if (previewModal?.isOpen) return 'viewer';
+  if (requiredHtml('tag-overlay').classList.contains('open')) return 'blocked';
+  return activeWorkspace === 'gallery' ? 'gallery' : 'blocked';
+}
+
+function isPlainCharacter(event: KeyboardEvent, key: string): boolean {
+  return event.key === key && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey;
+}
+
+function resolveShortcut(event: KeyboardEvent, context: ShortcutContext): AppCommand | null {
+  if (event.key === 'Escape') {
+    if (context === 'viewer') return 'viewer.close';
+    if (context === 'settings') return 'settings.close';
+    if (context === 'graph') return 'graph.close';
+    return null;
   }
-  if (isTextEntryTarget(e.target)) return;
-  const tabShortcut = e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
-  const panelShortcut = e.key.toLowerCase() === 'b' && e.ctrlKey && !e.altKey && !e.metaKey;
-  if (previewModal?.isOpen) {
-    if (tabShortcut) {
-      e.preventDefault();
-      togglePreviewFocusMode();
-    } else if (panelShortcut) {
-      e.preventDefault();
-      togglePreviewInspector();
-    } else if (e.key === 'ArrowLeft') previewNav(-1);
-    else if (e.key === 'ArrowRight') previewNav(1);
-    else if (e.code === 'Space') {
-      e.preventDefault();
+
+  const tabShortcut = event.key === 'Tab'
+    && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey;
+  const panelShortcut = event.key.toLowerCase() === 'b'
+    && event.ctrlKey && !event.altKey && !event.metaKey;
+  if ((context === 'gallery' || context === 'viewer') && tabShortcut) return 'ui.toggleFocus';
+  if ((context === 'gallery' || context === 'viewer') && panelShortcut) return 'ui.toggleSidePanel';
+
+  if (context === 'gallery') {
+    if (isPlainCharacter(event, 'j')) return 'gallery.moveDown';
+    if (isPlainCharacter(event, 'k')) return 'gallery.moveUp';
+    return null;
+  }
+  if (context !== 'viewer') return null;
+
+  if (isPlainCharacter(event, 'h')) return 'viewer.panLeft';
+  if (isPlainCharacter(event, 'j')) return 'viewer.panDown';
+  if (isPlainCharacter(event, 'k')) return 'viewer.panUp';
+  if (isPlainCharacter(event, 'l')) return 'viewer.panRight';
+  if (isPlainCharacter(event, 'i')) return 'viewer.zoomIn';
+  if (isPlainCharacter(event, 'o')) return 'viewer.zoomOut';
+  if (isPlainCharacter(event, 'p')) return 'viewer.nextImage';
+  if (isPlainCharacter(event, 'n')) return 'viewer.previousImage';
+  if (event.key === 'ArrowRight') return 'viewer.nextImage';
+  if (event.key === 'ArrowLeft') return 'viewer.previousImage';
+  if (event.key.toLowerCase() === 'f') return 'viewer.fit';
+  if (event.key === '1') return 'viewer.actualSize';
+  if (event.key === '+' || event.key === '=') return 'viewer.zoomIn';
+  if (event.key === '-') return 'viewer.zoomOut';
+  if (event.code === 'Space') return 'viewer.quickMenu';
+  return null;
+}
+
+function dispatchCommand(command: AppCommand, context: ShortcutContext): void {
+  switch (command) {
+    case 'ui.toggleFocus':
+      if (context === 'viewer') togglePreviewFocusMode();
+      else if (context === 'gallery') toggleGalleryFocusMode();
+      break;
+    case 'ui.toggleSidePanel':
+      if (context === 'viewer') togglePreviewInspector();
+      else if (context === 'gallery') toggleFolderSidebar();
+      break;
+    case 'gallery.moveDown':
+      window.scrollBy({top: GALLERY_KEYBOARD_SCROLL_STEP, behavior: 'auto'});
+      break;
+    case 'gallery.moveUp':
+      window.scrollBy({top: -GALLERY_KEYBOARD_SCROLL_STEP, behavior: 'auto'});
+      break;
+    case 'viewer.panLeft':
+      previewModal?.panBy(-VIEWER_KEYBOARD_PAN_STEP, 0);
+      break;
+    case 'viewer.panDown':
+      previewModal?.panBy(0, VIEWER_KEYBOARD_PAN_STEP);
+      break;
+    case 'viewer.panUp':
+      previewModal?.panBy(0, -VIEWER_KEYBOARD_PAN_STEP);
+      break;
+    case 'viewer.panRight':
+      previewModal?.panBy(VIEWER_KEYBOARD_PAN_STEP, 0);
+      break;
+    case 'viewer.zoomIn':
+      previewModal?.zoomBy(1.2);
+      break;
+    case 'viewer.zoomOut':
+      previewModal?.zoomBy(1 / 1.2);
+      break;
+    case 'viewer.nextImage':
+      previewNav(1);
+      break;
+    case 'viewer.previousImage':
+      previewNav(-1);
+      break;
+    case 'viewer.fit':
+      previewModal?.fit();
+      break;
+    case 'viewer.actualSize':
+      previewModal?.oneToOne();
+      break;
+    case 'viewer.quickMenu':
       openPreviewQuickMenu(window.innerWidth / 2 - 90, window.innerHeight / 2 - 120);
-    }
-    return;
+      break;
+    case 'viewer.close':
+      previewModal?.close();
+      break;
+    case 'settings.close':
+      toggleSettings(false);
+      break;
+    case 'graph.close':
+      closeGraph();
+      break;
   }
-  if (activeWorkspace !== 'gallery' || graphState?.open || requiredHtml('tag-overlay').classList.contains('open')) return;
-  if (tabShortcut) {
-    e.preventDefault();
-    toggleGalleryFocusMode();
-  } else if (panelShortcut) {
-    e.preventDefault();
-    toggleFolderSidebar();
-  }
+}
+
+document.addEventListener('keydown', event => {
+  const context = resolveShortcutContext();
+  const preserveContextEscape = event.key === 'Escape' && (context === 'settings' || context === 'graph');
+  if (isTextEntryTarget(event.target) && !preserveContextEscape) return;
+  const command = resolveShortcut(event, context);
+  if (!command) return;
+  event.preventDefault();
+  dispatchCommand(command, context);
 });
 
 function saveSessionSoon(): void {
