@@ -452,7 +452,10 @@ function closestFromEvent(event: Event, selector: string): HTMLElement | null {
 }
 
 function isTextEntryTarget(target: EventTarget | null): boolean {
-  return target instanceof HTMLElement && ['INPUT', 'TEXTAREA'].includes(target.tagName);
+  if (!(target instanceof HTMLElement)) return false;
+  return ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)
+    || target.isContentEditable
+    || Boolean(target.closest('[contenteditable]:not([contenteditable="false"])'));
 }
 
 class PreviewModal {
@@ -621,7 +624,7 @@ class PreviewModal {
     const wasOpen = this.isOpen;
     this.modal.style.display = "none";
     this.modal.setAttribute("aria-hidden", "true");
-    this.modal.classList.remove("preview-chrome-hidden");
+    this.modal.classList.remove("preview-focus-mode", "preview-inspector-hidden");
     this.isOpen = false;
     this.isDragging = false;
     this.hasDragged = false;
@@ -915,6 +918,13 @@ let previewModal: PreviewModal | null = null;
 let lightboxImages: ImageItem[] = [];
 let previewFilmMode: 'nearby' | 'tag' | 'folder' = 'nearby';
 let previewFocusMode = false;
+let previewInspectorVisible = true;
+let previewInspectorBeforeFocus = true;
+let previewInspectorChangedDuringFocus = false;
+let galleryFocusMode = false;
+let gallerySidebarVisible = true;
+let gallerySidebarBeforeFocus = true;
+let gallerySidebarChangedDuringFocus = false;
 const selectedImageIds = new Set<string>();
 let previewRequestToken = 0;
 let suppressPreviewCloseClear = false;
@@ -924,7 +934,6 @@ let latestStatus: StatusResponse | null = null;
 let filterSuggestionOpen = false;
 let settingsActiveTab: SettingsTab = 'general';
 let tagAdminSort: TagAdminSort = 'name';
-let lastScrollY = 0;
 let graphState: GraphState | null = null;
 let liveEventSource: EventSource | null = null;
 let lastLiveSequence = 0;
@@ -1126,12 +1135,54 @@ async function refreshFolderTree() {
   } catch {}
 }
 
-function toggleFolderSidebar(force?: boolean): void {
-  const sidebar = optionalHtml('folder-sidebar');
-  if (!sidebar) return;
-  const open = force === undefined ? sidebar.classList.contains('collapsed') : Boolean(force);
-  sidebar.classList.toggle('collapsed', !open);
-  requestAnimationFrame(handleGalleryResize);
+function renderGalleryUiState(): void {
+  const screen = requiredHtml('gallery-screen');
+  const sidebar = requiredHtml('folder-sidebar');
+  const focusButton = optionalHtml('gallery-focus-toggle');
+  const sidebarButton = optionalHtml('folder-sidebar-toggle');
+  screen.classList.toggle('gallery-focus-mode', galleryFocusMode);
+  sidebar.classList.toggle('collapsed', !gallerySidebarVisible);
+  if (focusButton) {
+    focusButton.classList.toggle('active', galleryFocusMode);
+    focusButton.setAttribute('aria-pressed', galleryFocusMode ? 'true' : 'false');
+  }
+  sidebarButton?.setAttribute('aria-expanded', gallerySidebarVisible ? 'true' : 'false');
+}
+
+function updateGalleryUiState(mutator: () => void): void {
+  const anchor = captureGalleryAnchor();
+  mutator();
+  renderGalleryUiState();
+  scheduleGalleryResize(anchor);
+}
+
+function toggleFolderSidebar(force?: boolean, explicit = true): void {
+  const open = force === undefined ? !gallerySidebarVisible : Boolean(force);
+  if (open === gallerySidebarVisible) return;
+  updateGalleryUiState(() => {
+    gallerySidebarVisible = open;
+    if (galleryFocusMode && explicit) gallerySidebarChangedDuringFocus = true;
+  });
+}
+
+function setGalleryFocusMode(enabled: boolean): void {
+  if (enabled === galleryFocusMode) return;
+  updateGalleryUiState(() => {
+    if (enabled) {
+      gallerySidebarBeforeFocus = gallerySidebarVisible;
+      gallerySidebarChangedDuringFocus = false;
+      galleryFocusMode = true;
+      gallerySidebarVisible = false;
+      return;
+    }
+    galleryFocusMode = false;
+    if (!gallerySidebarChangedDuringFocus) gallerySidebarVisible = gallerySidebarBeforeFocus;
+    gallerySidebarChangedDuringFocus = false;
+  });
+}
+
+function toggleGalleryFocusMode(): void {
+  setGalleryFocusMode(!galleryFocusMode);
 }
 
 function updateRootSummary(): void {
@@ -1172,7 +1223,6 @@ function toggleSettings(force?: boolean): void {
   if (open === (activeWorkspace === 'settings')) return;
   if (open) {
     saveActiveScroll();
-    showChrome();
     suppressedPreviewRestoreId = activeTab().lastImageId;
     closePreview(false);
     closeGraph();
@@ -1258,7 +1308,7 @@ function showGallery(): void {
 function showSetup(): void {
   requiredHtml('setup-screen').style.display = 'none';
   requiredHtml('gallery-screen').style.display = 'block';
-  toggleFolderSidebar(true);
+  toggleFolderSidebar(true, false);
   renderFolderTree();
   updateRootSummary();
 }
@@ -2943,35 +2993,6 @@ function updateScrollTopButton(): void {
   btn.classList.toggle('visible', window.scrollY > 320);
 }
 
-function hasActiveModal(): boolean {
-  return Boolean(
-    requiredHtml('tag-overlay').classList.contains('open') ||
-    requiredHtml('graph-overlay').classList.contains('open') ||
-    (previewModal && previewModal.isOpen)
-  );
-}
-
-function showChrome(): void {
-  document.body.classList.remove('chrome-hidden');
-  document.documentElement.classList.remove('chrome-hidden');
-}
-
-function hideChrome(): void {
-  document.body.classList.add('chrome-hidden');
-  document.documentElement.classList.add('chrome-hidden');
-}
-
-function handleChromeScroll(): void {
-  const y = window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0;
-  updateScrollTopButton();
-  if (y < 64 || y < lastScrollY || hasActiveModal()) {
-    showChrome();
-  } else if (y > lastScrollY + 4) {
-    hideChrome();
-  }
-  lastScrollY = y;
-}
-
 function ensureGraphState(): GraphState {
   if (graphState) return graphState;
   const canvas = requireElement('graph-canvas', HTMLCanvasElement, "Graph canvas is missing");
@@ -3019,7 +3040,6 @@ function openGraph(scope: GraphScope | null = null): void {
   requiredHtml('graph-overlay').classList.add('open');
   requiredHtml('graph-overlay').setAttribute('aria-hidden', 'false');
   document.body.classList.add('modal-open');
-  showChrome();
   updateGraphScopeButtons();
   rebuildGraph();
 }
@@ -3487,7 +3507,7 @@ function openLightbox(idx: number, persist = true, sourceList: ImageItem[] = vis
     return;
   }
   const navigatingOpenViewer = Boolean(previewModal?.isOpen);
-  if (!navigatingOpenViewer) setPreviewFocusMode(false);
+  if (!navigatingOpenViewer) resetPreviewUiState();
   lightboxImages = nextSource;
   if (persist) suppressedPreviewRestoreId = null;
   togglePreviewTagDropdown(false);
@@ -3567,7 +3587,7 @@ function handlePreviewClosed(): void {
   document.body.style.overflow = '';
   togglePreviewTagDropdown(false);
   closePreviewQuickMenu();
-  setPreviewFocusMode(false);
+  resetPreviewUiState();
   lightboxImages = [];
   if (!suppressPreviewCloseClear && tabs.length && activeTab().lastImageId) {
     activeTab().lastImageId = null;
@@ -3679,17 +3699,54 @@ function setPreviewFilmMode(mode: string | undefined): void {
   renderPreviewFilmstrip();
 }
 
-function setPreviewFocusMode(enabled: boolean): void {
-  previewFocusMode = enabled;
+function renderPreviewUiState(): void {
   const modal = requiredHtml('preview-modal');
-  modal.classList.toggle('preview-chrome-hidden', previewFocusMode);
-  const button = optionalHtml('preview-inspector-toggle');
-  if (button) button.title = previewFocusMode ? 'Показать интерфейс Viewer · I' : 'Скрыть интерфейс Viewer · I';
-  if (previewModal?.isOpen) requestAnimationFrame(() => previewModal?.fit());
+  modal.classList.toggle('preview-focus-mode', previewFocusMode);
+  modal.classList.toggle('preview-inspector-hidden', !previewInspectorVisible);
+  const button = optionalHtml('preview-focus-toggle');
+  if (button) {
+    button.classList.toggle('active', previewFocusMode);
+    button.setAttribute('aria-pressed', previewFocusMode ? 'true' : 'false');
+  }
+}
+
+function refreshPreviewLayout(): void {
+  if (previewModal?.isOpen) requestAnimationFrame(() => previewModal?.refreshLayout());
+}
+
+function setPreviewFocusMode(enabled: boolean): void {
+  if (enabled === previewFocusMode) return;
+  if (enabled) {
+    previewInspectorBeforeFocus = previewInspectorVisible;
+    previewInspectorChangedDuringFocus = false;
+    previewFocusMode = true;
+    previewInspectorVisible = false;
+  } else {
+    previewFocusMode = false;
+    if (!previewInspectorChangedDuringFocus) previewInspectorVisible = previewInspectorBeforeFocus;
+    previewInspectorChangedDuringFocus = false;
+  }
+  renderPreviewUiState();
+  refreshPreviewLayout();
 }
 
 function togglePreviewFocusMode(): void {
   setPreviewFocusMode(!previewFocusMode);
+}
+
+function togglePreviewInspector(): void {
+  previewInspectorVisible = !previewInspectorVisible;
+  if (previewFocusMode) previewInspectorChangedDuringFocus = true;
+  renderPreviewUiState();
+  refreshPreviewLayout();
+}
+
+function resetPreviewUiState(): void {
+  previewFocusMode = false;
+  previewInspectorVisible = true;
+  previewInspectorBeforeFocus = true;
+  previewInspectorChangedDuringFocus = false;
+  renderPreviewUiState();
 }
 
 function openPreviewQuickMenu(clientX: number, clientY: number): void {
@@ -3872,16 +3929,31 @@ document.addEventListener('keydown', e => {
       return;
     }
   }
-  if (!previewModal || !previewModal.isOpen) return;
   if (isTextEntryTarget(e.target)) return;
-  if (e.key === 'ArrowLeft') previewNav(-1);
-  else if (e.key === 'ArrowRight') previewNav(1);
-  else if (e.key.toLowerCase() === 'i') {
+  const tabShortcut = e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
+  const panelShortcut = e.key.toLowerCase() === 'b' && e.ctrlKey && !e.altKey && !e.metaKey;
+  if (previewModal?.isOpen) {
+    if (tabShortcut) {
+      e.preventDefault();
+      togglePreviewFocusMode();
+    } else if (panelShortcut) {
+      e.preventDefault();
+      togglePreviewInspector();
+    } else if (e.key === 'ArrowLeft') previewNav(-1);
+    else if (e.key === 'ArrowRight') previewNav(1);
+    else if (e.code === 'Space') {
+      e.preventDefault();
+      openPreviewQuickMenu(window.innerWidth / 2 - 90, window.innerHeight / 2 - 120);
+    }
+    return;
+  }
+  if (activeWorkspace !== 'gallery' || graphState?.open || requiredHtml('tag-overlay').classList.contains('open')) return;
+  if (tabShortcut) {
     e.preventDefault();
-    togglePreviewFocusMode();
-  } else if (e.code === 'Space') {
+    toggleGalleryFocusMode();
+  } else if (panelShortcut) {
     e.preventDefault();
-    openPreviewQuickMenu(window.innerWidth / 2 - 90, window.innerHeight / 2 - 120);
+    toggleFolderSidebar();
   }
 });
 
@@ -4341,6 +4413,12 @@ function restoreGalleryAnchor(anchor: {imageId: string; viewportTop: number} | n
   const item = galleryVirtualizer.measurementsCache[index];
   if (!item) return;
   galleryVirtualizer.scrollToOffset(Math.max(0, item.start - anchor.viewportTop), {behavior: 'instant'});
+  requestAnimationFrame(() => {
+    const mounted = mountedGalleryCards.get(anchor.imageId);
+    if (!mounted) return;
+    const delta = mounted.slot.getBoundingClientRect().top - anchor.viewportTop;
+    if (Math.abs(delta) > 0.5) window.scrollTo(0, Math.max(0, window.scrollY + delta));
+  });
 }
 
 function invalidateVirtualGallery(options: {preserveAnchor: boolean; resetCards: boolean}): void {
@@ -4409,17 +4487,20 @@ async function restorePendingGalleryScroll(): Promise<void> {
   galleryVirtualizer?.scrollToOffset(target, {behavior: 'instant'});
 }
 
-function handleGalleryResize(): void {
+function scheduleGalleryResize(anchor: {imageId: string; viewportTop: number} | null): void {
   if (galleryResizeFrame !== null) cancelAnimationFrame(galleryResizeFrame);
   galleryResizeFrame = requestAnimationFrame(() => {
     galleryResizeFrame = null;
-    const anchor = captureGalleryAnchor();
     galleryGeometry = computeGalleryGeometry();
     const instance = ensureGalleryVirtualizer();
     instance.measure();
     renderVirtualGalleryRange(instance);
     requestAnimationFrame(() => restoreGalleryAnchor(anchor));
   });
+}
+
+function handleGalleryResize(): void {
+  scheduleGalleryResize(captureGalleryAnchor());
 }
 
 function normalizeTag(tag: unknown): string {
@@ -4751,8 +4832,14 @@ function runAction(actionEl: HTMLElement): void {
     case 'toggle-folder-sidebar':
       toggleFolderSidebar();
       break;
-    case 'toggle-preview-chrome':
+    case 'toggle-gallery-focus':
+      toggleGalleryFocusMode();
+      break;
+    case 'toggle-preview-focus':
       togglePreviewFocusMode();
+      break;
+    case 'toggle-preview-inspector':
+      togglePreviewInspector();
       break;
     case 'toggle-preview-tag-dropdown':
       togglePreviewTagDropdown();
@@ -4814,10 +4901,7 @@ requiredInput('problems-search').addEventListener('input', () => {
 requiredInput('tag-admin-create').addEventListener('keydown', e => {
   if (e.key === 'Enter') createTagFromSettings();
 });
-window.addEventListener('scroll', handleChromeScroll, {passive: true});
-document.addEventListener('scroll', handleChromeScroll, {passive: true, capture: true});
-window.addEventListener('wheel', () => requestAnimationFrame(handleChromeScroll), {passive: true});
-window.addEventListener('touchmove', () => requestAnimationFrame(handleChromeScroll), {passive: true});
+window.addEventListener('scroll', updateScrollTopButton, {passive: true});
 window.addEventListener('resize', () => {
   handleGalleryResize();
   if (graphState && graphState.open) rebuildGraph();
@@ -4840,5 +4924,6 @@ initFishInputs();
 startLiveEvents();
 startProblemsPolling();
 updateScrollTopButton();
-handleChromeScroll();
+renderGalleryUiState();
+renderPreviewUiState();
 loadSession();

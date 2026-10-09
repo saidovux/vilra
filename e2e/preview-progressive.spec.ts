@@ -209,7 +209,7 @@ test('closing during original load releases media and late completion cannot mut
   await expect(page.locator('#preview-modal')).not.toHaveAttribute('data-image-id', /.+/);
 });
 
-test('viewer controls preserve Fit, zoom, persistent focus navigation, filmstrip, and Escape behavior', async ({page}) => {
+test('viewer Focus and Inspector controls preserve layout state through navigation', async ({page}) => {
   const fixture = await installPreviewFixture(page);
   await openFixture(page);
 
@@ -237,27 +237,39 @@ test('viewer controls preserve Fit, zoom, persistent focus navigation, filmstrip
   await page.locator('[data-action="preview-fit"]').click();
   await expect(page.locator('#zoom-level')).toHaveText('FIT');
 
-  const stage = page.locator('#preview-image-stage');
-  const stageBox = await stage.boundingBox();
-  expect(stageBox).toBeTruthy();
-  await stage.dispatchEvent('wheel', {
-    deltaY: -100,
-    clientX: stageBox!.x + stageBox!.width / 2,
-    clientY: stageBox!.y + stageBox!.height / 2,
-  });
-  await expect(page.locator('#zoom-level')).not.toHaveText('FIT');
+  await expect(page.locator('#preview-focus-toggle')).toContainText('Focus');
+  await expect(page.locator('#preview-focus-toggle')).toContainText('Tab');
+  await page.keyboard.press('i');
+  await expect(modal).not.toHaveClass(/preview-focus-mode/);
+  await expect(page.locator('#preview-inspector')).toBeVisible();
 
-  await page.locator('#preview-inspector-toggle').click();
-  await expect(modal).toHaveClass(/preview-chrome-hidden/);
-  await expect(page.locator('#preview-toolbar')).toHaveCSS('opacity', '0');
-  await expect(page.locator('#preview-inspector')).toHaveCSS('opacity', '0');
-  await expect(page.locator('#preview-filmstrip')).toHaveCSS('opacity', '0');
-  await expect(page.locator('#preview-prev')).toHaveCSS('opacity', '0');
-  await expect(page.locator('#preview-next')).toHaveCSS('opacity', '0');
-  const focusStage = await page.locator('#preview-stage-viewport').boundingBox();
+  await page.keyboard.press('Control+b');
+  await expect(modal).toHaveClass(/preview-inspector-hidden/);
+  await expect(modal).not.toHaveClass(/preview-focus-mode/);
+  await expect(page.locator('#preview-toolbar')).toBeVisible();
+  await expect(page.locator('#preview-inspector')).not.toBeVisible();
+  await expect(page.locator('#preview-filmstrip')).toBeVisible();
+  const normalHiddenInspectorStage = await page.locator('#preview-stage-viewport').boundingBox();
   const viewport = page.viewportSize();
-  expect(focusStage).toBeTruthy();
+  expect(normalHiddenInspectorStage).toBeTruthy();
   expect(viewport).toBeTruthy();
+  expect(Math.abs(normalHiddenInspectorStage!.width - viewport!.width)).toBeLessThanOrEqual(1);
+  expect(normalHiddenInspectorStage!.y).toBeGreaterThan(0);
+  expect(normalHiddenInspectorStage!.height).toBeLessThan(viewport!.height);
+  await page.keyboard.press('Control+b');
+  await expect(modal).not.toHaveClass(/preview-inspector-hidden/);
+
+  await page.locator('[data-action="preview-fit"]').click();
+  await page.keyboard.press('Tab');
+  await expect(modal).toHaveClass(/preview-focus-mode/);
+  await expect(modal).toHaveClass(/preview-inspector-hidden/);
+  await expect(page.locator('#preview-toolbar')).not.toBeVisible();
+  await expect(page.locator('#preview-inspector')).not.toBeVisible();
+  await expect(page.locator('#preview-filmstrip')).not.toBeVisible();
+  await expect(page.locator('#preview-prev')).not.toBeVisible();
+  await expect(page.locator('#preview-next')).not.toBeVisible();
+  const focusStage = await page.locator('#preview-stage-viewport').boundingBox();
+  expect(focusStage).toBeTruthy();
   expect(Math.abs(focusStage!.x)).toBeLessThanOrEqual(1);
   expect(Math.abs(focusStage!.y)).toBeLessThanOrEqual(1);
   expect(Math.abs(focusStage!.width - viewport!.width)).toBeLessThanOrEqual(1);
@@ -268,24 +280,37 @@ test('viewer controls preserve Fit, zoom, persistent focus navigation, filmstrip
 
   await page.keyboard.press('ArrowRight');
   await expect(modal).toHaveAttribute('data-image-id', 'preview-b');
-  await expect(modal).toHaveClass(/preview-chrome-hidden/);
+  await expect(modal).toHaveClass(/preview-focus-mode/);
+  await expect(modal).toHaveClass(/preview-inspector-hidden/);
   await page.keyboard.press('ArrowRight');
   await expect(modal).toHaveAttribute('data-image-id', 'preview-c');
-  await expect(modal).toHaveClass(/preview-chrome-hidden/);
-  await page.locator('.preview-film-item[title="preview-a.png"]').evaluate((button: HTMLElement) => button.click());
-  await expect(modal).toHaveAttribute('data-image-id', 'preview-a');
-  await expect(modal).toHaveClass(/preview-chrome-hidden/);
+  await expect(modal).toHaveClass(/preview-focus-mode/);
 
-  await page.keyboard.press('i');
-  await expect(modal).not.toHaveClass(/preview-chrome-hidden/);
-  const normalImageStage = await page.locator('#preview-image-stage').boundingBox();
-  expect(normalImageStage!.width).toBeLessThanOrEqual(1.1);
-  expect(normalImageStage!.height).toBeLessThanOrEqual(1.1);
-
-  await page.locator('#preview-next').click();
-  await expect(modal).toHaveAttribute('data-image-id', 'preview-b');
-  await page.locator('#preview-prev').click();
+  await page.keyboard.press('Control+b');
+  await expect(modal).toHaveClass(/preview-focus-mode/);
+  await expect(modal).not.toHaveClass(/preview-inspector-hidden/);
+  await expect(page.locator('#preview-inspector')).toBeVisible();
+  await expect(page.locator('#preview-toolbar')).not.toBeVisible();
+  const focusInspectorStage = await page.locator('#preview-stage-viewport').boundingBox();
+  const focusInspector = await page.locator('#preview-inspector').boundingBox();
+  expect(focusInspectorStage).toBeTruthy();
+  expect(focusInspector).toBeTruthy();
+  expect(Math.abs(focusInspectorStage!.width - (viewport!.width - 292))).toBeLessThanOrEqual(1);
+  expect(Math.abs(focusInspectorStage!.height - viewport!.height)).toBeLessThanOrEqual(1);
+  expect(Math.abs(focusInspector!.x - (viewport!.width - 292))).toBeLessThanOrEqual(1);
+  expect(Math.abs(focusInspector!.y)).toBeLessThanOrEqual(1);
+  expect(Math.abs(focusInspector!.height - viewport!.height)).toBeLessThanOrEqual(1);
+  await page.keyboard.press('ArrowRight');
   await expect(modal).toHaveAttribute('data-image-id', 'preview-a');
+  await expect(modal).toHaveClass(/preview-focus-mode/);
+  await expect(modal).not.toHaveClass(/preview-inspector-hidden/);
+
+  await page.keyboard.press('Tab');
+  await expect(modal).not.toHaveClass(/preview-focus-mode/);
+  await expect(modal).not.toHaveClass(/preview-inspector-hidden/);
+  await expect(page.locator('#preview-toolbar')).toBeVisible();
+  await expect(page.locator('#preview-inspector')).toBeVisible();
+  await expect(page.locator('#preview-filmstrip')).toBeVisible();
   await page.locator('.preview-film-item[title="preview-c.png"]').click();
   await expect(modal).toHaveAttribute('data-image-id', 'preview-c');
 
@@ -296,8 +321,35 @@ test('viewer controls preserve Fit, zoom, persistent focus navigation, filmstrip
   await expect(modal).not.toBeVisible();
   await page.locator('.card[data-id="preview-b"]').click();
   await expect(modal).toBeVisible();
-  await expect(modal).not.toHaveClass(/preview-chrome-hidden/);
+  await expect(modal).not.toHaveClass(/preview-focus-mode/);
+  await expect(modal).not.toHaveClass(/preview-inspector-hidden/);
+  await expect(page.locator('#preview-inspector')).toBeVisible();
   await page.keyboard.press('Escape');
+});
+
+test('app layout shortcuts do not intercept text controls or contenteditable', async ({page}) => {
+  await installPreviewFixture(page);
+  await openFixture(page);
+
+  const gallery = page.locator('#gallery-screen');
+  const sidebar = page.locator('#folder-sidebar');
+  await page.locator('#sort-select').focus();
+  await page.keyboard.press('Tab');
+  await expect(gallery).not.toHaveClass(/gallery-focus-mode/);
+
+  await page.locator('#filter-tag-input').focus();
+  await page.keyboard.press('Control+b');
+  await expect(sidebar).not.toHaveClass(/collapsed/);
+
+  await page.evaluate(() => {
+    const editable = document.createElement('div');
+    editable.id = 'shortcut-contenteditable';
+    editable.contentEditable = 'true';
+    document.body.appendChild(editable);
+    editable.focus();
+  });
+  await page.keyboard.press('Tab');
+  await expect(gallery).not.toHaveClass(/gallery-focus-mode/);
 });
 
 test('viewer quick actions open for the current image by right click and Space', async ({page}) => {
@@ -397,10 +449,12 @@ for (const viewport of [
 
     await page.locator('#gallery').evaluate(element => { element.style.minHeight = '1800px'; });
     await page.evaluate(() => window.scrollTo({top: 420}));
-    await page.waitForFunction(() => document.body.classList.contains('chrome-hidden'));
-    await expect(page.locator('#filter-bar')).toHaveCSS('opacity', '0');
+    await expect(page.locator('#topbar')).toBeVisible();
+    await expect(page.locator('#filter-bar')).toBeVisible();
+    await expect(page.locator('#folder-sidebar')).toBeVisible();
+    await expect(page.locator('body')).not.toHaveClass(/chrome-hidden/);
+    await expect(page.locator('html')).not.toHaveClass(/chrome-hidden/);
     await page.evaluate(() => window.scrollTo({top: 0}));
-    await page.waitForFunction(() => !document.body.classList.contains('chrome-hidden'));
 
     await page.locator('.card[data-id="preview-a"]').click();
     const toolbar = await box('#preview-toolbar');

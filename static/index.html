@@ -66,6 +66,9 @@
       </div>
       <div id="top-summary"><span id="count-text"></span></div>
       <div class="top-actions">
+        <button id="gallery-focus-toggle" class="btn btn-ghost btn-sm gallery-focus-button" type="button" data-action="toggle-gallery-focus" aria-pressed="false" title="Режим фокуса · Tab">
+          Focus <span class="preview-kbd">Tab</span>
+        </button>
         <button id="settings-toggle" class="btn btn-ghost icon-btn" data-action="toggle-settings" title="Настройки">⚙</button>
       </div>
     </header>
@@ -271,8 +274,8 @@
 
         <span class="preview-toolbar-separator" aria-hidden="true"></span>
 
-        <button id="preview-inspector-toggle" class="btn btn-ghost btn-sm preview-toolbar-button" type="button" data-action="toggle-preview-chrome" title="Скрыть интерфейс Viewer · I">
-          Inspector <span class="preview-kbd">I</span>
+        <button id="preview-focus-toggle" class="btn btn-ghost btn-sm preview-toolbar-button" type="button" data-action="toggle-preview-focus" aria-pressed="false" title="Режим фокуса · Tab">
+          Focus <span class="preview-kbd">Tab</span>
         </button>
         <a id="preview-open" href="#" target="_blank" class="btn btn-ghost btn-sm preview-toolbar-button">Original</a>
         <button id="preview-viewer-close" class="btn btn-ghost icon-btn" type="button" data-action="close-preview" title="Закрыть · Esc">×</button>
@@ -300,7 +303,7 @@
     <aside id="preview-inspector" aria-label="Inspector">
       <div class="preview-inspector-head">
         <strong>Inspector</strong>
-        <button class="btn btn-ghost icon-btn" type="button" data-action="toggle-preview-chrome" title="Скрыть интерфейс Viewer · I">×</button>
+        <button class="btn btn-ghost icon-btn" type="button" data-action="toggle-preview-inspector" title="Скрыть Inspector · Ctrl+B">×</button>
       </div>
 
       <section class="preview-inspector-section">

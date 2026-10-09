@@ -41,6 +41,20 @@ async function installSyntheticGallery(page: Page): Promise<SyntheticState> {
     cursors: [],
   };
   await page.route('**/api/events', route => route.abort());
+  await page.route('**/api/session', async route => {
+    if (route.request().method() !== 'GET') return route.fulfill({status: 200, json: {ok: true}});
+    return route.fulfill({status: 200, json: {
+      root_path: '/synthetic-fixture',
+      root_paths: ['/synthetic-fixture'],
+      search_tags: [],
+      search_mode: 'any',
+      tabs: [],
+      active_tab_id: null,
+      last_image_id: null,
+      scroll_top: 0,
+      folder_tag_sync: true,
+    }});
+  });
   await page.route('**/api/images?**', async route => {
     const url = new URL(route.request().url());
     const cursor = url.searchParams.get('cursor') || '0';
@@ -90,6 +104,16 @@ async function gallerySnapshot(page: Page) {
   });
 }
 
+async function visibleGalleryAnchor(page: Page) {
+  return page.locator('.virtual-card-slot[data-id]').evaluateAll(slots => {
+    const candidates = slots
+      .map(slot => ({id: String((slot as HTMLElement).dataset.id || ''), rect: slot.getBoundingClientRect()}))
+      .filter(item => item.rect.bottom > 0 && item.rect.top < innerHeight)
+      .sort((left, right) => Math.abs(left.rect.top) - Math.abs(right.rect.top));
+    return candidates[0] ? {id: candidates[0].id, top: candidates[0].rect.top} : null;
+  });
+}
+
 async function assertVirtualGeometry(page: Page): Promise<number> {
   return page.locator('.virtual-card-slot[data-index]').evaluateAll(slots => {
     const gallery = document.querySelector<HTMLElement>('#gallery');
@@ -130,6 +154,85 @@ async function loadAllSyntheticPages(page: Page, state: SyntheticState): Promise
   }
   expect(state.servedThrough).toBe(TOTAL_IMAGES);
 }
+
+test('explicit Gallery Focus and sidebar controls preserve the visible virtual anchor', async ({page}) => {
+  await installSyntheticGallery(page);
+  await page.setViewportSize({width: 1366, height: 768});
+  await page.goto('/');
+  await page.locator('html').evaluate(element => { element.style.scrollBehavior = 'auto'; });
+  await expect(page.locator('.card[data-id]').first()).toBeVisible();
+  await expect(page.locator('#gallery-focus-toggle')).toContainText('Focus');
+  await expect(page.locator('#gallery-focus-toggle')).toContainText('Tab');
+
+  await page.evaluate(() => window.scrollTo({top: 1200}));
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(1000);
+  await expect(page.locator('#topbar')).toBeVisible();
+  await expect(page.locator('#filter-bar')).toBeVisible();
+  await expect(page.locator('#folder-sidebar')).toBeVisible();
+  await expect(page.locator('body')).not.toHaveClass(/chrome-hidden/);
+  const beforeFocus = await visibleGalleryAnchor(page);
+  expect(beforeFocus).toBeTruthy();
+
+  await page.keyboard.press('Tab');
+  await expect(page.locator('#gallery-screen')).toHaveClass(/gallery-focus-mode/);
+  await expect(page.locator('#topbar')).not.toBeVisible();
+  await expect(page.locator('#filter-bar')).not.toBeVisible();
+  await expect(page.locator('#folder-sidebar')).toHaveClass(/collapsed/);
+  const focusedWrap = await page.locator('#gallery-wrap').boundingBox();
+  expect(focusedWrap).toBeTruthy();
+  expect(Math.abs(focusedWrap!.x)).toBeLessThanOrEqual(1);
+  expect(Math.abs(focusedWrap!.width - 1366)).toBeLessThanOrEqual(1);
+  const anchorSlot = page.locator(`.virtual-card-slot[data-id="${beforeFocus!.id}"]`);
+  await expect(anchorSlot).toHaveCount(1);
+  await expect.poll(async () => {
+    const box = await anchorSlot.boundingBox();
+    return Math.abs((box?.y ?? Number.POSITIVE_INFINITY) - beforeFocus!.top);
+  }).toBeLessThanOrEqual(3);
+  const beforeFocusExit = await visibleGalleryAnchor(page);
+  expect(beforeFocusExit).toBeTruthy();
+
+  await page.keyboard.press('Tab');
+  await expect(page.locator('#gallery-screen')).not.toHaveClass(/gallery-focus-mode/);
+  await expect(page.locator('#topbar')).toBeVisible();
+  await expect(page.locator('#filter-bar')).toBeVisible();
+  await expect(page.locator('#folder-sidebar')).not.toHaveClass(/collapsed/);
+  const focusExitAnchorSlot = page.locator(`.virtual-card-slot[data-id="${beforeFocusExit!.id}"]`);
+  await expect.poll(async () => {
+    const box = await focusExitAnchorSlot.boundingBox();
+    return Math.abs((box?.y ?? Number.POSITIVE_INFINITY) - beforeFocusExit!.top);
+  }).toBeLessThanOrEqual(3);
+
+  await page.keyboard.press('Control+b');
+  await expect(page.locator('#folder-sidebar')).toHaveClass(/collapsed/);
+  await expect(page.locator('#topbar')).toBeVisible();
+  await expect(page.locator('#filter-bar')).toBeVisible();
+  const hiddenSidebarWrap = await page.locator('#gallery-wrap').boundingBox();
+  expect(hiddenSidebarWrap).toBeTruthy();
+  expect(Math.abs(hiddenSidebarWrap!.x)).toBeLessThanOrEqual(1);
+  expect(Math.abs(hiddenSidebarWrap!.width - 1366)).toBeLessThanOrEqual(1);
+
+  await page.keyboard.press('Tab');
+  await expect(page.locator('#gallery-screen')).toHaveClass(/gallery-focus-mode/);
+  await expect(page.locator('#folder-sidebar')).toHaveClass(/collapsed/);
+  await page.keyboard.press('Control+b');
+  await expect(page.locator('#folder-sidebar')).not.toHaveClass(/collapsed/);
+  await expect(page.locator('#topbar')).not.toBeVisible();
+  await expect(page.locator('#filter-bar')).not.toBeVisible();
+  const focusSidebar = await page.locator('#folder-sidebar').boundingBox();
+  const focusSidebarWrap = await page.locator('#gallery-wrap').boundingBox();
+  expect(focusSidebar).toBeTruthy();
+  expect(focusSidebarWrap).toBeTruthy();
+  expect(Math.abs(focusSidebar!.y)).toBeLessThanOrEqual(1);
+  expect(Math.abs(focusSidebar!.height - 768)).toBeLessThanOrEqual(1);
+  expect(Math.abs(focusSidebarWrap!.x - 276)).toBeLessThanOrEqual(1);
+  expect(Math.abs(focusSidebarWrap!.width - (1366 - 276))).toBeLessThanOrEqual(1);
+
+  await page.keyboard.press('Tab');
+  await expect(page.locator('#gallery-screen')).not.toHaveClass(/gallery-focus-mode/);
+  await expect(page.locator('#folder-sidebar')).not.toHaveClass(/collapsed/);
+  await expect(page.locator('#topbar')).toBeVisible();
+  await expect(page.locator('#filter-bar')).toBeVisible();
+});
 
 test('TanStack virtual masonry stays bounded through pagination, reverse scroll, and resize', async ({page}, testInfo) => {
   test.setTimeout(180_000);
