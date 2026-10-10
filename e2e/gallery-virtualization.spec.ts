@@ -259,12 +259,33 @@ test('explicit Gallery Focus and sidebar controls preserve the visible virtual a
   await expect(page.locator('#filter-bar')).toBeVisible();
 });
 
-test('loaded Chromium thumbnail stays paint-ready across virtual remount and hover', async ({page}) => {
+test('Chromium thumbnail becomes visible only after current decode and stays ready on hover', async ({page}) => {
   const targetId = 'synthetic-00000';
   let targetRequests = 0;
   page.on('request', request => {
     if (new URL(request.url()).pathname === `/thumb-file/${targetId}.jpg`) targetRequests += 1;
   });
+  await page.addInitScript(imageId => {
+    const originalDecode = HTMLImageElement.prototype.decode;
+    const pending: Array<() => void> = [];
+    const control = {
+      calls: 0,
+      enabled: true,
+      pending: () => pending.length,
+      releaseNext: () => pending.shift()?.(),
+      disable: () => { control.enabled = false; },
+    };
+    (window as unknown as {__thumbnailDecodeControl: typeof control}).__thumbnailDecodeControl = control;
+    HTMLImageElement.prototype.decode = function(): Promise<void> {
+      if (this.dataset.imageId !== imageId) return originalDecode.call(this);
+      control.calls += 1;
+      if (!control.enabled) return originalDecode.call(this);
+      const image = this;
+      return new Promise<void>((resolve, reject) => {
+        pending.push(() => { void originalDecode.call(image).then(resolve, reject); });
+      });
+    };
+  }, targetId);
   await installSyntheticGallery(page);
   await page.setViewportSize({width: 1366, height: 768});
   await page.goto('/');
@@ -273,7 +294,43 @@ test('loaded Chromium thumbnail stays paint-ready across virtual remount and hov
   const targetSlot = page.locator(`.virtual-card-slot[data-id="${targetId}"]`);
   const targetCard = targetSlot.locator('.card');
   const targetImage = targetCard.locator('img');
+  const decodeState = () => page.evaluate(() => {
+    const control = (window as unknown as {__thumbnailDecodeControl: {
+      calls: number;
+      pending: () => number;
+    }}).__thumbnailDecodeControl;
+    return {calls: control.calls, pending: control.pending()};
+  });
+  const releaseDecode = () => page.evaluate(() => {
+    (window as unknown as {__thumbnailDecodeControl: {releaseNext: () => void}})
+      .__thumbnailDecodeControl.releaseNext();
+  });
+
+  await expect.poll(decodeState).toEqual({calls: 1, pending: 1});
+  await expect.poll(() => targetImage.evaluate(image => image.complete && image.naturalWidth > 0)).toBe(true);
+  await expect(targetImage).not.toHaveClass(/loaded/);
+  await expect(targetImage).toHaveCSS('opacity', '0');
+  const staleImage = await targetImage.elementHandle();
+  expect(staleImage).toBeTruthy();
+
+  await page.evaluate(() => window.scrollTo({top: 12_000}));
+  await expect(targetSlot).toHaveCount(0);
+  await releaseDecode();
+  await expect.poll(async () => (await decodeState()).pending).toBe(0);
+  expect(await staleImage!.evaluate(image => ({
+    connected: image.isConnected,
+    loaded: image.classList.contains('loaded'),
+  }))).toEqual({connected: false, loaded: false});
+
+  await page.evaluate(() => window.scrollTo({top: 0}));
+  await expect.poll(decodeState).toEqual({calls: 2, pending: 1});
+  await releaseDecode();
   await expect(targetImage).toHaveClass(/loaded/);
+  await page.evaluate(() => {
+    (window as unknown as {__thumbnailDecodeControl: {disable: () => void}})
+      .__thumbnailDecodeControl.disable();
+  });
+  expect(await targetImage.evaluate(image => image.decode().then(() => true))).toBe(true);
 
   const assertPaintReady = async () => {
     const state = await targetImage.evaluate(image => {
@@ -300,7 +357,7 @@ test('loaded Chromium thumbnail stays paint-ready across virtual remount and hov
       slotWillChange: 'auto',
     });
     expect(state.naturalWidth).toBeGreaterThan(0);
-    expect(state.slotTransform).toMatch(/^translate3d\(/);
+    expect(state.slotTransform).toMatch(/^translate\(/);
     expect(state.source).toContain(`/thumb-file/${targetId}.jpg`);
     return state.source;
   };
@@ -313,21 +370,35 @@ test('loaded Chromium thumbnail stays paint-ready across virtual remount and hov
       });
     });
     const requestsBeforeHover = targetRequests;
+    const decodeCallsBeforeHover = (await decodeState()).calls;
     const sourceBeforeHover = await assertPaintReady();
+    const transformBeforeHover = await targetSlot.evaluate(slot => slot.style.transform);
+    await targetSlot.evaluate(slot => {
+      const state = {mutations: 0, observer: null as MutationObserver | null};
+      state.observer = new MutationObserver(records => { state.mutations += records.length; });
+      state.observer.observe(slot, {attributes: true, childList: true, subtree: true});
+      (window as unknown as {__thumbnailHoverState: typeof state}).__thumbnailHoverState = state;
+    });
     await targetCard.hover();
     await page.evaluate(() => new Promise<void>(resolve => {
       requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
     }));
+    const mutations = await page.evaluate(() => {
+      const state = (window as unknown as {__thumbnailHoverState: {
+        mutations: number;
+        observer: MutationObserver;
+      }}).__thumbnailHoverState;
+      state.observer.disconnect();
+      return state.mutations;
+    });
     expect(await targetImage.getAttribute('data-hover-probe-loads')).toBe('0');
     expect(targetRequests).toBe(requestsBeforeHover);
+    expect((await decodeState()).calls).toBe(decodeCallsBeforeHover);
+    expect(mutations).toBe(0);
+    expect(await targetSlot.evaluate(slot => slot.style.transform)).toBe(transformBeforeHover);
     expect(await assertPaintReady()).toBe(sourceBeforeHover);
   };
 
-  await assertHoverDoesNotReload();
-  await page.evaluate(() => window.scrollTo({top: 12_000}));
-  await expect(targetSlot).toHaveCount(0);
-  await page.evaluate(() => window.scrollTo({top: 0}));
-  await expect(targetImage).toHaveClass(/loaded/);
   await assertHoverDoesNotReload();
 });
 

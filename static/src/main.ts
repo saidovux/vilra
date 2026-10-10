@@ -122,6 +122,7 @@ interface MountedGalleryCard {
 type ThumbAdmissionClass = 'visible' | 'near';
 type GalleryScrollDirection = 'forward' | 'backward' | null;
 type ThumbLifecycleState = 'missing' | 'admitting' | 'polling';
+type ThumbnailDecodeResult = 'ready' | 'stale' | 'failed';
 
 interface ThumbLifecycle {
   imageId: string;
@@ -2018,6 +2019,20 @@ function thumbnailUrls(img: ImageItem): {primary: string; fallback: string; vers
   };
 }
 
+async function decodeCurrentThumbnail(
+  image: HTMLImageElement,
+  expectedSrc: string,
+  isCurrent: () => boolean,
+): Promise<ThumbnailDecodeResult> {
+  try {
+    await image.decode();
+  } catch {
+    return isCurrent() && image.currentSrc === expectedSrc ? 'failed' : 'stale';
+  }
+  if (!isCurrent() || image.currentSrc !== expectedSrc) return 'stale';
+  return image.complete && image.naturalWidth > 0 ? 'ready' : 'failed';
+}
+
 function bindDiagnosticCardRef(image: HTMLImageElement, ref: DiagnosticCardRef | null): void {
   if (!ref) return;
   image.dataset.diagnosticGeneration = String(ref.generation);
@@ -2143,14 +2158,10 @@ function makeCard(
     }
     openLightboxById(img.id);
   });
-  ph.onload = () => {
-    galleryDiagnostics.primaryLoaded(
-      diagnosticCardRef(ph),
-      ph.complete && ph.naturalWidth > 0,
-    );
-    ph.classList.add('loaded');
-  };
-  ph.onerror = () => {
+  let primaryState: 'loading' | 'decoding' | 'ready' | 'failed' = 'loading';
+  const failPrimary = () => {
+    if (primaryState === 'failed') return;
+    primaryState = 'failed';
     galleryDiagnostics.primaryFailed(diagnosticCardRef(ph));
     if (ph.dataset.fallbackSrc && ph.dataset.primarySrc) {
       registerMissingThumbnail(ph);
@@ -2159,6 +2170,27 @@ function makeCard(
     ph.classList.add('loaded');
     ph.alt = 'Ошибка загрузки';
   };
+  const handlePrimaryLoad = () => {
+    if (primaryState !== 'loading') return;
+    primaryState = 'decoding';
+    const expectedSrc = ph.currentSrc;
+    void decodeCurrentThumbnail(
+      ph,
+      expectedSrc,
+      () => ph.isConnected && primaryState === 'decoding' && ph.onload === handlePrimaryLoad,
+    ).then(result => {
+      if (result === 'stale') return;
+      if (result === 'failed') {
+        failPrimary();
+        return;
+      }
+      primaryState = 'ready';
+      galleryDiagnostics.primaryLoaded(diagnosticCardRef(ph), true);
+      ph.classList.add('loaded');
+    });
+  };
+  ph.onload = handlePrimaryLoad;
+  ph.onerror = failPrimary;
   galleryDiagnostics.primaryRequestStarted(diagnosticCardRef(ph));
   ph.src = sources.primary;
   return card;
@@ -2231,26 +2263,41 @@ function setThumbnailFromBlob(lifecycle: ThumbLifecycle, blob: Blob): void {
   const diagnosticRef = diagnosticCardRef(image);
   const objectUrl = URL.createObjectURL(blob);
   image.dataset.objectUrl = objectUrl;
-  image.onload = () => {
-    if (thumbLifecycles.get(lifecycle.imageId) !== lifecycle) {
-      URL.revokeObjectURL(objectUrl);
-      return;
-    }
-    galleryDiagnostics.fallbackImageLoaded(
-      diagnosticRef,
-      image.complete && image.naturalWidth > 0,
-    );
-    image.classList.add('loaded');
+  const releaseObjectUrl = () => {
     URL.revokeObjectURL(objectUrl);
-    delete image.dataset.objectUrl;
-    thumbLifecycles.delete(lifecycle.imageId);
-    scheduleThumbnailAdmissionEvaluation();
+    if (image.dataset.objectUrl === objectUrl) delete image.dataset.objectUrl;
   };
+  const handleFallbackLoad = () => {
+    const expectedSrc = image.currentSrc;
+    void decodeCurrentThumbnail(
+      image,
+      expectedSrc,
+      () => currentThumbLifecycle(lifecycle)
+        && image.onload === handleFallbackLoad
+        && image.dataset.objectUrl === objectUrl,
+    ).then(result => {
+      if (result === 'stale') {
+        releaseObjectUrl();
+        return;
+      }
+      if (result === 'failed') {
+        galleryDiagnostics.fallbackImageFailed(diagnosticRef);
+        failThumbLifecycle(lifecycle, 'fallback_decode_error');
+        releaseObjectUrl();
+        return;
+      }
+      galleryDiagnostics.fallbackImageLoaded(diagnosticRef, true);
+      image.classList.add('loaded');
+      releaseObjectUrl();
+      thumbLifecycles.delete(lifecycle.imageId);
+      scheduleThumbnailAdmissionEvaluation();
+    });
+  };
+  image.onload = handleFallbackLoad;
   image.onerror = () => {
     galleryDiagnostics.fallbackImageFailed(diagnosticRef);
     failThumbLifecycle(lifecycle, 'fallback_decode_error');
-    URL.revokeObjectURL(objectUrl);
-    delete image.dataset.objectUrl;
+    releaseObjectUrl();
   };
   image.src = objectUrl;
 }
@@ -3965,7 +4012,7 @@ function dispatchCommand(command: AppCommand, context: ShortcutContext): void {
       window.scrollBy({top: -GALLERY_KEYBOARD_SCROLL_STEP, behavior: 'auto'});
       break;
     case 'viewer.panLeft':
-      previewModal?.panBy(-VIEWER_KEYBOARD_PAN_STEP, 0);
+      previewModal?.panBy(VIEWER_KEYBOARD_PAN_STEP, 0);
       break;
     case 'viewer.panDown':
       previewModal?.panBy(0, -VIEWER_KEYBOARD_PAN_STEP);
@@ -3974,7 +4021,7 @@ function dispatchCommand(command: AppCommand, context: ShortcutContext): void {
       previewModal?.panBy(0, VIEWER_KEYBOARD_PAN_STEP);
       break;
     case 'viewer.panRight':
-      previewModal?.panBy(VIEWER_KEYBOARD_PAN_STEP, 0);
+      previewModal?.panBy(-VIEWER_KEYBOARD_PAN_STEP, 0);
       break;
     case 'viewer.zoomIn':
       previewModal?.zoomBy(1.2);
@@ -4378,7 +4425,7 @@ function positionVirtualCard(mounted: MountedGalleryCard, item: VirtualItem, geo
   mounted.slot.dataset.lane = String(item.lane);
   mounted.slot.style.width = `${geometry.laneWidth}px`;
   mounted.slot.style.height = `${item.size}px`;
-  mounted.slot.style.transform = `translate3d(${x}px, ${y}px, 0)`;
+  mounted.slot.style.transform = `translate(${x}px, ${y}px)`;
 }
 
 function renderVirtualGalleryRange(instance = galleryVirtualizer): void {

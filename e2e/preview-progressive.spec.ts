@@ -374,19 +374,29 @@ test('viewer HJKL pans one shared constrained image transform', async ({page}) =
   expect(initial!.width).toBeGreaterThan(page.viewportSize()!.width);
   expect(initial!.height).toBeGreaterThan(page.viewportSize()!.height);
 
+  await page.keyboard.press('1');
+  const beforeH = await stage.boundingBox();
   await page.keyboard.press('h');
-  const left = await stage.boundingBox();
-  expect(left!.x).toBeLessThan(initial!.x - 10);
-  await page.keyboard.press('l');
-  const right = await stage.boundingBox();
-  expect(right!.x).toBeGreaterThan(left!.x + 10);
+  const afterH = await stage.boundingBox();
+  expect(afterH!.x).toBeGreaterThan(beforeH!.x + 10);
 
+  await page.keyboard.press('1');
+  const beforeL = await stage.boundingBox();
+  await page.keyboard.press('l');
+  const afterL = await stage.boundingBox();
+  expect(afterL!.x).toBeLessThan(beforeL!.x - 10);
+
+  await page.keyboard.press('1');
+  const beforeJ = await stage.boundingBox();
   await page.keyboard.press('j');
-  const down = await stage.boundingBox();
-  expect(down!.y).toBeLessThan(right!.y - 10);
+  const afterJ = await stage.boundingBox();
+  expect(afterJ!.y).toBeLessThan(beforeJ!.y - 10);
+
+  await page.keyboard.press('1');
+  const beforeK = await stage.boundingBox();
   await page.keyboard.press('k');
-  const up = await stage.boundingBox();
-  expect(up!.y).toBeGreaterThan(down!.y + 10);
+  const afterK = await stage.boundingBox();
+  expect(afterK!.y).toBeGreaterThan(beforeK!.y + 10);
 
   const beforeModifiedKeys = await stage.boundingBox();
   await stage.dispatchEvent('keydown', {key: 'h', ctrlKey: true, bubbles: true, cancelable: true});
