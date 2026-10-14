@@ -23,7 +23,7 @@ const {
 } = require('../electron/runtime-layout.cjs');
 
 if (process.platform !== 'linux' || process.arch !== 'x64') {
-  throw new Error('Electron Round 2A packaging supports Linux x86_64 only');
+  throw new Error('Vilra AppImage packaging currently supports Linux x86_64 only');
 }
 
 const targetTriple = hostTriple();

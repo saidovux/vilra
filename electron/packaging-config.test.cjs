@@ -10,14 +10,15 @@ const repoRoot = path.resolve(__dirname, '..');
 test('electron-builder configuration is valid, explicit, and AppImage-only', async () => {
   const parsed = await getConfig(repoRoot, 'electron-builder.yml', null);
   await validateConfiguration(parsed, new DebugLogger(false));
-  assert.equal(parsed.appId, 'app.tagimage.desktop.electron');
+  assert.equal(parsed.appId, 'app.tagimage.desktop');
   assert.equal(parsed.directories.output, 'dist-electron');
   assert.equal(parsed.asar, true);
-  assert.equal(parsed.linux.artifactName, 'Vilra-Electron_${version}_amd64.${ext}');
+  assert.equal(parsed.linux.artifactName, 'Vilra_${version}_amd64.${ext}');
+  assert.equal(parsed.linux.syncDesktopName, true);
 
   const config = fs.readFileSync(path.join(repoRoot, 'electron-builder.yml'), 'utf8');
   for (const expected of [
-    'appId: app.tagimage.desktop.electron',
+    'appId: app.tagimage.desktop',
     'output: dist-electron',
     'electron/main.cjs',
     'electron/preload.cjs',
@@ -28,18 +29,28 @@ test('electron-builder configuration is valid, explicit, and AppImage-only', asy
     'from: electron/package-resources/static',
     'from: electron/package-resources/build-info.json',
     'target: AppImage',
-    'Vilra-Electron_${version}_amd64.${ext}',
+    'Vilra_${version}_amd64.${ext}',
     'icon: app-icon.png',
+    'syncDesktopName: true',
   ]) {
     assert.ok(config.includes(expected), `missing builder configuration: ${expected}`);
   }
   for (const forbidden of ['target: deb', 'target: rpm', 'asar: false']) {
     assert.equal(config.includes(forbidden), false, `unexpected builder configuration: ${forbidden}`);
   }
+  const oldAppId = ['app.tagimage.desktop', 'electron'].join('.');
+  const oldArtifactPrefix = `${['Vilra', 'Electron'].join('-')}_`;
+  assert.equal(config.includes(oldAppId), false);
+  assert.equal(config.includes(oldArtifactPrefix), false);
 });
 
 test('package scripts keep dev runtime and make Electron build self-contained', () => {
   const packageJson = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+  const packageLock = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package-lock.json'), 'utf8'));
+  assert.equal(packageJson.version, '0.3.0');
+  assert.equal(packageLock.version, '0.3.0');
+  assert.equal(packageLock.packages[''].version, '0.3.0');
+  assert.equal(packageJson.desktopName, 'Vilra');
   assert.equal(packageJson.main, 'electron/main.cjs');
   assert.ok(packageJson.scripts['electron:dev'].includes('electron:prepare'));
   assert.ok(packageJson.scripts['electron:build'].includes('electron:prepare'));

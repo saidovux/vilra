@@ -1,4 +1,4 @@
-appId: app.tagimage.desktop.electron
+appId: app.tagimage.desktop
 productName: Vilra
 asar: true
 directories:
@@ -26,6 +26,7 @@ linux:
     - target: AppImage
       arch:
         - x64
-  artifactName: Vilra-Electron_${version}_amd64.${ext}
+  artifactName: Vilra_${version}_amd64.${ext}
   icon: app-icon.png
   category: Graphics
+  syncDesktopName: true
