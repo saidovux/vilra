@@ -5,8 +5,9 @@ const net = require('node:net');
 const path = require('node:path');
 const readline = require('node:readline');
 
+const {createGalleryDiagnostics} = require('./diagnostics.cjs');
 const {resolveRuntimeBuildId, resolveRuntimeLayout} = require('./runtime-layout.cjs');
-const {resolveSqlitePath} = require('./runtime-paths.cjs');
+const {resolveDiagnosticsPath, resolveSqlitePath} = require('./runtime-paths.cjs');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const SIDECARS = [
@@ -257,6 +258,8 @@ function requireTrustedSender(event) {
 }
 
 function registerNativeBridge() {
+  const diagnostics = createGalleryDiagnostics({diagnosticsDirectory: resolveDiagnosticsPath()});
+
   ipcMain.handle('vilra:pick-folder', async (event, requestedDefault) => {
     requireTrustedSender(event);
     const options = {title: 'Выберите папку с изображениями', properties: ['openDirectory']};
@@ -281,6 +284,26 @@ function registerNativeBridge() {
     }
     if (!fs.existsSync(targetPath)) throw new Error('File does not exist');
     shell.showItemInFolder(targetPath);
+  });
+
+  ipcMain.handle('vilra:diagnostics:begin', event => {
+    requireTrustedSender(event);
+    return diagnostics.begin();
+  });
+
+  ipcMain.handle('vilra:diagnostics:checkpoint', (event, sessionId, reportJson) => {
+    requireTrustedSender(event);
+    return diagnostics.checkpoint(sessionId, reportJson);
+  });
+
+  ipcMain.handle('vilra:diagnostics:finalize', (event, sessionId, reportJson) => {
+    requireTrustedSender(event);
+    return diagnostics.finalize(sessionId, reportJson);
+  });
+
+  ipcMain.handle('vilra:diagnostics:status', event => {
+    requireTrustedSender(event);
+    return diagnostics.status();
   });
 }
 

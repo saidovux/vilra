@@ -4,9 +4,11 @@
  */
 
 import {
-  desktopRuntimeKind,
+  beginNativeDiagnosticSession,
+  checkpointNativeDiagnosticSession,
   diagnosticRuntimeLabel,
-  invokeTauriCommand,
+  finalizeNativeDiagnosticSession,
+  nativeDiagnosticStatus,
   supportsNativeDiagnosticsPersistence,
 } from './desktop-runtime';
 
@@ -608,9 +610,7 @@ class GalleryDiagnostics {
     this.activePages.clear();
     this.persistenceNotice = supportsNativeDiagnosticsPersistence()
       ? 'Сохранение JSON и Markdown…'
-      : desktopRuntimeKind() === 'electron'
-        ? 'Нативное автосохранение не поддерживается в Electron Round 1; JSON можно скопировать.'
-        : 'Нативное автосохранение доступно в диагностической AppImage.';
+      : 'Нативное автосохранение доступно в desktop-приложении.';
     this.renderPanel();
     const generation = this.generation;
     const snapshotJson = this.snapshotJson;
@@ -682,9 +682,7 @@ class GalleryDiagnostics {
 
   private async beginNativeSession(generation: number): Promise<NativeDiagnosticSession | null> {
     try {
-      const session = await nativeInvoke<NativeDiagnosticSession>(
-        'begin_gallery_diagnostic_session',
-      );
+      const session = await beginNativeDiagnosticSession<NativeDiagnosticSession>();
       if (generation !== this.generation || this.currentState !== 'recording') return session;
       this.diagnosticsDir = session.diagnostics_dir;
       this.persistenceNotice = `Checkpoint: ${session.checkpoint_path}`;
@@ -722,10 +720,10 @@ class GalleryDiagnostics {
       mounted_cards: this.cards.size,
     }, 'recording', now);
     try {
-      await nativeInvoke('checkpoint_gallery_diagnostic_session', {
-        sessionId: session.session_id,
-        reportJson: JSON.stringify(checkpoint),
-      });
+      await checkpointNativeDiagnosticSession(
+        session.session_id,
+        JSON.stringify(checkpoint),
+      );
       if (generation === this.generation && this.currentState === 'recording') {
         this.persistenceNotice = `Checkpoint сохранён: ${session.checkpoint_path}`;
         this.renderPanel();
@@ -746,9 +744,9 @@ class GalleryDiagnostics {
     const session = await this.nativeSessionPromise;
     if (!session) return;
     try {
-      const saved = await nativeInvoke<NativeDiagnosticFinal>(
-        'finalize_gallery_diagnostic_session',
-        {sessionId: session.session_id, reportJson},
+      const saved = await finalizeNativeDiagnosticSession<NativeDiagnosticFinal>(
+        session.session_id,
+        reportJson,
       );
       if (generation !== this.generation || this.snapshotJson !== reportJson) return;
       this.savedJsonPath = saved.json_path;
@@ -769,7 +767,7 @@ class GalleryDiagnostics {
   private async loadNativeStatus(): Promise<void> {
     if (!supportsNativeDiagnosticsPersistence() || this.currentState === 'recording') return;
     try {
-      const status = await nativeInvoke<NativeDiagnosticStatus>('gallery_diagnostics_status');
+      const status = await nativeDiagnosticStatus<NativeDiagnosticStatus>();
       this.diagnosticsDir = status.diagnostics_dir;
       if (!this.savedJsonPath) this.savedJsonPath = status.latest_json;
       if (!this.savedMarkdownPath) this.savedMarkdownPath = status.latest_markdown;
@@ -1639,10 +1637,6 @@ class GalleryDiagnostics {
     return target instanceof HTMLElement
       && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
   }
-}
-
-async function nativeInvoke<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
-  return invokeTauriCommand<T>(command, args);
 }
 
 declare global {

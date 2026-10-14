@@ -2,14 +2,22 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 const test = require('node:test');
 
-const {resolveSqlitePath, resolveTauriAppData} = require('./runtime-paths.cjs');
+const {
+  resolveDiagnosticsPath,
+  resolveSqlitePath,
+  resolveVilraAppData,
+} = require('./runtime-paths.cjs');
 
-test('resolves the Tauri-compatible Linux application data path', () => {
+test('resolves the stable Vilra Linux application data path', () => {
   const options = {platform: 'linux', env: {}, home: '/home/example'};
-  assert.equal(resolveTauriAppData(options), '/home/example/.local/share/app.tagimage.desktop');
+  assert.equal(resolveVilraAppData(options), '/home/example/.local/share/app.tagimage.desktop');
   assert.equal(
     resolveSqlitePath(options),
     '/home/example/.local/share/app.tagimage.desktop/tagimage.sqlite',
+  );
+  assert.equal(
+    resolveDiagnosticsPath(options),
+    '/home/example/.local/share/app.tagimage.desktop/diagnostics',
   );
 });
 

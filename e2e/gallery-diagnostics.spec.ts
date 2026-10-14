@@ -163,25 +163,31 @@ test('native stop saves JSON and Markdown automatically without clipboard access
   await page.addInitScript(() => {
     type Invocation = {command: string; args: Record<string, unknown>};
     const runtime = window as Window & {
-      __TAURI_INTERNALS__?: object;
-      __TAURI__?: {core: {invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>}};
+      vilraDesktop?: {
+        runtime: 'electron';
+        pickFolder: () => Promise<null>;
+        revealPath: () => Promise<void>;
+        diagnosticsBegin: () => Promise<unknown>;
+        diagnosticsCheckpoint: (sessionId: string, reportJson: string) => Promise<unknown>;
+        diagnosticsFinalize: (sessionId: string, reportJson: string) => Promise<unknown>;
+        diagnosticsStatus: () => Promise<unknown>;
+      };
       __diagnosticInvocations?: Invocation[];
     };
-    runtime.__TAURI_INTERNALS__ = {};
     runtime.__diagnosticInvocations = [];
-    runtime.__TAURI__ = {core: {invoke: async (command, args = {}) => {
+    const invoke = async (command: string, args: Record<string, unknown> = {}) => {
       runtime.__diagnosticInvocations!.push({command, args});
-      if (command === 'begin_gallery_diagnostic_session') {
+      if (command === 'diagnosticsBegin') {
         return {
           session_id: '1700000000-001-123-1',
           diagnostics_dir: '/mock-app-data/diagnostics',
           checkpoint_path: '/mock-app-data/diagnostics/long-scroll.checkpoint.json',
         };
       }
-      if (command === 'checkpoint_gallery_diagnostic_session') {
+      if (command === 'diagnosticsCheckpoint') {
         return {checkpoint_path: '/mock-app-data/diagnostics/long-scroll.checkpoint.json', bytes: 1024};
       }
-      if (command === 'finalize_gallery_diagnostic_session') {
+      if (command === 'diagnosticsFinalize') {
         return {
           json_path: '/mock-app-data/diagnostics/long-scroll-final.json',
           markdown_path: '/mock-app-data/diagnostics/long-scroll-final.md',
@@ -189,7 +195,7 @@ test('native stop saves JSON and Markdown automatically without clipboard access
           bytes: 2048,
         };
       }
-      if (command === 'gallery_diagnostics_status') {
+      if (command === 'diagnosticsStatus') {
         return {
           diagnostics_dir: '/mock-app-data/diagnostics',
           latest_json: null,
@@ -198,7 +204,16 @@ test('native stop saves JSON and Markdown automatically without clipboard access
         };
       }
       throw new Error(`unexpected command: ${command}`);
-    }}};
+    };
+    runtime.vilraDesktop = {
+      runtime: 'electron',
+      pickFolder: async () => null,
+      revealPath: async () => undefined,
+      diagnosticsBegin: () => invoke('diagnosticsBegin'),
+      diagnosticsCheckpoint: (sessionId, reportJson) => invoke('diagnosticsCheckpoint', {sessionId, reportJson}),
+      diagnosticsFinalize: (sessionId, reportJson) => invoke('diagnosticsFinalize', {sessionId, reportJson}),
+      diagnosticsStatus: () => invoke('diagnosticsStatus'),
+    };
     Object.defineProperty(navigator, 'clipboard', {value: undefined, configurable: true});
   });
   await page.goto('/');
@@ -207,7 +222,7 @@ test('native stop saves JSON and Markdown automatically without clipboard access
   await diagnostics.start();
   await expect.poll(() => page.evaluate(() => (
     (window as Window & {__diagnosticInvocations?: Array<{command: string}>})
-      .__diagnosticInvocations?.some(call => call.command === 'checkpoint_gallery_diagnostic_session')
+      .__diagnosticInvocations?.some(call => call.command === 'diagnosticsCheckpoint')
   ))).toBe(true);
 
   await diagnostics.stop();
@@ -216,8 +231,8 @@ test('native stop saves JSON and Markdown automatically without clipboard access
     (window as Window & {__diagnosticInvocations?: Array<{command: string; args: Record<string, unknown>}>})
       .__diagnosticInvocations || []
   ));
-  expect(invocations.map(call => call.command)).toContain('finalize_gallery_diagnostic_session');
-  const final = invocations.find(call => call.command === 'finalize_gallery_diagnostic_session');
+  expect(invocations.map(call => call.command)).toContain('diagnosticsFinalize');
+  const final = invocations.find(call => call.command === 'diagnosticsFinalize');
   const report = JSON.parse(String(final?.args.reportJson || '{}')) as DiagnosticReport;
   expect(report.session.state).toBe('stopped');
   expect(JSON.stringify(report)).not.toContain('synthetic-private');

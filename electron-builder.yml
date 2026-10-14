@@ -6,6 +6,7 @@ directories:
 files:
   - electron/main.cjs
   - electron/preload.cjs
+  - electron/diagnostics.cjs
   - electron/runtime-layout.cjs
   - electron/runtime-paths.cjs
   - package.json
@@ -26,5 +27,5 @@ linux:
       arch:
         - x64
   artifactName: Vilra-Electron_${version}_amd64.${ext}
-  icon: src-tauri/icons/icon.png
+  icon: app-icon.png
   category: Graphics

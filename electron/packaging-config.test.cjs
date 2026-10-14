@@ -21,6 +21,7 @@ test('electron-builder configuration is valid, explicit, and AppImage-only', asy
     'output: dist-electron',
     'electron/main.cjs',
     'electron/preload.cjs',
+    'electron/diagnostics.cjs',
     'electron/runtime-layout.cjs',
     'electron/runtime-paths.cjs',
     'from: electron/package-resources/bin',
@@ -28,10 +29,11 @@ test('electron-builder configuration is valid, explicit, and AppImage-only', asy
     'from: electron/package-resources/build-info.json',
     'target: AppImage',
     'Vilra-Electron_${version}_amd64.${ext}',
+    'icon: app-icon.png',
   ]) {
     assert.ok(config.includes(expected), `missing builder configuration: ${expected}`);
   }
-  for (const forbidden of ['src-tauri/binaries', 'target: deb', 'target: rpm', 'asar: false']) {
+  for (const forbidden of ['target: deb', 'target: rpm', 'asar: false']) {
     assert.equal(config.includes(forbidden), false, `unexpected builder configuration: ${forbidden}`);
   }
 });
@@ -43,4 +45,8 @@ test('package scripts keep dev runtime and make Electron build self-contained', 
   assert.ok(packageJson.scripts['electron:build'].includes('electron:prepare'));
   assert.ok(packageJson.scripts['electron:build'].includes('electron:package:prepare'));
   assert.ok(packageJson.scripts['electron:build'].includes('--linux AppImage --x64'));
+  assert.equal(packageJson.scripts.dev, 'npm run electron:dev');
+  assert.equal(packageJson.scripts.build, 'npm run electron:build');
+  assert.equal(packageJson.scripts.smoke, 'npm run electron:smoke');
+  assert.equal(packageJson.scripts.check, 'npm run typecheck && npm run electron:check');
 });

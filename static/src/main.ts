@@ -1801,7 +1801,7 @@ async function revealProblem(issueId: number): Promise<void> {
   if (errorTarget) errorTarget.textContent = '';
   try {
     if (isDesktopRuntime()) {
-      await revealFileNative(issueId, problem.absolutePath);
+      await revealFileNative(problem.absolutePath);
     } else {
       await navigator.clipboard.writeText(problem.absolutePath);
       if (errorTarget) errorTarget.textContent = 'Путь скопирован.';

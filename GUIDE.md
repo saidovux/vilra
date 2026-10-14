@@ -8,24 +8,24 @@ Vilra — локальная галерея для просмотра изобр
 
 | Компонент | Версия |
 |---|---|
-| Rust | совместимый с Tauri 2 (не ниже 1.77.2) |
+| Rust | актуальный stable Rust/Cargo |
 | Node.js | актуальный LTS |
-| Tauri system dependencies | для вашей ОС |
+| Electron/AppImage system libraries | для вашей ОС |
 
 Основной desktop-запуск:
 
 ```bash
-npm install
-npm run tauri:dev
+npm ci
+npm run dev
 ```
 
 Сборка desktop-пакета:
 
 ```bash
-npm run tauri:build
+npm run build
 ```
 
-Tauri хранит `tagimage.sqlite` в системном каталоге данных приложения, запускает три Rust sidecar-процесса и останавливает их вместе с окном. Python в desktop runtime не используется.
+Electron хранит `tagimage.sqlite` в системном каталоге данных приложения, запускает три Rust sidecar-процесса и останавливает их вместе с окном. Python в desktop runtime не используется.
 
 ## 2. Browser Dev Runtime
 
@@ -41,7 +41,7 @@ Tauri хранит `tagimage.sqlite` в системном каталоге да
 
 При запуске с аргументом папка открывается сразу. Без аргумента путь можно указать в интерфейсе.
 
-Этот режим предназначен для разработки, E2E и диагностики. Основной пользовательский runtime запускается через Tauri.
+Этот режим предназначен для разработки, E2E и диагностики. Основной пользовательский runtime запускается через Electron.
 
 Проверка Rust thumbnails в строгом режиме:
 
@@ -208,7 +208,7 @@ rm -rf /путь/к/фото/.imgindex/thumbs
 ./start.sh /путь/к/фото
 ```
 
-Browser runtime использует file-based SQLite через `TAGIMAGE_SQLITE_PATH`, по умолчанию `.run/tagimage.sqlite`. Tauri использует app-data `tagimage.sqlite`, если override не задан.
+Browser runtime использует file-based SQLite через `TAGIMAGE_SQLITE_PATH`, по умолчанию `.run/tagimage.sqlite`. Electron использует app-data `tagimage.sqlite`, если override не задан.
 
 Vilra остается локальным приложением: без аккаунтов, загрузок файлов на серверы и публичного веб-деплоя.
 

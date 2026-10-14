@@ -6,20 +6,20 @@ Vilra is a local desktop image gallery and tagging application. Images stay on d
 
 ## Run
 
-Requirements: Node.js/npm, Rust/Cargo and the system dependencies required by Tauri 2.
+Requirements: Node.js/npm, Rust/Cargo, and the system libraries required by Electron/AppImage on your Linux distribution.
 
 ```bash
-npm install
-npm run tauri:dev
+npm ci
+npm run dev
 ```
 
-Build a desktop package:
+Build the Linux x86_64 desktop AppImage:
 
 ```bash
-npm run tauri:build
+npm run build
 ```
 
-Tauri builds the frontend and three Rust sidecars, initializes the local SQLite database, starts the API/thumbnail/metadata processes and stops them when the application exits.
+Electron builds the frontend and three Rust sidecars, initializes the local SQLite database, starts the API/thumbnail/metadata processes, and stops them when the application exits. The packaged database remains at `~/.local/share/app.tagimage.desktop/tagimage.sqlite` on Linux. Gallery diagnostics remain under `~/.local/share/app.tagimage.desktop/diagnostics/`.
 
 Python is not part of the project runtime.
 
@@ -32,7 +32,7 @@ Python is not part of the project runtime.
 - `rust/metadata-worker` — metadata jobs.
 - `rust/crates/tagimage-db` — SQLite schema and data access.
 - `rust/crates/tagimage-core` — shared Rust types/helpers.
-- `src-tauri` — desktop shell and sidecar lifecycle.
+- `electron/` — desktop shell, native bridge, diagnostics persistence, and sidecar lifecycle.
 
 The desktop application uses `tagimage.sqlite` in the OS application-data directory unless `TAGIMAGE_SQLITE_PATH` overrides it.
 
@@ -76,6 +76,13 @@ Browser regression tests:
 
 ```bash
 npm run test:e2e
+```
+
+Desktop runtime checks and a non-GUI smoke run:
+
+```bash
+npm run check
+npm run smoke
 ```
 
 ## Main API

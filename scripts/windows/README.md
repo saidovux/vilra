@@ -1,6 +1,6 @@
 # Windows Notes
 
-Основной пользовательский runtime реализован через Tauri 2.
+Основной пользовательский runtime реализован через Electron.
 
 Для отдельного browser development launcher на Windows потребуется PowerShell-обёртка с эквивалентным поведением:
 

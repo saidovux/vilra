@@ -65,21 +65,21 @@ test('plain browser keeps fallback behavior and browser diagnostics label', asyn
   expect(await diagnosticRuntime(page)).toBe('browser');
 });
 
-test('Electron bridge is selected without enabling Tauri-only persistence', async ({page}) => {
+test('Electron bridge provides folder, reveal, diagnostics, and Chromium labeling', async ({page}) => {
   await page.addInitScript(() => {
     const runtime = window as Window & {
       vilraDesktop?: {
         runtime: 'electron';
         pickFolder: (defaultPath?: string) => Promise<string | null>;
         revealPath: (targetPath: string) => Promise<void>;
+        diagnosticsBegin: () => Promise<unknown>;
+        diagnosticsCheckpoint: (sessionId: string, reportJson: string) => Promise<unknown>;
+        diagnosticsFinalize: (sessionId: string, reportJson: string) => Promise<unknown>;
+        diagnosticsStatus: () => Promise<unknown>;
       };
-      __TAURI_INTERNALS__?: object;
-      __TAURI__?: {core: {invoke: (command: string) => Promise<never>}};
       __electronCalls?: Array<{method: string; value: string}>;
-      __tauriCalls?: string[];
     };
     runtime.__electronCalls = [];
-    runtime.__tauriCalls = [];
     runtime.vilraDesktop = {
       runtime: 'electron',
       pickFolder: async defaultPath => {
@@ -89,12 +89,34 @@ test('Electron bridge is selected without enabling Tauri-only persistence', asyn
       revealPath: async targetPath => {
         runtime.__electronCalls!.push({method: 'revealPath', value: targetPath});
       },
+      diagnosticsBegin: async () => {
+        runtime.__electronCalls!.push({method: 'diagnosticsBegin', value: ''});
+        return {
+          session_id: '1700000000-001-123-1',
+          diagnostics_dir: '/mock-app-data/diagnostics',
+          checkpoint_path: '/mock-app-data/diagnostics/long-scroll.checkpoint.json',
+        };
+      },
+      diagnosticsCheckpoint: async sessionId => {
+        runtime.__electronCalls!.push({method: 'diagnosticsCheckpoint', value: sessionId});
+        return {checkpoint_path: 'checkpoint.json', bytes: 1};
+      },
+      diagnosticsFinalize: async sessionId => {
+        runtime.__electronCalls!.push({method: 'diagnosticsFinalize', value: sessionId});
+        return {
+          json_path: '/mock-app-data/diagnostics/long-scroll.json',
+          markdown_path: '/mock-app-data/diagnostics/long-scroll.md',
+          analysis_error: null,
+          bytes: 1,
+        };
+      },
+      diagnosticsStatus: async () => ({
+        diagnostics_dir: '/mock-app-data/diagnostics',
+        latest_json: null,
+        latest_markdown: null,
+        checkpoints: 0,
+      }),
     };
-    runtime.__TAURI_INTERNALS__ = {};
-    runtime.__TAURI__ = {core: {invoke: async command => {
-      runtime.__tauriCalls!.push(command);
-      throw new Error('Electron must not invoke Tauri');
-    }}};
   });
   await installProblemRoutes(page);
   await page.goto('/');
@@ -107,13 +129,13 @@ test('Electron bridge is selected without enabling Tauri-only persistence', asyn
   await reveal.click();
   expect(await diagnosticRuntime(page)).toBe('Electron/Chromium');
 
-  const calls = await page.evaluate(() => ({
-    electron: (window as Window & {__electronCalls?: unknown[]}).__electronCalls || [],
-    tauri: (window as Window & {__tauriCalls?: string[]}).__tauriCalls || [],
-  }));
-  expect(calls.electron).toEqual([
+  const calls = await page.evaluate(() => (
+    (window as Window & {__electronCalls?: unknown[]}).__electronCalls || []
+  ));
+  expect(calls).toEqual([
     {method: 'pickFolder', value: ''},
     {method: 'revealPath', value: problem.absolute_path},
+    {method: 'diagnosticsBegin', value: ''},
+    {method: 'diagnosticsFinalize', value: '1700000000-001-123-1'},
   ]);
-  expect(calls.tauri).toEqual([]);
 });

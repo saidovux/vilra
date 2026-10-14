@@ -11,4 +11,16 @@ contextBridge.exposeInMainWorld('vilraDesktop', Object.freeze({
   revealPath(targetPath) {
     return ipcRenderer.invoke('vilra:reveal-path', targetPath);
   },
+  diagnosticsBegin() {
+    return ipcRenderer.invoke('vilra:diagnostics:begin');
+  },
+  diagnosticsCheckpoint(sessionId, reportJson) {
+    return ipcRenderer.invoke('vilra:diagnostics:checkpoint', sessionId, reportJson);
+  },
+  diagnosticsFinalize(sessionId, reportJson) {
+    return ipcRenderer.invoke('vilra:diagnostics:finalize', sessionId, reportJson);
+  },
+  diagnosticsStatus() {
+    return ipcRenderer.invoke('vilra:diagnostics:status');
+  },
 }));
