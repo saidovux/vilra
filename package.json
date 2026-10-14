@@ -1,7 +1,7 @@
 {
   "name": "vilra-frontend",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.2.0",
   "desktopName": "Vilra",
   "main": "electron/main.cjs",
   "scripts": {
