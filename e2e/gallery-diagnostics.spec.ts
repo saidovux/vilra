@@ -366,11 +366,14 @@ test('thumbnail lifecycle separates one 202 admission, cache polling, failure, r
 
   for (let index = 0; index < 14; index += 1) {
     const before = synthetic.servedThrough;
-    await page.evaluate(() => window.scrollTo({top: document.documentElement.scrollHeight}));
+    await page.evaluate(() => window.scrollTo({
+      top: document.documentElement.scrollHeight,
+      behavior: 'smooth',
+    }));
     await expect.poll(() => synthetic.servedThrough).toBeGreaterThan(before);
     if (index === 4) await diagnostics.mark();
   }
-  await page.evaluate(() => window.scrollTo({top: 0}));
+  await page.evaluate(() => window.scrollTo({top: 0, behavior: 'smooth'}));
   await page.waitForTimeout(150);
   await diagnostics.stop();
   const report = await diagnostics.report();

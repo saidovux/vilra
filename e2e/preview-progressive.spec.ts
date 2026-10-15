@@ -332,6 +332,54 @@ test('Nearby capacity follows Inspector, window resize, and leaving Focus mode',
   expectFilledFilmstrip(await filmstripSnapshot(page));
 });
 
+test('Nearby capacity resets before a fresh Viewer session is measured', async ({page}) => {
+  const ids = await openFilmstripFixture(page, 32);
+  await expect.poll(() => page.locator('.preview-film-item').count()).toBeGreaterThan(15);
+  const inspectorCount = await page.locator('.preview-film-item').count();
+
+  await page.keyboard.press('Control+b');
+  await expect(page.locator('#preview-inspector')).not.toBeVisible();
+  await expect.poll(() => page.locator('.preview-film-item').count()).toBeGreaterThan(inspectorCount);
+
+  await page.keyboard.press('Escape');
+  await expect(page.locator('#preview-modal')).not.toBeVisible();
+  await expectGalleryCardInViewport(page, ids[32]);
+  const preMeasurementCount = await page.locator(`.card[data-id="${ids[32]}"]`).evaluate(element => {
+    (element as HTMLElement).click();
+    return document.querySelectorAll('.preview-film-item').length;
+  });
+
+  expect(preMeasurementCount).toBe(15);
+  await expect(page.locator('#preview-modal')).toBeVisible();
+  await expect(page.locator('#preview-inspector')).toBeVisible();
+  await expect.poll(() => page.locator('.preview-film-item').count()).toBe(inspectorCount);
+  expectFilledFilmstrip(await filmstripSnapshot(page));
+});
+
+test('Viewer navigation hints match the functional P/N shortcuts', async ({page}) => {
+  await installPreviewFixture(page, {immediateOriginals: true});
+  await openFixture(page);
+
+  await page.locator('.card[data-id="preview-b"]').click();
+  const modal = page.locator('#preview-modal');
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-b');
+  await expect(page.locator('#preview-prev')).toHaveAttribute('title', 'Предыдущее · P / ←');
+  await expect(page.locator('#preview-next')).toHaveAttribute('title', 'Следующее · N / →');
+
+  await page.keyboard.press('p');
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-a');
+  await page.keyboard.press('n');
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-b');
+});
+
+test('document root does not impose global smooth scrolling', async ({page}) => {
+  await installPreviewFixture(page);
+  await openFixture(page);
+
+  await expect.poll(() => page.locator('html').evaluate(element => getComputedStyle(element).scrollBehavior))
+    .toBe('auto');
+});
+
 test('Viewer crosses the Gallery cursor boundary and wraps only at the true end', async ({page}) => {
   const fixture = await installPaginatedPreviewFixture(page, 47, 2);
   await page.goto('/');

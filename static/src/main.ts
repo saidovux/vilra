@@ -936,7 +936,8 @@ let previewPendingDirection: -1 | 1 | null = null;
 let previewNavigationGeneration = 0;
 let pendingGalleryAnchorImageId: string | null = null;
 let previewFilmMode: 'nearby' | 'tag' | 'folder' = 'nearby';
-let previewFilmNearbyCapacity = 15;
+const PREVIEW_FILM_NEARBY_FALLBACK_CAPACITY = 15;
+let previewFilmNearbyCapacity = PREVIEW_FILM_NEARBY_FALLBACK_CAPACITY;
 let previewFilmLayoutFrame: number | null = null;
 let previewFocusMode = false;
 let previewInspectorVisible = true;
@@ -3486,6 +3487,7 @@ function openLightbox(
   if (!navigatingOpenViewer) {
     pendingGalleryAnchorImageId = null;
     resetPreviewUiState();
+    previewFilmNearbyCapacity = PREVIEW_FILM_NEARBY_FALLBACK_CAPACITY;
   }
   previewSourceMode = sourceMode;
   lightboxImages = sourceMode === 'fixed' ? nextSource : [];
