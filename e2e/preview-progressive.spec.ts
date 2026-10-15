@@ -21,6 +21,12 @@ type PreviewFixtureOptions = {
   height?: number;
 };
 
+type PaginatedPreviewFixture = {
+  cursorRequests: string[];
+  sessionWrites: Array<{last_image_id?: string | null}>;
+  releaseNextPage: () => void;
+};
+
 function deferred(): Deferred {
   let resolve = () => {};
   const promise = new Promise<void>(done => { resolve = done; });
@@ -116,6 +122,187 @@ async function openFixture(page: Page): Promise<void> {
   await page.goto('/');
   await expect(page.locator('.card[data-id="preview-a"]')).toBeVisible();
 }
+
+function pagedImageId(index: number): string {
+  return `paged-${String(index).padStart(3, '0')}`;
+}
+
+async function installPaginatedPreviewFixture(
+  page: Page,
+  lastImageIndex: number,
+  secondPageCount = 48,
+): Promise<PaginatedPreviewFixture> {
+  const nextPage = deferred();
+  const cursorRequests: string[] = [];
+  const sessionWrites: Array<{last_image_id?: string | null}> = [];
+  const firstPage = Array.from({length: 48}, (_, index) => image(pagedImageId(index), index));
+  const secondPage = Array.from(
+    {length: secondPageCount},
+    (_, index) => image(pagedImageId(48 + index), 48 + index),
+  );
+
+  await page.route('**/api/events', route => route.abort());
+  await page.route('**/api/session', async route => {
+    if (route.request().method() !== 'GET') {
+      sessionWrites.push(route.request().postDataJSON() as {last_image_id?: string | null});
+      await route.fulfill({status: 200, json: {ok: true}});
+      return;
+    }
+    await route.fulfill({status: 200, json: {
+      root_path: '/paginated-preview-fixture',
+      root_paths: ['/paginated-preview-fixture'],
+      search_tags: [],
+      search_mode: 'any',
+      tabs: [],
+      active_tab_id: null,
+      last_image_id: pagedImageId(lastImageIndex),
+      folder_tag_sync: true,
+    }});
+  });
+  await page.route('**/api/images?**', async route => {
+    const cursor = new URL(route.request().url()).searchParams.get('cursor');
+    if (cursor) {
+      cursorRequests.push(cursor);
+      await nextPage.promise;
+      await route.fulfill({status: 200, json: {
+        items: secondPage,
+        page: {total: null, next_cursor: null, has_more: false},
+      }});
+      return;
+    }
+    await route.fulfill({status: 200, json: {
+      items: firstPage,
+      page: {total: firstPage.length + secondPage.length, next_cursor: '48', has_more: true},
+    }});
+  });
+  await page.route('**/api/tags', route => route.fulfill({status: 200, json: {tags: []}}));
+  await page.route('**/thumb-file/paged-*.jpg*', route => route.fulfill({
+    status: 200,
+    contentType: 'image/png',
+    body: IMAGE_BYTES,
+  }));
+  await page.route('**/thumb/paged-*', route => route.fulfill({
+    status: 200,
+    contentType: 'image/png',
+    body: IMAGE_BYTES,
+  }));
+  await page.route('**/file/paged-*', route => route.fulfill({
+    status: 200,
+    contentType: 'image/png',
+    body: IMAGE_BYTES,
+  }));
+
+  return {
+    cursorRequests,
+    sessionWrites,
+    releaseNextPage: nextPage.resolve,
+  };
+}
+
+async function expectGalleryCardInViewport(page: Page, imageId: string): Promise<void> {
+  const slot = page.locator(`.virtual-card-slot[data-id="${imageId}"]`);
+  await expect(slot).toBeVisible();
+  const intersects = await slot.evaluate(element => {
+    const rect = element.getBoundingClientRect();
+    return rect.bottom > 0 && rect.top < innerHeight;
+  });
+  expect(intersects).toBe(true);
+}
+
+test('Viewer crosses the Gallery cursor boundary and wraps only at the true end', async ({page}) => {
+  const fixture = await installPaginatedPreviewFixture(page, 47, 2);
+  await page.goto('/');
+  const modal = page.locator('#preview-modal');
+  await expect(modal).toHaveAttribute('data-image-id', pagedImageId(47));
+  await expect(page.locator('#preview-index')).toHaveText('48 / 48');
+
+  await page.keyboard.press('n');
+  await expect.poll(() => fixture.cursorRequests).toEqual(['48']);
+  fixture.releaseNextPage();
+  await expect(modal).toHaveAttribute('data-image-id', pagedImageId(48));
+  await expect(page.locator('#preview-index')).toHaveText('49 / 50');
+
+  await page.keyboard.press('ArrowRight');
+  await expect(modal).toHaveAttribute('data-image-id', pagedImageId(49));
+  await page.keyboard.press('n');
+  await expect(modal).toHaveAttribute('data-image-id', pagedImageId(0));
+  await expect(page.locator('#preview-index')).toHaveText('1 / 50');
+  expect(fixture.cursorRequests).toEqual(['48']);
+});
+
+test('Viewer coalesces repeated navigation while one cursor page is loading', async ({page}) => {
+  const fixture = await installPaginatedPreviewFixture(page, 47, 3);
+  await page.goto('/');
+  const modal = page.locator('#preview-modal');
+  await expect(modal).toHaveAttribute('data-image-id', pagedImageId(47));
+
+  await page.keyboard.press('n');
+  await page.keyboard.press('n');
+  await page.keyboard.press('n');
+  await expect.poll(() => fixture.cursorRequests).toEqual(['48']);
+  fixture.releaseNextPage();
+
+  await expect(modal).toHaveAttribute('data-image-id', pagedImageId(49));
+  await expect(page.locator('#preview-index')).toHaveText('50 / 51');
+  expect(fixture.cursorRequests).toEqual(['48']);
+});
+
+test('Previous on the first image does not wrap before the final page is loaded', async ({page}) => {
+  const fixture = await installPaginatedPreviewFixture(page, 0, 2);
+  await page.goto('/');
+  const modal = page.locator('#preview-modal');
+  await expect(modal).toHaveAttribute('data-image-id', pagedImageId(0));
+
+  await page.keyboard.press('p');
+  await expect(modal).toHaveAttribute('data-image-id', pagedImageId(0));
+  fixture.releaseNextPage();
+});
+
+test('closing Viewer invalidates navigation waiting for a cursor response', async ({page}) => {
+  const fixture = await installPaginatedPreviewFixture(page, 47, 2);
+  await page.goto('/');
+  const modal = page.locator('#preview-modal');
+  await expect(modal).toHaveAttribute('data-image-id', pagedImageId(47));
+
+  await page.keyboard.press('n');
+  await expect.poll(() => fixture.cursorRequests).toEqual(['48']);
+  await page.keyboard.press('q');
+  await expect(modal).not.toBeVisible();
+  fixture.releaseNextPage();
+  await expect.poll(() => fixture.cursorRequests).toEqual(['48']);
+  await page.waitForTimeout(100);
+  await expect(modal).not.toBeVisible();
+  await expect(modal).not.toHaveAttribute('data-image-id', /.+/);
+});
+
+test('normal Viewer close returns Gallery to the final image and clears session Viewer state', async ({page}) => {
+  const fixture = await installPaginatedPreviewFixture(page, 47, 24);
+  await page.goto('/');
+  const modal = page.locator('#preview-modal');
+  await expect(modal).toHaveAttribute('data-image-id', pagedImageId(47));
+
+  await page.keyboard.press('n');
+  await expect.poll(() => fixture.cursorRequests).toEqual(['48']);
+  fixture.releaseNextPage();
+  await expect(modal).toHaveAttribute('data-image-id', pagedImageId(48));
+  for (let index = 49; index <= 63; index += 1) await page.keyboard.press('n');
+  await expect(modal).toHaveAttribute('data-image-id', pagedImageId(63));
+
+  await page.keyboard.press('q');
+  await expect(modal).not.toBeVisible();
+  await expectGalleryCardInViewport(page, pagedImageId(63));
+  await expect.poll(() => {
+    const latest = fixture.sessionWrites[fixture.sessionWrites.length - 1];
+    return latest ? latest.last_image_id : undefined;
+  }).toBeNull();
+
+  await page.locator(`.card[data-id="${pagedImageId(63)}"]`).click();
+  await page.keyboard.press('ArrowRight');
+  await expect(modal).toHaveAttribute('data-image-id', pagedImageId(64));
+  await page.locator('#preview-close').click();
+  await expect(modal).not.toBeVisible();
+  await expectGalleryCardInViewport(page, pagedImageId(64));
+});
 
 test('Vilra selects disable native appearance and keep dark platform-independent styling', async ({page}) => {
   await installPreviewFixture(page);

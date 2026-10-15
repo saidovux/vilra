@@ -927,7 +927,14 @@ let pendingGalleryScrollTop: number | null = null;
 let activePageLoad: {requestId: number; promise: Promise<void>} | null = null;
 const mountedGalleryCards = new Map<string, MountedGalleryCard>();
 let previewModal: PreviewModal | null = null;
+type PreviewSourceMode = 'gallery' | 'fixed';
+let previewSourceMode: PreviewSourceMode = 'gallery';
+let previewCurrentImageId: string | null = null;
 let lightboxImages: ImageItem[] = [];
+let previewPageNavigationBusy = false;
+let previewPendingDirection: -1 | 1 | null = null;
+let previewNavigationGeneration = 0;
+let pendingGalleryAnchorImageId: string | null = null;
 let previewFilmMode: 'nearby' | 'tag' | 'folder' = 'nearby';
 let previewFocusMode = false;
 let previewInspectorVisible = true;
@@ -940,6 +947,7 @@ let gallerySidebarChangedDuringFocus = false;
 const selectedImageIds = new Set<string>();
 let previewRequestToken = 0;
 let suppressPreviewCloseClear = false;
+let suppressPreviewGalleryReturn = false;
 let suppressedPreviewRestoreId: string | null = null;
 let latestStatus: StatusResponse | null = null;
 let filterSuggestionOpen = false;
@@ -1501,7 +1509,7 @@ function removeLiveImage(imageId: string, removedImage: ImageItem | null): void 
   if (serverTotalKnown && (wasVisible || (removedImage && imageMatchesActiveTab(removedImage)))) {
     serverTotal = Math.max(0, serverTotal - 1);
   }
-  if (activeTab().lastImageId === imageId) closePreview(true);
+  if (previewCurrentImageId === imageId) closePreview(true, false);
   renderLiveGalleryState();
   scheduleLiveFolderRefresh();
   scheduleLiveTagRefresh();
@@ -1510,14 +1518,19 @@ function removeLiveImage(imageId: string, removedImage: ImageItem | null): void 
 function renderLiveGalleryState(): void {
   invalidateVirtualGallery({preserveAnchor: true, resetCards: false});
   updateImageCounter();
+  refreshPreviewSourceUi();
   requiredHtml('empty-state').style.display = visibleImages.length ? 'none' : 'flex';
   requestGraphRebuild();
 }
 
 function updateLivePreviewImage(image: ImageItem): void {
-  const index = lightboxImages.findIndex(item => item.id === image.id);
-  if (index >= 0) lightboxImages[index] = image;
-  if (previewModal?.isOpen && activeTab().lastImageId === image.id) renderPreviewMeta(image, false);
+  if (previewSourceMode === 'fixed') {
+    const index = lightboxImages.findIndex(item => item.id === image.id);
+    if (index >= 0) lightboxImages[index] = image;
+  }
+  if (previewModal?.isOpen && previewCurrentImageId === image.id) {
+    renderPreviewMeta(currentPreviewImage() || image, false);
+  }
 }
 
 function scheduleLiveRecovery(reason: string): void {
@@ -1910,6 +1923,7 @@ async function refreshImages(clear = true): Promise<void> {
     await refreshTagPool();
     galleryDiagnostics.pageStage(diagnosticPage, 'pre_virtualizer_wait');
     applyFilter(clear);
+    refreshPreviewSourceUi();
     galleryDiagnostics.pageStage(diagnosticPage, 'virtualizer');
     galleryDiagnostics.finishPage(diagnosticPage, 'success', allImages.length);
     await restorePendingGalleryScroll();
@@ -1995,6 +2009,7 @@ function loadNextImagesPage(): Promise<void> {
       hasMorePages = Boolean(page && page.has_more);
       updateImageCounter();
       updateVirtualGalleryCount();
+      refreshPreviewSourceUi();
       galleryDiagnostics.pageStage(diagnosticPage, 'virtualizer');
       galleryDiagnostics.finishPage(diagnosticPage, 'success', allImages.length);
     } catch (e) {
@@ -2444,9 +2459,9 @@ function handleTerminalImageUnavailable(imageId: string): void {
   selectedImageIds.delete(imageId);
   updateImageSelectionUi();
   cancelThumbLifecycle(imageId);
-  if (activeTab().lastImageId === imageId || lightboxImages[lbIndex]?.id === imageId) {
+  if (previewCurrentImageId === imageId) {
     previewRequestToken += 1;
-    closePreview(true);
+    closePreview(true, false);
   }
   removeLiveImage(imageId, null);
   scheduleProblemsRefresh();
@@ -2792,7 +2807,7 @@ function renderAllTagSurfaces(): void {
   renderFilterControls();
   renderTagAdmin();
   visibleImages.forEach(updateCardForImage);
-  const previewImage = (lightboxImages.length ? lightboxImages : visibleImages)[lbIndex];
+  const previewImage = currentPreviewImage();
   if (previewImage) renderPreviewTags(previewImage);
 }
 
@@ -3330,7 +3345,7 @@ function openGraphImage(imageId: string): void {
   const idx = source.findIndex(img => img.id === imageId);
   if (idx < 0) return;
   closeGraph();
-  openLightbox(idx, true, source);
+  openLightbox(idx, true, source, 'fixed');
 }
 
 function resetGraphLayout(): void {
@@ -3393,7 +3408,7 @@ let fishControllers: FishController[] = [];
 function initFishInputs(): void {
   fishControllers = [
     initFishInput('preview-tag-input', 'preview-tag-ghost', () => {
-      const img = (lightboxImages.length ? lightboxImages : visibleImages)[lbIndex];
+      const img = currentPreviewImage();
       return img ? img.tags || [] : [];
     }, tag => addTagToPreview(tag))
   ];
@@ -3415,10 +3430,36 @@ function openLightboxById(imageId: string, persist = true): void {
     });
     return;
   }
-  void openLightbox(idx, persist, sourceList);
+  openLightbox(idx, persist, sourceList, 'gallery');
 }
 
-function openLightbox(idx: number, persist = true, sourceList: ImageItem[] = visibleImages): void {
+function previewSource(): ImageItem[] {
+  return previewSourceMode === 'gallery' ? visibleImages : lightboxImages;
+}
+
+function previewCurrentIndex(): number {
+  if (!previewCurrentImageId) return -1;
+  return previewSource().findIndex(image => image.id === previewCurrentImageId);
+}
+
+function currentPreviewImage(): ImageItem | null {
+  const source = previewSource();
+  const index = previewCurrentIndex();
+  return index >= 0 ? source[index] : null;
+}
+
+function invalidatePreviewNavigation(): void {
+  previewNavigationGeneration += 1;
+  previewPageNavigationBusy = false;
+  previewPendingDirection = null;
+}
+
+function openLightbox(
+  idx: number,
+  persist = true,
+  sourceList: ImageItem[] = visibleImages,
+  sourceMode: PreviewSourceMode = 'gallery',
+): void {
   const nextSource = Array.isArray(sourceList) && sourceList.length ? sourceList : visibleImages;
   if (!Number.isInteger(idx) || idx < 0 || idx >= nextSource.length) {
     console.warn('openLightbox: invalid image index', {
@@ -3427,15 +3468,32 @@ function openLightbox(idx: number, persist = true, sourceList: ImageItem[] = vis
     });
     return;
   }
+  const nextImageId = nextSource[idx].id;
+  const activeSource = sourceMode === 'gallery' ? visibleImages : nextSource;
+  const currentIndex = activeSource.findIndex(image => image.id === nextImageId);
+  if (currentIndex < 0) {
+    console.warn('openLightbox: image is missing from active preview source', {
+      imageId: nextImageId,
+      sourceMode,
+      sourceLength: activeSource.length,
+    });
+    return;
+  }
   const navigatingOpenViewer = Boolean(previewModal?.isOpen);
-  if (!navigatingOpenViewer) resetPreviewUiState();
-  lightboxImages = nextSource;
+  if (!navigatingOpenViewer || previewSourceMode !== sourceMode) invalidatePreviewNavigation();
+  if (!navigatingOpenViewer) {
+    pendingGalleryAnchorImageId = null;
+    resetPreviewUiState();
+  }
+  previewSourceMode = sourceMode;
+  lightboxImages = sourceMode === 'fixed' ? nextSource : [];
+  previewCurrentImageId = nextImageId;
   if (persist) suppressedPreviewRestoreId = null;
   togglePreviewTagDropdown(false);
   closePreviewQuickMenu();
   previewFilmMode = 'nearby';
-  lbIndex = idx;
-  const img = lightboxImages[lbIndex];
+  lbIndex = currentIndex;
+  const img = previewSource()[lbIndex];
   activeTab().lastImageId = img.id;
   renderPreviewMeta(img, true);
   document.body.style.overflow = 'hidden';
@@ -3465,7 +3523,7 @@ function isCurrentPreviewRequest(imageId: string, token: number): boolean {
   return token === previewRequestToken
     && Boolean(previewModal?.isOpen)
     && previewModal?.modal.dataset.imageId === imageId
-    && lightboxImages[lbIndex]?.id === imageId;
+    && previewCurrentImageId === imageId;
 }
 
 async function diagnosePreviewOriginalFailure(img: ImageItem, token: number): Promise<void> {
@@ -3492,11 +3550,13 @@ async function diagnosePreviewOriginalFailure(img: ImageItem, token: number): Pr
   alert('Не удалось открыть изображение: ' + message);
 }
 
-function closePreview(clearLast = true): void {
+function closePreview(clearLast = true, restoreGalleryAnchor = clearLast): void {
   previewRequestToken += 1;
   suppressPreviewCloseClear = !clearLast;
+  suppressPreviewGalleryReturn = !restoreGalleryAnchor;
   if (previewModal && previewModal.isOpen) previewModal.close();
   suppressPreviewCloseClear = false;
+  suppressPreviewGalleryReturn = false;
   if (clearLast) {
     activeTab().lastImageId = null;
     saveSessionSoon();
@@ -3504,23 +3564,83 @@ function closePreview(clearLast = true): void {
 }
 
 function handlePreviewClosed(): void {
+  const closingImageId = previewCurrentImageId;
+  const shouldRestoreGallery = !suppressPreviewGalleryReturn
+    && previewSourceMode === 'gallery'
+    && Boolean(closingImageId);
   previewRequestToken += 1;
+  invalidatePreviewNavigation();
   document.body.style.overflow = '';
   togglePreviewTagDropdown(false);
   closePreviewQuickMenu();
   resetPreviewUiState();
   lightboxImages = [];
+  previewCurrentImageId = null;
+  previewSourceMode = 'gallery';
+  lbIndex = -1;
   if (!suppressPreviewCloseClear && tabs.length && activeTab().lastImageId) {
     activeTab().lastImageId = null;
     saveSessionSoon();
   }
+  if (shouldRestoreGallery && closingImageId) scheduleGalleryAnchorRestore(closingImageId);
 }
 
 function previewNav(dir: number): void {
-  const source = lightboxImages.length ? lightboxImages : visibleImages;
+  const direction: -1 | 1 = dir < 0 ? -1 : 1;
+  if (previewPageNavigationBusy) {
+    previewPendingDirection = direction;
+    return;
+  }
+  const source = previewSource();
   if (!source.length) return;
-  lbIndex = (lbIndex + dir + source.length) % source.length;
-  openLightbox(lbIndex, true, source);
+  const currentIndex = previewCurrentIndex();
+  if (currentIndex < 0) return;
+  lbIndex = currentIndex;
+  if (previewSourceMode === 'fixed') {
+    openLightbox((currentIndex + direction + source.length) % source.length, true, source, 'fixed');
+    return;
+  }
+  const desiredIndex = currentIndex + direction;
+  if (desiredIndex >= 0 && desiredIndex < source.length) {
+    openLightbox(desiredIndex, true, source, 'gallery');
+    return;
+  }
+  if (direction < 0) {
+    if (!hasMorePages) openLightbox(source.length - 1, true, source, 'gallery');
+    return;
+  }
+  if (!hasMorePages) {
+    openLightbox(0, true, source, 'gallery');
+    return;
+  }
+  void navigatePreviewAcrossPageBoundary();
+}
+
+async function navigatePreviewAcrossPageBoundary(): Promise<void> {
+  if (previewPageNavigationBusy || previewSourceMode !== 'gallery' || !previewCurrentImageId) return;
+  previewPageNavigationBusy = true;
+  const generation = previewNavigationGeneration;
+  const currentImageId = previewCurrentImageId;
+  try {
+    await loadNextImagesPage();
+    if (
+      generation !== previewNavigationGeneration
+      || !previewModal?.isOpen
+      || previewSourceMode !== 'gallery'
+      || previewCurrentImageId !== currentImageId
+    ) return;
+    const source = previewSource();
+    const currentIndex = source.findIndex(image => image.id === currentImageId);
+    if (currentIndex >= 0 && currentIndex + 1 < source.length) {
+      openLightbox(currentIndex + 1, true, source, 'gallery');
+    }
+  } finally {
+    if (generation !== previewNavigationGeneration) return;
+    previewPageNavigationBusy = false;
+    const pendingDirection = previewPendingDirection;
+    previewPendingDirection = null;
+    if (pendingDirection && previewModal?.isOpen) previewNav(pendingDirection);
+  }
 }
 
 function imageFormat(path: string): string {
@@ -3536,6 +3656,7 @@ function imageParentPath(path: string): string {
 }
 
 function renderPreviewMeta(img: ImageItem, loading: boolean): void {
+  lbIndex = previewCurrentIndex();
   const name = fileName(img.path);
   const resolution = `${img.width || '?'} × ${img.height || '?'}`;
   requiredHtml('preview-name').textContent = loading ? `Загрузка: ${name}` : name;
@@ -3551,15 +3672,26 @@ function renderPreviewMeta(img: ImageItem, loading: boolean): void {
   if (previewFormat) previewFormat.textContent = imageFormat(img.path);
   if (previewPath) previewPath.textContent = img.path;
   if (previewHudResolution) previewHudResolution.textContent = resolution;
-  if (previewIndex) previewIndex.textContent = `${lbIndex + 1} / ${(lightboxImages.length ? lightboxImages : visibleImages).length}`;
+  if (previewIndex) previewIndex.textContent = `${lbIndex + 1} / ${previewSource().length}`;
   requiredAnchor('preview-open').href = `/file/${img.id}`;
   renderPreviewTags(img);
   renderPreviewFilmstrip();
 }
 
+function refreshPreviewSourceUi(): void {
+  if (!previewModal?.isOpen) return;
+  const currentIndex = previewCurrentIndex();
+  if (currentIndex < 0) return;
+  lbIndex = currentIndex;
+  const previewIndex = optionalHtml('preview-index');
+  if (previewIndex) previewIndex.textContent = `${currentIndex + 1} / ${previewSource().length}`;
+  renderPreviewFilmstrip();
+}
+
 function previewFilmCandidates(): ImageItem[] {
-  const source = lightboxImages.length ? lightboxImages : visibleImages;
-  const current = source[lbIndex];
+  const source = previewSource();
+  const currentIndex = previewCurrentIndex();
+  const current = currentIndex >= 0 ? source[currentIndex] : null;
   if (!current) return [];
   if (previewFilmMode === 'tag') {
     const tags = new Set((current.tags || []).map(normalizeTag));
@@ -3570,8 +3702,8 @@ function previewFilmCandidates(): ImageItem[] {
     const folder = imageParentPath(current.path);
     return source.filter(image => imageParentPath(image.path) === folder);
   }
-  const start = Math.max(0, lbIndex - 7);
-  const end = Math.min(source.length, lbIndex + 8);
+  const start = Math.max(0, currentIndex - 7);
+  const end = Math.min(source.length, currentIndex + 8);
   return source.slice(start, end);
 }
 
@@ -3584,7 +3716,7 @@ function renderPreviewFilmstrip(): void {
     button.classList.toggle('active', button.dataset.mode === previewFilmMode);
   });
   const items = previewFilmCandidates();
-  const current = (lightboxImages.length ? lightboxImages : visibleImages)[lbIndex];
+  const current = currentPreviewImage();
   target.replaceChildren();
   for (const image of items) {
     const button = document.createElement('button');
@@ -3602,9 +3734,9 @@ function renderPreviewFilmstrip(): void {
     };
     button.appendChild(thumbnail);
     button.addEventListener('click', () => {
-      const source = lightboxImages.length ? lightboxImages : visibleImages;
+      const source = previewSource();
       const nextIndex = source.findIndex(item => item.id === image.id);
-      if (nextIndex >= 0) void openLightbox(nextIndex, true, source);
+      if (nextIndex >= 0) openLightbox(nextIndex, true, source, previewSourceMode);
     });
     target.appendChild(button);
   }
@@ -3765,7 +3897,7 @@ function togglePreviewTagDropdown(force?: boolean): void {
 function renderPreviewTagDropdown(): void {
   const dropdown = optionalHtml('preview-tag-dropdown');
   if (!dropdown) return;
-  const img = (lightboxImages.length ? lightboxImages : visibleImages)[lbIndex];
+  const img = currentPreviewImage();
   const used = new Set((img ? img.tags || [] : []).map(normalizeTag));
   const tags = allTagPool.filter(tag => !used.has(normalizeTag(tag)));
   dropdown.innerHTML = tags.length
@@ -3790,7 +3922,7 @@ async function addTagFromPreviewInput(): Promise<void> {
 
 async function addTagToPreview(tag: string | undefined): Promise<void> {
   if (!tag) return;
-  const img = (lightboxImages.length ? lightboxImages : visibleImages)[lbIndex];
+  const img = currentPreviewImage();
   if (!img) return;
   const newTags = dedupeDisplayTags([...(img.user_tags || []), findDisplayTag(tag)]);
   await saveTags(img.id, newTags);
@@ -3798,7 +3930,7 @@ async function addTagToPreview(tag: string | undefined): Promise<void> {
 
 async function removeTagFromPreview(tag: string | undefined): Promise<void> {
   if (!tag) return;
-  const img = (lightboxImages.length ? lightboxImages : visibleImages)[lbIndex];
+  const img = currentPreviewImage();
   if (!img) return;
   const newTags = (img.user_tags || []).filter(t => normalizeTag(t) !== normalizeTag(tag));
   await saveTags(img.id, newTags);
@@ -3833,7 +3965,7 @@ function updateImageTags(id: string, updated: JsonRecord): void {
   }
   if (updatedImage) {
     setTagPool([...allTagPool, ...(updatedImage.tags || [])]);
-    const previewImage = (lightboxImages.length ? lightboxImages : visibleImages)[lbIndex];
+    const previewImage = currentPreviewImage();
     if (previewImage && previewImage.id === id) renderPreviewTags(previewImage);
     updateCardForImage(updatedImage);
     updateFishGhosts();
@@ -4493,6 +4625,43 @@ function restoreGalleryAnchor(anchor: {imageId: string; viewportTop: number} | n
     const delta = mounted.slot.getBoundingClientRect().top - anchor.viewportTop;
     if (Math.abs(delta) > 0.5) window.scrollTo(0, Math.max(0, window.scrollY + delta));
   });
+}
+
+function scheduleGalleryAnchorRestore(imageId: string): void {
+  pendingGalleryAnchorImageId = imageId;
+  requestAnimationFrame(() => restorePendingGalleryAnchor(imageId, 0));
+}
+
+function restorePendingGalleryAnchor(imageId: string, frame: number): void {
+  if (pendingGalleryAnchorImageId !== imageId) return;
+  if (previewModal?.isOpen || activeWorkspace !== 'gallery') {
+    pendingGalleryAnchorImageId = null;
+    return;
+  }
+  const index = visibleImages.findIndex(image => image.id === imageId);
+  if (index < 0) {
+    pendingGalleryAnchorImageId = null;
+    return;
+  }
+  const instance = ensureGalleryVirtualizer();
+  if (frame === 0) instance.scrollToIndex(index, {align: 'center', behavior: 'instant'});
+  renderVirtualGalleryRange(instance);
+  const mounted = mountedGalleryCards.get(imageId);
+  if (!mounted && frame < 2) {
+    requestAnimationFrame(() => restorePendingGalleryAnchor(imageId, frame + 1));
+    return;
+  }
+  if (mounted) {
+    const rect = mounted.slot.getBoundingClientRect();
+    const targetCenter = rect.top + rect.height / 2;
+    const viewportCenter = window.innerHeight / 2;
+    if (Math.abs(targetCenter - viewportCenter) > 1) {
+      window.scrollTo(0, Math.max(0, window.scrollY + targetCenter - viewportCenter));
+    }
+  }
+  pendingGalleryAnchorImageId = null;
+  saveActiveScroll();
+  saveSessionSoon();
 }
 
 function invalidateVirtualGallery(options: {preserveAnchor: boolean; resetCards: boolean}): void {
