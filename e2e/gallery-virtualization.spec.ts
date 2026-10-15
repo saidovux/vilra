@@ -155,7 +155,26 @@ async function loadAllSyntheticPages(page: Page, state: SyntheticState): Promise
   expect(state.servedThrough).toBe(TOTAL_IMAGES);
 }
 
-test('Gallery j and k scroll natively while modified variants stay unhandled', async ({page}) => {
+async function waitForKeyboardScroll(page: Page, start: number, direction: 1 | -1): Promise<number> {
+  if (direction > 0) {
+    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(start);
+  } else {
+    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeLessThan(start);
+  }
+  let previous = Number.NaN;
+  let stableSamples = 0;
+  await expect.poll(async () => {
+    const current = await page.evaluate(() => window.scrollY);
+    stableSamples = Number.isFinite(previous) && Math.abs(current - previous) < 1
+      ? stableSamples + 1
+      : 0;
+    previous = current;
+    return stableSamples;
+  }).toBeGreaterThanOrEqual(2);
+  return page.evaluate(() => window.scrollY);
+}
+
+test('Gallery j and k scrolling is smooth coalesced and reduced-motion aware', async ({page}) => {
   await installSyntheticGallery(page);
   await page.setViewportSize({width: 1366, height: 768});
   await page.goto('/');
@@ -167,10 +186,34 @@ test('Gallery j and k scroll natively while modified variants stay unhandled', a
   });
   const beforeDown = await page.evaluate(() => window.scrollY);
   await page.keyboard.press('j');
-  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(beforeDown);
+  const afterSingleDown = await waitForKeyboardScroll(page, beforeDown, 1);
+  const singleDownDistance = afterSingleDown - beforeDown;
+
+  await page.evaluate(() => window.scrollTo({top: 1200}));
+  const beforeRapidDown = await page.evaluate(() => window.scrollY);
+  for (let index = 0; index < 4; index += 1) await page.keyboard.press('j');
+  const afterRapidDown = await waitForKeyboardScroll(page, beforeRapidDown, 1);
+  expect(afterRapidDown - beforeRapidDown).toBeGreaterThan(singleDownDistance * 2);
+
+  await page.evaluate(() => window.scrollTo({top: 1600}));
   const beforeUp = await page.evaluate(() => window.scrollY);
   await page.keyboard.press('k');
-  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeLessThan(beforeUp);
+  const afterSingleUp = await waitForKeyboardScroll(page, beforeUp, -1);
+  const singleUpDistance = beforeUp - afterSingleUp;
+
+  await page.evaluate(() => window.scrollTo({top: 1600}));
+  const beforeRapidUp = await page.evaluate(() => window.scrollY);
+  for (let index = 0; index < 4; index += 1) await page.keyboard.press('k');
+  const afterRapidUp = await waitForKeyboardScroll(page, beforeRapidUp, -1);
+  expect(beforeRapidUp - afterRapidUp).toBeGreaterThan(singleUpDistance * 2);
+
+  await page.emulateMedia({reducedMotion: 'reduce'});
+  await page.evaluate(() => window.scrollTo({top: 1200}));
+  const reducedBefore = await page.evaluate(() => window.scrollY);
+  await page.keyboard.press('j');
+  const reducedAfter = await page.evaluate(() => window.scrollY);
+  expect(reducedAfter - reducedBefore).toBeGreaterThanOrEqual(90);
+  expect(reducedAfter - reducedBefore).toBeLessThanOrEqual(100);
 
   const beforeModifiedKeys = await page.evaluate(() => window.scrollY);
   await page.locator('body').dispatchEvent('keydown', {key: 'j', ctrlKey: true, bubbles: true, cancelable: true});

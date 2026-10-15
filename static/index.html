@@ -205,7 +205,6 @@
           <button id="match-all" type="button" data-action="set-match-mode" data-mode="all">Все</button>
         </div>
         <button class="btn btn-ghost btn-sm" data-action="clear-active-filters">Сбросить</button>
-        <button class="btn btn-ghost btn-sm" data-action="open-tag-manager">Список тегов</button>
         <button class="btn btn-ghost btn-sm" data-action="open-graph">Граф</button>
         <div class="filter-input-wrap">
           <div class="fish-field">
@@ -378,25 +377,6 @@
   <button type="button" data-quick-action="Reveal in folder">Reveal in folder</button>
   <button type="button" data-quick-action="Original">Original</button>
   <button type="button" data-quick-action="Delete">Delete</button>
-</div>
-
-<div id="tag-overlay">
-  <section id="tag-center">
-    <div class="tag-manager-row">
-      <button class="btn btn-primary" data-action="apply-tag-manager-selection">Принять</button>
-      <div id="tag-manager-selected"></div>
-      <button class="btn btn-ghost icon-btn" data-action="close-tag-manager">×</button>
-    </div>
-    <div id="tag-create-panel">
-      <div class="fish-field">
-        <div id="tag-create-ghost" class="fish-ghost"></div>
-        <input id="tag-create-input" type="text" placeholder="Новый тег" autocomplete="off">
-      </div>
-      <button class="btn btn-primary btn-sm" data-action="create-tag-from-manager">Создать</button>
-      <button class="btn btn-ghost btn-sm" data-action="toggle-create-tag-panel" data-open="false">Отмена</button>
-    </div>
-    <div id="tag-list"></div>
-  </section>
 </div>
 
 <div id="graph-overlay" aria-hidden="true">

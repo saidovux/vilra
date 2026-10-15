@@ -13,6 +13,7 @@ type Deferred = {
 type PreviewFixture = {
   controls: Map<string, Deferred>;
   originalRequests: string[];
+  tagRequests: Array<{id: string; tags: string[]}>;
 };
 
 type PreviewFixtureOptions = {
@@ -51,6 +52,7 @@ async function installPreviewFixture(page: Page, options: PreviewFixtureOptions 
   const ids = ['preview-a', 'preview-b', 'preview-c'];
   const controls = new Map(ids.map(id => [id, deferred()]));
   const originalRequests: string[] = [];
+  const tagRequests: Array<{id: string; tags: string[]}> = [];
 
   await page.route('**/api/events', route => route.abort());
   await page.route('**/api/session', async route => {
@@ -74,6 +76,18 @@ async function installPreviewFixture(page: Page, options: PreviewFixtureOptions 
     page: {total: ids.length, next_cursor: null, has_more: false},
   }}));
   await page.route('**/api/tags', route => route.fulfill({status: 200, json: {tags: ['hiking']}}));
+  await page.route('**/api/tag/preview-*', async route => {
+    const id = new URL(route.request().url()).pathname.split('/').pop() || '';
+    const body = route.request().postDataJSON() as {tags?: string[]};
+    const tags = Array.isArray(body.tags) ? body.tags : [];
+    tagRequests.push({id, tags});
+    await route.fulfill({status: 200, json: {
+      tags,
+      auto_tags: [],
+      folder_tags: [],
+      user_tags: tags,
+    }});
+  });
   await page.route('**/thumb-file/preview-*.jpg*', route => route.fulfill({
     status: 200,
     contentType: 'image/png',
@@ -95,7 +109,7 @@ async function installPreviewFixture(page: Page, options: PreviewFixtureOptions 
     await fulfillOriginal(route, control);
   });
 
-  return {controls, originalRequests};
+  return {controls, originalRequests, tagRequests};
 }
 
 async function openFixture(page: Page): Promise<void> {
@@ -138,6 +152,23 @@ test('Vilra selects disable native appearance and keep dark platform-independent
     expect(style.backgroundImage).not.toBe('none');
     expect(style.color).toBe('rgb(255, 255, 255)');
   }
+});
+
+test('Gallery tag suggestions replace the removed legacy tag manager and Ctrl+O focuses them', async ({page}) => {
+  await installPreviewFixture(page);
+  await openFixture(page);
+
+  await expect(page.getByText('Список тегов', {exact: true})).toHaveCount(0);
+  await expect(page.locator('[data-action="open-tag-manager"]')).toHaveCount(0);
+  await expect(page.locator('#tag-overlay')).toHaveCount(0);
+  await expect(page.locator('#tag-list')).toHaveCount(0);
+
+  await page.locator('#sidebar-tag-search').focus();
+  await page.keyboard.press('Control+KeyO');
+  const input = page.locator('#filter-tag-input');
+  await expect(input).toBeFocused();
+  await expect(page.locator('#filter-suggestion-list')).toBeVisible();
+  await expect(page.locator('#filter-suggestion-list')).toContainText('hiking');
 });
 
 test('preview opens thumbnail-first, upgrades to native original, and creates no natural-size canvas', async ({page}) => {
@@ -450,6 +481,89 @@ test('app layout shortcuts do not intercept text controls or contenteditable', a
   await expect(modal).not.toHaveClass(/preview-focus-mode/);
 });
 
+test('Viewer T reveals the inspector, focuses repeat tagging, and preserves Focus mode', async ({page}) => {
+  const fixture = await installPreviewFixture(page);
+  await openFixture(page);
+
+  await page.locator('.card[data-id="preview-a"]').click();
+  const modal = page.locator('#preview-modal');
+  const inspector = page.locator('#preview-inspector');
+  const input = page.locator('#preview-tag-input');
+
+  await page.keyboard.press('1');
+  await page.keyboard.press('i');
+  await expect(page.locator('#zoom-level')).toHaveText('120%');
+  const ctrlOPrevented = await modal.evaluate(element => {
+    const event = new KeyboardEvent('keydown', {
+      key: 'o',
+      code: 'KeyO',
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    element.dispatchEvent(event);
+    return event.defaultPrevented;
+  });
+  expect(ctrlOPrevented).toBe(true);
+  await expect(page.locator('#zoom-level')).toHaveText('120%');
+  await expect(page.locator('#filter-tag-input')).not.toBeFocused();
+  await page.keyboard.press('o');
+  await expect(page.locator('#zoom-level')).toHaveText('100%');
+
+  await page.keyboard.press('Control+b');
+  await expect(inspector).not.toBeVisible();
+  await page.keyboard.press('t');
+  await expect(inspector).toBeVisible();
+  await expect(input).toBeFocused();
+
+  await page.keyboard.type('alpha');
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#preview-user-tags')).toContainText('alpha');
+  await expect(input).toBeFocused();
+  await page.keyboard.type('beta');
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#preview-user-tags')).toContainText('beta');
+  await expect(input).toBeFocused();
+  expect(fixture.tagRequests).toEqual([
+    {id: 'preview-a', tags: ['alpha']},
+    {id: 'preview-a', tags: ['alpha', 'beta']},
+  ]);
+
+  await input.fill('');
+  await page.keyboard.type('q');
+  await expect(input).toHaveValue('q');
+  await expect(modal).toBeVisible();
+
+  await input.evaluate(element => element.blur());
+  await page.keyboard.press('Tab');
+  await expect(modal).toHaveClass(/preview-focus-mode/);
+  await expect(inspector).not.toBeVisible();
+  await page.keyboard.press('t');
+  await expect(modal).toHaveClass(/preview-focus-mode/);
+  await expect(inspector).toBeVisible();
+  await expect(input).toBeFocused();
+});
+
+test('Q closes Viewer, Settings, and Graph as an Escape alias', async ({page}) => {
+  await installPreviewFixture(page);
+  await openFixture(page);
+
+  await page.locator('#settings-toggle').click();
+  await expect(page.locator('#settings-panel')).toBeVisible();
+  await page.keyboard.press('q');
+  await expect(page.locator('#settings-panel')).not.toBeVisible();
+
+  await page.locator('#filter-bar [data-action="open-graph"]').click();
+  await expect(page.locator('#graph-overlay')).toBeVisible();
+  await page.keyboard.press('q');
+  await expect(page.locator('#graph-overlay')).not.toBeVisible();
+
+  await page.locator('.card[data-id="preview-a"]').click();
+  await expect(page.locator('#preview-modal')).toBeVisible();
+  await page.keyboard.press('q');
+  await expect(page.locator('#preview-modal')).not.toBeVisible();
+});
+
 test('application tab shortcuts create close and select tabs even from text input', async ({page}) => {
   await installPreviewFixture(page);
   await openFixture(page);
@@ -522,7 +636,7 @@ test('viewer quick actions open for the current image by right click and Space',
   await page.keyboard.press('Space');
   await expect(menu).toBeVisible();
   await expect(menu).toHaveAttribute('data-image-id', 'preview-b');
-  await page.keyboard.press('Escape');
+  await page.keyboard.press('q');
   await expect(menu).not.toBeVisible();
   await expect(modal).toBeVisible();
 

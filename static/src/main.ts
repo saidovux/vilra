@@ -23,10 +23,12 @@ type SettingsTab = 'general' | 'tags' | 'graph' | 'problems';
 type AppWorkspace = 'gallery' | 'settings';
 type ShortcutContext = 'gallery' | 'viewer' | 'settings' | 'graph' | 'blocked';
 type AppCommand =
+  | 'ui.consumeShortcut'
   | 'ui.toggleFocus'
   | 'ui.toggleSidePanel'
   | 'gallery.newTab'
   | 'gallery.closeTab'
+  | 'gallery.focusTagSearch'
   | 'gallery.moveDown'
   | 'gallery.moveUp'
   | 'viewer.panLeft'
@@ -40,6 +42,7 @@ type AppCommand =
   | 'viewer.fit'
   | 'viewer.actualSize'
   | 'viewer.quickMenu'
+  | 'viewer.focusTagInput'
   | 'viewer.close'
   | 'settings.close'
   | 'graph.close';
@@ -936,7 +939,6 @@ const selectedImageIds = new Set<string>();
 let previewRequestToken = 0;
 let suppressPreviewCloseClear = false;
 let suppressedPreviewRestoreId: string | null = null;
-let tagManagerSelection: Pick<GalleryTab, 'includeTags' | 'excludeTags'> = {includeTags: [], excludeTags: []};
 let latestStatus: StatusResponse | null = null;
 let filterSuggestionOpen = false;
 let settingsActiveTab: SettingsTab = 'general';
@@ -981,11 +983,17 @@ let thumbLifecycleGeneration = 0;
 let thumbnailAdmissionFrame: number | null = null;
 let thumbnailScrollSettleTimer: ReturnType<typeof setTimeout> | null = null;
 let terminalGalleryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let galleryKeyboardScrollTarget: number | null = null;
+let galleryKeyboardScrollDirection = 0;
+let galleryKeyboardScrollFrame: number | null = null;
+let galleryKeyboardScrollLastTimestamp: number | null = null;
 const PAGE = 48;
 const MASONRY_COL_MIN = 218;
 const GALLERY_OVERSCAN = 20;
 const CARD_BORDER_WIDTH = 1;
 const GALLERY_KEYBOARD_SCROLL_STEP = 96;
+const GALLERY_KEYBOARD_SCROLL_SPEED = 900;
+const GALLERY_KEYBOARD_SCROLL_MAX_BACKLOG = GALLERY_KEYBOARD_SCROLL_STEP * 6;
 const VIEWER_KEYBOARD_PAN_STEP = 80;
 const THUMB_VELOCITY_EMA_ALPHA = 0.35;
 const THUMB_FAST_ENTER_THRESHOLD = 1.25;
@@ -2776,127 +2784,15 @@ function initFilterInput(): void {
   });
 }
 
-function openTagManager(): void {
-  const tab = activeTab();
-  tagManagerSelection = {
-    includeTags: [...(tab.includeTags || [])],
-    excludeTags: [...(tab.excludeTags || [])]
-  };
-  requiredHtml('tag-overlay').classList.add('open');
-  toggleCreateTagPanel(false);
-  renderTagManager();
-}
-
-function closeTagManager(): void {
-  requiredHtml('tag-overlay').classList.remove('open');
-}
-
-function renderTagManager(): void {
-  const selectedInclude = new Set((tagManagerSelection.includeTags || []).map(normalizeTag));
-  const selectedExclude = new Set((tagManagerSelection.excludeTags || []).map(normalizeTag));
-  const selectedEl = requiredHtml('tag-manager-selected');
-  selectedEl.innerHTML = [
-    ...(tagManagerSelection.includeTags || []).map(tag => renderTagChip(tag, {
-      removable: true,
-      actionKind: 'include',
-      className: 'filter-chip'
-    })),
-    ...(tagManagerSelection.excludeTags || []).map(tag => renderTagChip(tag, {
-      removable: true,
-      exclude: true,
-      actionKind: 'exclude',
-      className: 'filter-chip'
-    }))
-  ].join('') || '<span class="muted-inline">Выберите теги ниже</span>';
-  selectedEl.querySelectorAll<HTMLElement>('button[data-tag]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      removeManagerTag(btn.dataset.kind, btn.dataset.tag);
-      renderTagManager();
-    });
-  });
-  const list = requiredHtml('tag-list');
-  list.innerHTML = `<button class="tag-option add" data-action="toggle-create-tag-panel" data-open="true" title="Создать тег">+</button>` +
-    allTagPool.map(tag => `
-      <span class="tag-choice ${selectedInclude.has(normalizeTag(tag)) ? 'include' : ''} ${selectedExclude.has(normalizeTag(tag)) ? 'exclude' : ''}">
-        <button class="tag-choice-name" data-kind="include" data-tag="${escAttr(tag)}">${renderTagChip(tag, {count: true})}</button>
-        <button class="tag-choice-anti" data-kind="exclude" data-tag="${escAttr(tag)}">!</button>
-      </span>
-    `).join('');
-  list.querySelectorAll<HTMLElement>('.tag-choice button[data-tag]').forEach(btn => {
-    btn.addEventListener('click', () => toggleManagerTag(btn.dataset.kind, btn.dataset.tag));
-  });
-}
-
-function removeManagerTag(kind: string | undefined, tag: string | undefined): void {
-  if (!tag) return;
-  const norm = normalizeTag(tag);
-  const key: 'includeTags' | 'excludeTags' = normalizeTagKind(kind) === 'exclude' ? 'excludeTags' : 'includeTags';
-  tagManagerSelection[key] = (tagManagerSelection[key] || []).filter(item => normalizeTag(item) !== norm);
-}
-
-function toggleManagerTag(kind: string | undefined, tag: string | undefined): void {
-  if (!tag) return;
-  const value = findDisplayTag(tag);
-  const norm = normalizeTag(value);
-  const normalizedKind = normalizeTagKind(kind);
-  const key: 'includeTags' | 'excludeTags' = normalizedKind === 'exclude' ? 'excludeTags' : 'includeTags';
-  const oppositeKey: 'includeTags' | 'excludeTags' = normalizedKind === 'exclude' ? 'includeTags' : 'excludeTags';
-  if ((tagManagerSelection[key] || []).some(item => normalizeTag(item) === norm)) {
-    removeManagerTag(kind, value);
-  } else {
-    tagManagerSelection[oppositeKey] = (tagManagerSelection[oppositeKey] || []).filter(item => normalizeTag(item) !== norm);
-    tagManagerSelection[key] = dedupeDisplayTags([...(tagManagerSelection[key] || []), value]);
-  }
-  renderTagManager();
-}
-
-function applyTagManagerSelection(): void {
-  activeTab().includeTags = dedupeDisplayTags(tagManagerSelection.includeTags || []);
-  activeTab().excludeTags = dedupeDisplayTags(tagManagerSelection.excludeTags || []);
-  closeTagManager();
-  refreshImages(true);
-  saveSessionSoon();
-}
-
-function toggleCreateTagPanel(open?: boolean): void {
-  const panel = requiredHtml('tag-create-panel');
-  panel.classList.toggle('open', Boolean(open));
-  if (open) {
-    requiredInput('tag-create-input').value = '';
-    updateFishGhosts();
-    setTimeout(() => requiredInput('tag-create-input').focus(), 0);
-  }
-}
-
-async function createTagFromManager(): Promise<void> {
-  const input = requiredInput('tag-create-input');
-  const value = input.value.trim();
-  if (!value) return;
-  try {
-    const r = await fetch('/api/tags', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({name: value})
-    });
-    if (!r.ok) throw new Error(await readError(r));
-    const d = await readJsonRecord(r);
-    setTagPool(d.tags || [...allTagPool, d.tag || value]);
-    const createdName = tagName(d.tag || value);
-    tagManagerSelection.includeTags = dedupeDisplayTags([...(tagManagerSelection.includeTags || []), createdName]);
-    tagManagerSelection.excludeTags = (tagManagerSelection.excludeTags || []).filter(tag => normalizeTag(tag) !== normalizeTag(createdName));
-    input.value = '';
-    toggleCreateTagPanel(false);
-    renderTagManager();
-    renderTagAdmin();
-    updateFishGhosts();
-  } catch (e) {
-    alert('Ошибка: ' + errorMessage(e));
-  }
+function focusGalleryTagSearch(): void {
+  const input = requiredInput('filter-tag-input');
+  input.focus({preventScroll: true});
+  filterSuggestionOpen = true;
+  renderFilterSuggestions();
 }
 
 function renderAllTagSurfaces(): void {
   renderFilterControls();
-  if (requiredHtml('tag-overlay').classList.contains('open')) renderTagManager();
   renderTagAdmin();
   visibleImages.forEach(updateCardForImage);
   const previewImage = (lightboxImages.length ? lightboxImages : visibleImages)[lbIndex];
@@ -3502,11 +3398,7 @@ function initFishInputs(): void {
     initFishInput('preview-tag-input', 'preview-tag-ghost', () => {
       const img = (lightboxImages.length ? lightboxImages : visibleImages)[lbIndex];
       return img ? img.tags || [] : [];
-    }, tag => addTagToPreview(tag)),
-    initFishInput('tag-create-input', 'tag-create-ghost', () => [], tag => {
-      requiredInput('tag-create-input').value = tag;
-      createTagFromManager();
-    })
+    }, tag => addTagToPreview(tag))
   ];
 }
 
@@ -3773,6 +3665,13 @@ function togglePreviewInspector(): void {
   refreshPreviewLayout();
 }
 
+function focusPreviewTagInput(): void {
+  if (!previewModal?.isOpen) return;
+  closePreviewQuickMenu();
+  if (!previewInspectorVisible) togglePreviewInspector();
+  requiredInput('preview-tag-input').focus({preventScroll: true});
+}
+
 function resetPreviewUiState(): void {
   previewFocusMode = false;
   previewInspectorVisible = true;
@@ -3834,7 +3733,9 @@ function initPreviewQuickMenu(): void {
     if (target && !menu.contains(target)) closePreviewQuickMenu();
   });
   document.addEventListener('keydown', event => {
-    if (event.key === 'Escape' && menu.classList.contains('open')) {
+    const closeShortcut = event.key === 'Escape'
+      || (isPlainCode(event, 'KeyQ') && !isTextEntryTarget(event.target));
+    if (closeShortcut && menu.classList.contains('open')) {
       event.preventDefault();
       event.stopImmediatePropagation();
       closePreviewQuickMenu();
@@ -3950,11 +3851,66 @@ function restorePreviewIfNeeded(): void {
   if (previewModal && !previewModal.isOpen) openLightboxById(tab.lastImageId, false);
 }
 
+function galleryScrollLimit(): number {
+  return Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+}
+
+function cancelGalleryKeyboardScroll(): void {
+  if (galleryKeyboardScrollFrame !== null) cancelAnimationFrame(galleryKeyboardScrollFrame);
+  galleryKeyboardScrollFrame = null;
+  galleryKeyboardScrollTarget = null;
+  galleryKeyboardScrollDirection = 0;
+  galleryKeyboardScrollLastTimestamp = null;
+}
+
+function animateGalleryKeyboardScroll(timestamp: number): void {
+  galleryKeyboardScrollFrame = null;
+  if (galleryKeyboardScrollTarget === null) return;
+  galleryKeyboardScrollTarget = clamp(galleryKeyboardScrollTarget, 0, galleryScrollLimit());
+  const current = window.scrollY;
+  const remaining = galleryKeyboardScrollTarget - current;
+  if (Math.abs(remaining) <= 0.5) {
+    window.scrollTo({top: galleryKeyboardScrollTarget, behavior: 'auto'});
+    cancelGalleryKeyboardScroll();
+    return;
+  }
+
+  const previousTimestamp = galleryKeyboardScrollLastTimestamp ?? timestamp;
+  const elapsed = clamp(timestamp - previousTimestamp, 0, 50);
+  galleryKeyboardScrollLastTimestamp = timestamp;
+  const distance = Math.min(Math.abs(remaining), GALLERY_KEYBOARD_SCROLL_SPEED * elapsed / 1000);
+  window.scrollTo({top: current + Math.sign(remaining) * distance, behavior: 'auto'});
+  galleryKeyboardScrollFrame = requestAnimationFrame(animateGalleryKeyboardScroll);
+}
+
+function queueGalleryKeyboardScroll(delta: number): void {
+  const current = window.scrollY;
+  const limit = galleryScrollLimit();
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    cancelGalleryKeyboardScroll();
+    window.scrollTo({top: clamp(current + delta, 0, limit), behavior: 'auto'});
+    return;
+  }
+
+  const direction = Math.sign(delta);
+  const continuing = galleryKeyboardScrollDirection === direction && galleryKeyboardScrollTarget !== null;
+  const base = continuing ? galleryKeyboardScrollTarget as number : current;
+  galleryKeyboardScrollTarget = clamp(
+    base + delta,
+    Math.max(0, current - GALLERY_KEYBOARD_SCROLL_MAX_BACKLOG),
+    Math.min(limit, current + GALLERY_KEYBOARD_SCROLL_MAX_BACKLOG),
+  );
+  galleryKeyboardScrollDirection = direction;
+  if (galleryKeyboardScrollFrame === null) {
+    galleryKeyboardScrollLastTimestamp = performance.now();
+    galleryKeyboardScrollFrame = requestAnimationFrame(animateGalleryKeyboardScroll);
+  }
+}
+
 function resolveShortcutContext(): ShortcutContext {
   if (graphState?.open) return 'graph';
   if (activeWorkspace === 'settings') return 'settings';
   if (previewModal?.isOpen) return 'viewer';
-  if (requiredHtml('tag-overlay').classList.contains('open')) return 'blocked';
   return activeWorkspace === 'gallery' ? 'gallery' : 'blocked';
 }
 
@@ -3962,12 +3918,20 @@ function isPlainCharacter(event: KeyboardEvent, key: string): boolean {
   return event.key === key && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey;
 }
 
+function isPlainCode(event: KeyboardEvent, code: string): boolean {
+  return event.code === code && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey;
+}
+
 function resolveShortcut(event: KeyboardEvent, context: ShortcutContext): AppCommand | null {
   const controlOnly = event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey;
   if (controlOnly && event.code === 'KeyT') return 'gallery.newTab';
   if (controlOnly && event.code === 'KeyW') return 'gallery.closeTab';
+  if (controlOnly && event.code === 'KeyO') {
+    if (context === 'gallery') return 'gallery.focusTagSearch';
+    if (context === 'viewer') return 'ui.consumeShortcut';
+  }
 
-  if (event.key === 'Escape') {
+  if (event.key === 'Escape' || isPlainCode(event, 'KeyQ')) {
     if (context === 'viewer') return 'viewer.close';
     if (context === 'settings') return 'settings.close';
     if (context === 'graph') return 'graph.close';
@@ -3994,6 +3958,7 @@ function resolveShortcut(event: KeyboardEvent, context: ShortcutContext): AppCom
   if (isPlainCharacter(event, 'l')) return 'viewer.panRight';
   if (isPlainCharacter(event, 'i')) return 'viewer.zoomIn';
   if (isPlainCharacter(event, 'o')) return 'viewer.zoomOut';
+  if (isPlainCode(event, 'KeyT')) return 'viewer.focusTagInput';
   if (isPlainCharacter(event, 'p')) return 'viewer.previousImage';
   if (isPlainCharacter(event, 'n')) return 'viewer.nextImage';
   if (event.key === 'ArrowRight') return 'viewer.nextImage';
@@ -4008,6 +3973,8 @@ function resolveShortcut(event: KeyboardEvent, context: ShortcutContext): AppCom
 
 function dispatchCommand(command: AppCommand, context: ShortcutContext): void {
   switch (command) {
+    case 'ui.consumeShortcut':
+      break;
     case 'ui.toggleFocus':
       if (context === 'viewer') togglePreviewFocusMode();
       else if (context === 'gallery') toggleGalleryFocusMode();
@@ -4022,11 +3989,14 @@ function dispatchCommand(command: AppCommand, context: ShortcutContext): void {
     case 'gallery.closeTab':
       closeTab(activeTab().id);
       break;
+    case 'gallery.focusTagSearch':
+      focusGalleryTagSearch();
+      break;
     case 'gallery.moveDown':
-      window.scrollBy({top: GALLERY_KEYBOARD_SCROLL_STEP, behavior: 'auto'});
+      queueGalleryKeyboardScroll(GALLERY_KEYBOARD_SCROLL_STEP);
       break;
     case 'gallery.moveUp':
-      window.scrollBy({top: -GALLERY_KEYBOARD_SCROLL_STEP, behavior: 'auto'});
+      queueGalleryKeyboardScroll(-GALLERY_KEYBOARD_SCROLL_STEP);
       break;
     case 'viewer.panLeft':
       previewModal?.panBy(VIEWER_KEYBOARD_PAN_STEP, 0);
@@ -4061,6 +4031,9 @@ function dispatchCommand(command: AppCommand, context: ShortcutContext): void {
     case 'viewer.quickMenu':
       openPreviewQuickMenu(window.innerWidth / 2 - 90, window.innerHeight / 2 - 120);
       break;
+    case 'viewer.focusTagInput':
+      focusPreviewTagInput();
+      break;
     case 'viewer.close':
       previewModal?.close();
       break;
@@ -4086,7 +4059,10 @@ document.addEventListener('keydown', event => {
   }
   const command = resolveShortcut(event, context);
   const preserveContextEscape = event.key === 'Escape' && (context === 'settings' || context === 'graph');
-  const applicationCommand = command === 'gallery.newTab' || command === 'gallery.closeTab';
+  const applicationCommand = command === 'gallery.newTab'
+    || command === 'gallery.closeTab'
+    || command === 'gallery.focusTagSearch'
+    || command === 'ui.consumeShortcut';
   if (isTextEntryTarget(event.target) && !preserveContextEscape && !applicationCommand) return;
   if (!command) return;
   event.preventDefault();
@@ -4866,9 +4842,6 @@ function runAction(actionEl: HTMLElement): void {
     case 'add-tag-from-preview-input':
       addTagFromPreviewInput();
       break;
-    case 'apply-tag-manager-selection':
-      applyTagManagerSelection();
-      break;
     case 'clear-active-filters':
       clearActiveFilters();
       break;
@@ -4880,12 +4853,6 @@ function runAction(actionEl: HTMLElement): void {
       break;
     case 'close-graph':
       closeGraph();
-      break;
-    case 'close-tag-manager':
-      closeTagManager();
-      break;
-    case 'create-tag-from-manager':
-      createTagFromManager();
       break;
     case 'create-tag-from-settings':
       createTagFromSettings();
@@ -4901,9 +4868,6 @@ function runAction(actionEl: HTMLElement): void {
       break;
     case 'open-gallery-diagnostics':
       galleryDiagnostics.openPanel();
-      break;
-    case 'open-tag-manager':
-      openTagManager();
       break;
     case 'show-gallery-view':
       showGalleryView();
@@ -4962,9 +4926,6 @@ function runAction(actionEl: HTMLElement): void {
     case 'set-settings-tab':
       setSettingsTab(actionEl.dataset.settingsTab);
       break;
-    case 'toggle-create-tag-panel':
-      toggleCreateTagPanel(actionEl.dataset.open !== 'false');
-      break;
     case 'toggle-folder-sidebar':
       toggleFolderSidebar();
       break;
@@ -5006,10 +4967,6 @@ function initActionBindings(): void {
   });
 }
 
-requiredHtml('tag-overlay').addEventListener('click', e => {
-  if (e.target === requiredHtml('tag-overlay')) closeTagManager();
-});
-
 requiredHtml('graph-overlay').addEventListener('click', e => {
   if (e.target === requiredHtml('graph-overlay')) closeGraph();
 });
@@ -5038,6 +4995,7 @@ requiredInput('tag-admin-create').addEventListener('keydown', e => {
   if (e.key === 'Enter') createTagFromSettings();
 });
 window.addEventListener('scroll', updateScrollTopButton, {passive: true});
+window.addEventListener('wheel', cancelGalleryKeyboardScroll, {passive: true});
 window.addEventListener('resize', () => {
   handleGalleryResize();
   if (graphState && graphState.open) rebuildGraph();

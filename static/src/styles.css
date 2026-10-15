@@ -566,82 +566,6 @@ input::placeholder { color: var(--faint); }
 .preview-chip { padding: 2px 8px 2px 10px; }
 #preview-tag-input { width: 220px; font-family: var(--font-mono); font-size: 12px; }
 
-#tag-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 1200;
-  display: none;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  background: rgba(0, 0, 0, .58);
-}
-#tag-overlay.open { display: flex; }
-#tag-center {
-  width: min(820px, 100%);
-  max-height: min(680px, calc(100vh - 48px));
-  border: 1px solid var(--border-strong);
-  border-radius: 10px;
-  background: var(--panel);
-  box-shadow: 0 28px 80px rgba(0,0,0,.55);
-  display: grid;
-  grid-template-rows: auto auto minmax(180px, 1fr);
-  overflow: hidden;
-}
-.tag-manager-row {
-  border-bottom: 1px solid var(--border);
-  padding: 10px;
-  display: grid;
-  grid-template-columns: auto minmax(120px, 1fr) auto;
-  gap: 10px;
-  align-items: center;
-}
-#tag-manager-selected {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-  min-height: 30px;
-  align-items: center;
-}
-#tag-create-panel {
-  display: none;
-  grid-template-columns: minmax(160px, 1fr) auto auto;
-  gap: 8px;
-  padding: 10px;
-  border-bottom: 1px solid var(--border);
-  background: var(--panel-2);
-}
-#tag-create-panel.open { display: grid; }
-#tag-list {
-  padding: 10px;
-  overflow-y: auto;
-  display: flex;
-  flex-wrap: wrap;
-  align-content: flex-start;
-  gap: 7px;
-}
-.tag-option {
-  min-height: 30px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--panel-2);
-  color: var(--text);
-  padding: 0 11px;
-  cursor: pointer;
-}
-.tag-option:hover { border-color: var(--accent); }
-.tag-option.selected {
-  background: var(--accent-soft);
-  border-color: var(--accent);
-  color: var(--accent-strong);
-}
-.tag-option.add {
-  width: 34px;
-  padding: 0;
-  border-radius: 50%;
-  font-size: 18px;
-}
-
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: var(--bg); }
 ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; }
@@ -652,9 +576,7 @@ input::placeholder { color: var(--faint); }
   #filter-bar,
   #statusbar,
   .preview-info,
-  #preview-tag-panel,
-  .tag-manager-row,
-  #tag-create-panel {
+  #preview-tag-panel {
     grid-template-columns: 1fr;
   }
   #folder-strip, .top-actions, .preview-user-tools { flex-wrap: wrap; justify-content: stretch; }
@@ -979,80 +901,6 @@ body.modal-open { overflow: hidden; }
 }
 .preview-pick-tag:hover { border-color: var(--accent); color: var(--accent-strong); }
 
-#tag-overlay {
-  background: rgba(0,0,0,.62);
-  backdrop-filter: blur(10px);
-}
-#tag-center {
-  border: 0;
-  border-radius: 12px;
-  background: rgba(10,10,10,.48);
-  backdrop-filter: blur(18px);
-  box-shadow: none;
-  gap: 10px;
-  padding: 10px;
-  grid-template-rows: auto auto minmax(180px, 1fr);
-}
-.tag-manager-row,
-#tag-create-panel,
-#tag-list {
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: rgba(10,10,10,.72);
-  backdrop-filter: blur(16px);
-}
-.tag-manager-row { border-bottom: 1px solid var(--border); }
-#tag-create-panel { border-bottom: 1px solid var(--border); }
-#tag-manager-selected {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-}
-.tag-selection-pane {
-  min-width: 0;
-  display: grid;
-  gap: 5px;
-  align-content: start;
-}
-.tag-selection-title {
-  color: var(--faint);
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: .04em;
-}
-.tag-option {
-  border-radius: 999px;
-  background: rgba(17,17,17,.74);
-  border-color: var(--border);
-}
-.tag-choice {
-  display: inline-flex;
-  align-items: stretch;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  overflow: hidden;
-  background: rgba(17,17,17,.72);
-}
-.tag-choice button {
-  min-height: 30px;
-  border: 0;
-  background: transparent;
-  color: var(--text);
-  cursor: pointer;
-}
-.tag-choice-name { padding: 0 10px; }
-.tag-choice-anti {
-  width: 32px;
-  border-left: 1px solid var(--border) !important;
-  color: var(--accent) !important;
-}
-.tag-choice.include .tag-choice-name,
-.tag-choice.exclude .tag-choice-anti {
-  background: var(--accent);
-  color: #000 !important;
-  font-weight: 750;
-}
-
 @media (max-width: 900px) {
   html,
   body,
@@ -1100,8 +948,7 @@ body.modal-open { overflow: hidden; }
   #filter-bar,
   .settings-inline,
   #preview-tag-panel,
-  .preview-info,
-  #tag-manager-selected {
+  .preview-info {
     grid-template-columns: 1fr;
   }
   #preview-dock { bottom: 10px; width: calc(100vw - 20px); }
@@ -1269,61 +1116,6 @@ body.modal-open { overflow: hidden; }
   font-family: var(--font-mono);
   font-size: 11px;
   align-self: center;
-}
-
-#tag-center {
-  width: fit-content;
-  max-width: min(900px, calc(100vw - 48px));
-  max-height: min(680px, calc(100vh - 48px));
-  background: rgba(10,10,10,.28);
-  backdrop-filter: blur(20px);
-  gap: 12px;
-  grid-template-rows: auto auto minmax(0, auto);
-  overflow: visible;
-}
-.tag-manager-row,
-#tag-create-panel,
-#tag-list {
-  border: 0;
-  background: rgba(0,0,0,.30);
-  backdrop-filter: blur(18px);
-}
-.tag-manager-row {
-  border-radius: 9px;
-  grid-template-columns: auto minmax(120px, 1fr) auto;
-}
-#tag-manager-selected {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-#tag-list {
-  min-height: 0;
-  max-height: min(420px, 52vh);
-  width: fit-content;
-  max-width: 100%;
-  border-radius: 9px;
-  overflow-y: auto;
-}
-.tag-choice {
-  background: rgba(0,0,0,.42);
-  backdrop-filter: blur(12px);
-}
-.tag-choice-name {
-  min-width: 0;
-  max-width: 170px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.tag-choice .tag-chip-base {
-  border: 0;
-  background: transparent;
-  box-shadow: none;
-}
-.tag-choice.include .tag-choice-name,
-.tag-choice.exclude .tag-choice-anti {
-  background: var(--accent);
-  color: #000 !important;
 }
 
 #tag-admin-list {
@@ -2140,18 +1932,6 @@ body.modal-open { overflow: hidden; }
 .tag-chip-base.is-exclude {
   background: rgba(var(--tag-rgb), .14);
 }
-.tag-choice.include .tag-choice-name,
-.tag-choice.exclude .tag-choice-anti {
-  background: #E5E5E5;
-  color: #050505 !important;
-}
-.tag-choice.include .tag-choice-name .tag-chip-base,
-.tag-choice.exclude .tag-choice-anti .tag-chip-base,
-.tag-choice.include .tag-choice-name .tag-count,
-.tag-choice.exclude .tag-choice-anti .tag-count {
-  color: #050505 !important;
-}
-
 #scroll-top-btn {
   left: auto;
   right: 16px;

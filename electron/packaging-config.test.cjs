@@ -47,9 +47,9 @@ test('electron-builder configuration is valid, explicit, and AppImage-only', asy
 test('package scripts keep dev runtime and make Electron build self-contained', () => {
   const packageJson = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
   const packageLock = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package-lock.json'), 'utf8'));
-  assert.equal(packageJson.version, '0.2.0');
-  assert.equal(packageLock.version, '0.2.0');
-  assert.equal(packageLock.packages[''].version, '0.2.0');
+  assert.equal(packageJson.version, '0.2.1');
+  assert.equal(packageLock.version, '0.2.1');
+  assert.equal(packageLock.packages[''].version, '0.2.1');
   assert.equal(packageJson.desktopName, 'Vilra');
   assert.equal(packageJson.main, 'electron/main.cjs');
   assert.ok(packageJson.scripts['electron:dev'].includes('electron:prepare'));
