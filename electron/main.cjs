@@ -1,4 +1,4 @@
-const {app, BrowserWindow, dialog, ipcMain, shell} = require('electron');
+const {app, BrowserWindow, dialog, ipcMain, Menu, shell} = require('electron');
 const {execFileSync, spawn} = require('node:child_process');
 const fs = require('node:fs');
 const net = require('node:net');
@@ -322,6 +322,7 @@ async function createMainWindow(port) {
       sandbox: true,
     },
   });
+  window.setMenu(null);
   mainWindow = window;
   window.once('closed', () => {
     mainWindow = null;
@@ -394,7 +395,10 @@ process.on('SIGINT', () => app.quit());
 process.on('SIGTERM', () => app.quit());
 
 app.whenReady()
-  .then(startRuntime)
+  .then(() => {
+    Menu.setApplicationMenu(null);
+    return startRuntime();
+  })
   .catch(error => {
     console.error(`[electron] startup failed: ${error.stack || error}`);
     return fatalExit(1);

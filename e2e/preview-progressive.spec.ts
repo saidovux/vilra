@@ -306,11 +306,11 @@ test('viewer Focus and Inspector controls preserve layout state through navigati
   expect(focusedImageStage!.width).toBeGreaterThan(1);
   expect(focusedImageStage!.height).toBeGreaterThan(1);
 
-  await page.keyboard.press('p');
+  await page.keyboard.press('n');
   await expect(modal).toHaveAttribute('data-image-id', 'preview-b');
   await expect(modal).toHaveClass(/preview-focus-mode/);
   await expect(modal).toHaveClass(/preview-inspector-hidden/);
-  await page.keyboard.press('p');
+  await page.keyboard.press('n');
   await expect(modal).toHaveAttribute('data-image-id', 'preview-c');
   await expect(modal).toHaveClass(/preview-focus-mode/);
 
@@ -328,7 +328,7 @@ test('viewer Focus and Inspector controls preserve layout state through navigati
   expect(Math.abs(focusInspector!.x - (viewport!.width - 292))).toBeLessThanOrEqual(1);
   expect(Math.abs(focusInspector!.y)).toBeLessThanOrEqual(1);
   expect(Math.abs(focusInspector!.height - viewport!.height)).toBeLessThanOrEqual(1);
-  await page.keyboard.press('n');
+  await page.keyboard.press('p');
   await expect(modal).toHaveAttribute('data-image-id', 'preview-b');
   await expect(modal).toHaveClass(/preview-focus-mode/);
   await expect(modal).not.toHaveClass(/preview-inspector-hidden/);
@@ -448,6 +448,49 @@ test('app layout shortcuts do not intercept text controls or contenteditable', a
   await page.keyboard.press('Tab');
   await expect(previewInput).toHaveValue('hiking');
   await expect(modal).not.toHaveClass(/preview-focus-mode/);
+});
+
+test('application tab shortcuts create close and select tabs even from text input', async ({page}) => {
+  await installPreviewFixture(page);
+  await openFixture(page);
+
+  const tabs = page.locator('#tabs .tab[data-tab]');
+  const activeTab = page.locator('#tabs .tab.active[data-tab]');
+  await expect(tabs).toHaveCount(1);
+  const firstId = await activeTab.getAttribute('data-tab');
+
+  await page.locator('#filter-tag-input').focus();
+  await page.keyboard.press('Control+t');
+  await expect(tabs).toHaveCount(2);
+  const secondId = await activeTab.getAttribute('data-tab');
+  expect(secondId).not.toBe(firstId);
+
+  await page.locator('#filter-tag-input').focus();
+  await page.keyboard.press('Control+t');
+  await expect(tabs).toHaveCount(3);
+  const thirdId = await activeTab.getAttribute('data-tab');
+  expect(thirdId).not.toBe(secondId);
+
+  await page.locator('#filter-tag-input').focus();
+  await page.keyboard.press('Alt+Digit1');
+  await expect(activeTab).toHaveAttribute('data-tab', firstId || '');
+  await page.keyboard.press('Alt+Digit2');
+  await expect(activeTab).toHaveAttribute('data-tab', secondId || '');
+  await page.keyboard.press('Alt+Digit3');
+  await expect(activeTab).toHaveAttribute('data-tab', thirdId || '');
+  await page.keyboard.press('Alt+Digit9');
+  await expect(activeTab).toHaveAttribute('data-tab', thirdId || '');
+
+  await page.locator('#filter-tag-input').focus();
+  await page.keyboard.press('Control+w');
+  await expect(tabs).toHaveCount(2);
+  await expect(activeTab).toHaveAttribute('data-tab', secondId || '');
+  await page.keyboard.press('Control+w');
+  await expect(tabs).toHaveCount(1);
+  await page.keyboard.press('Control+w');
+  await expect(tabs).toHaveCount(1);
+  await expect(page.locator('#gallery-screen')).toBeVisible();
+  await expect(page.locator('.card[data-id="preview-a"]')).toBeVisible();
 });
 
 test('viewer quick actions open for the current image by right click and Space', async ({page}) => {

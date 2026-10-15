@@ -25,6 +25,8 @@ type ShortcutContext = 'gallery' | 'viewer' | 'settings' | 'graph' | 'blocked';
 type AppCommand =
   | 'ui.toggleFocus'
   | 'ui.toggleSidePanel'
+  | 'gallery.newTab'
+  | 'gallery.closeTab'
   | 'gallery.moveDown'
   | 'gallery.moveUp'
   | 'viewer.panLeft'
@@ -2505,6 +2507,11 @@ function closeTab(id: string): void {
   saveSessionSoon();
 }
 
+function switchTabByVisibleIndex(index: number): void {
+  const tab = tabs[index];
+  if (tab) switchTab(tab.id);
+}
+
 function renderTabs(): void {
   const el = requiredHtml('tabs');
   el.innerHTML = tabs.map(tab => `
@@ -3956,6 +3963,10 @@ function isPlainCharacter(event: KeyboardEvent, key: string): boolean {
 }
 
 function resolveShortcut(event: KeyboardEvent, context: ShortcutContext): AppCommand | null {
+  const controlOnly = event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey;
+  if (controlOnly && event.code === 'KeyT') return 'gallery.newTab';
+  if (controlOnly && event.code === 'KeyW') return 'gallery.closeTab';
+
   if (event.key === 'Escape') {
     if (context === 'viewer') return 'viewer.close';
     if (context === 'settings') return 'settings.close';
@@ -3983,8 +3994,8 @@ function resolveShortcut(event: KeyboardEvent, context: ShortcutContext): AppCom
   if (isPlainCharacter(event, 'l')) return 'viewer.panRight';
   if (isPlainCharacter(event, 'i')) return 'viewer.zoomIn';
   if (isPlainCharacter(event, 'o')) return 'viewer.zoomOut';
-  if (isPlainCharacter(event, 'p')) return 'viewer.nextImage';
-  if (isPlainCharacter(event, 'n')) return 'viewer.previousImage';
+  if (isPlainCharacter(event, 'p')) return 'viewer.previousImage';
+  if (isPlainCharacter(event, 'n')) return 'viewer.nextImage';
   if (event.key === 'ArrowRight') return 'viewer.nextImage';
   if (event.key === 'ArrowLeft') return 'viewer.previousImage';
   if (event.key.toLowerCase() === 'f') return 'viewer.fit';
@@ -4004,6 +4015,12 @@ function dispatchCommand(command: AppCommand, context: ShortcutContext): void {
     case 'ui.toggleSidePanel':
       if (context === 'viewer') togglePreviewInspector();
       else if (context === 'gallery') toggleFolderSidebar();
+      break;
+    case 'gallery.newTab':
+      addTab();
+      break;
+    case 'gallery.closeTab':
+      closeTab(activeTab().id);
       break;
     case 'gallery.moveDown':
       window.scrollBy({top: GALLERY_KEYBOARD_SCROLL_STEP, behavior: 'auto'});
@@ -4058,9 +4075,19 @@ function dispatchCommand(command: AppCommand, context: ShortcutContext): void {
 
 document.addEventListener('keydown', event => {
   const context = resolveShortcutContext();
-  const preserveContextEscape = event.key === 'Escape' && (context === 'settings' || context === 'graph');
-  if (isTextEntryTarget(event.target) && !preserveContextEscape) return;
+  const numberedTab = event.altKey && !event.shiftKey && !event.ctrlKey && !event.metaKey
+    && /^Digit[1-9]$/.test(event.code)
+    ? Number(event.code.slice(-1)) - 1
+    : null;
+  if (numberedTab !== null) {
+    event.preventDefault();
+    switchTabByVisibleIndex(numberedTab);
+    return;
+  }
   const command = resolveShortcut(event, context);
+  const preserveContextEscape = event.key === 'Escape' && (context === 'settings' || context === 'graph');
+  const applicationCommand = command === 'gallery.newTab' || command === 'gallery.closeTab';
+  if (isTextEntryTarget(event.target) && !preserveContextEscape && !applicationCommand) return;
   if (!command) return;
   event.preventDefault();
   dispatchCommand(command, context);

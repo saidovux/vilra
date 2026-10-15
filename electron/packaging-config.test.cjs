@@ -61,3 +61,16 @@ test('package scripts keep dev runtime and make Electron build self-contained', 
   assert.equal(packageJson.scripts.smoke, 'npm run electron:smoke');
   assert.equal(packageJson.scripts.check, 'npm run typecheck && npm run electron:check');
 });
+
+test('Electron removes both application and BrowserWindow menus', () => {
+  const mainSource = fs.readFileSync(path.join(repoRoot, 'electron', 'main.cjs'), 'utf8');
+  const applicationMenu = mainSource.indexOf('Menu.setApplicationMenu(null);');
+  const runtimeStart = mainSource.indexOf('return startRuntime();');
+  const windowConstruction = mainSource.indexOf('const window = new BrowserWindow({');
+  const windowMenu = mainSource.indexOf('window.setMenu(null);', windowConstruction);
+  const windowLoad = mainSource.indexOf('await window.loadURL(', windowConstruction);
+
+  assert.ok(applicationMenu >= 0 && applicationMenu < runtimeStart);
+  assert.ok(windowConstruction >= 0 && windowMenu > windowConstruction && windowMenu < windowLoad);
+  assert.equal(mainSource.includes('autoHideMenuBar'), false);
+});
