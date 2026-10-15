@@ -165,11 +165,11 @@ async function waitForKeyboardScroll(page: Page, start: number, direction: 1 | -
 }
 
 async function expectKeyboardScrollSettled(page: Page): Promise<number> {
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(450);
   const settled = await page.evaluate(() => window.scrollY);
-  await page.waitForTimeout(400);
+  await page.waitForTimeout(500);
   const after = await page.evaluate(() => window.scrollY);
-  expect(Math.abs(after - settled)).toBeLessThanOrEqual(3);
+  expect(Math.abs(after - settled)).toBeLessThanOrEqual(5);
   return after;
 }
 
@@ -196,7 +196,7 @@ test('Gallery j and k scrolling follows held keys without release backlog', asyn
   await page.evaluate(() => window.scrollTo({top: 1200}));
   const beforeHeldDown = await page.evaluate(() => window.scrollY);
   await page.keyboard.down('j');
-  await page.waitForTimeout(240);
+  await page.waitForTimeout(280);
   const heldDown = await page.evaluate(() => window.scrollY);
   expect(heldDown - beforeHeldDown).toBeGreaterThan(100);
   await page.keyboard.up('j');
@@ -205,7 +205,7 @@ test('Gallery j and k scrolling follows held keys without release backlog', asyn
   await page.evaluate(() => window.scrollTo({top: 1600}));
   const beforeHeldUp = await page.evaluate(() => window.scrollY);
   await page.keyboard.down('k');
-  await page.waitForTimeout(240);
+  await page.waitForTimeout(280);
   const heldUp = await page.evaluate(() => window.scrollY);
   expect(beforeHeldUp - heldUp).toBeGreaterThan(100);
   await page.keyboard.up('k');
@@ -239,6 +239,16 @@ test('Gallery j and k scrolling follows held keys without release backlog', asyn
   await waitForKeyboardScroll(page, afterReverse, 1);
   await page.keyboard.up('j');
   await expectKeyboardScrollSettled(page);
+
+  await page.emulateMedia({reducedMotion: 'no-preference'});
+  await page.evaluate(() => window.scrollTo({top: 1200}));
+  await page.keyboard.down('j');
+  await page.waitForTimeout(140);
+  await page.locator('body').dispatchEvent('wheel', {deltaY: 1, bubbles: true, cancelable: true});
+  const afterWheelCancel = await page.evaluate(() => window.scrollY);
+  await page.waitForTimeout(400);
+  expect(Math.abs(await page.evaluate(() => window.scrollY) - afterWheelCancel)).toBeLessThanOrEqual(5);
+  await page.keyboard.up('j');
 
   await page.emulateMedia({reducedMotion: 'reduce'});
   await page.evaluate(() => window.scrollTo({top: 1200}));
