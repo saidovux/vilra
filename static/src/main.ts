@@ -12,9 +12,11 @@ import {
   type DiagnosticPageOutcome,
 } from './gallery-diagnostics';
 import {
+  type GalleryArrowDirection,
   isDesktopRuntime,
   pickFolderNative,
   revealFileNative,
+  sendGalleryArrowInputNative,
 } from './desktop-runtime';
 
 type MatchMode = 'any' | 'all';
@@ -983,17 +985,12 @@ let thumbLifecycleGeneration = 0;
 let thumbnailAdmissionFrame: number | null = null;
 let thumbnailScrollSettleTimer: ReturnType<typeof setTimeout> | null = null;
 let terminalGalleryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-let galleryKeyboardScrollTimer: ReturnType<typeof setTimeout> | null = null;
-let galleryKeyboardScrollJHeld = false;
-let galleryKeyboardScrollKHeld = false;
-let galleryKeyboardScrollDirection: -1 | 0 | 1 = 0;
+const forwardedGalleryArrowDirections = new Set<GalleryArrowDirection>();
 const PAGE = 48;
 const MASONRY_COL_MIN = 218;
 const GALLERY_OVERSCAN = 20;
 const CARD_BORDER_WIDTH = 1;
-const GALLERY_KEYBOARD_SCROLL_STEP = 96;
-const GALLERY_KEYBOARD_SCROLL_PULSE_PX = 90;
-const GALLERY_KEYBOARD_SCROLL_PULSE_INTERVAL_MS = 50;
+const GALLERY_BROWSER_ARROW_STEP = 96;
 const VIEWER_KEYBOARD_PAN_STEP = 80;
 const THUMB_VELOCITY_EMA_ALPHA = 0.35;
 const THUMB_FAST_ENTER_THRESHOLD = 1.25;
@@ -3851,83 +3848,21 @@ function restorePreviewIfNeeded(): void {
   if (previewModal && !previewModal.isOpen) openLightboxById(tab.lastImageId, false);
 }
 
-function clearGalleryKeyboardScrollTimer(): void {
-  if (galleryKeyboardScrollTimer !== null) clearTimeout(galleryKeyboardScrollTimer);
-  galleryKeyboardScrollTimer = null;
-}
-
-function cancelGalleryKeyboardScroll(): void {
-  clearGalleryKeyboardScrollTimer();
-  galleryKeyboardScrollDirection = 0;
-  galleryKeyboardScrollJHeld = false;
-  galleryKeyboardScrollKHeld = false;
-  window.scrollTo({top: window.scrollY, behavior: 'auto'});
-}
-
-function performGalleryKeyboardScrollPulse(direction: -1 | 1): void {
+function forwardGalleryArrowKeyDown(direction: GalleryArrowDirection, repeat: boolean): void {
+  if (sendGalleryArrowInputNative(direction, 'down', repeat)) {
+    forwardedGalleryArrowDirections.add(direction);
+    return;
+  }
   window.scrollBy({
-    top: direction * GALLERY_KEYBOARD_SCROLL_PULSE_PX,
-    behavior: 'smooth',
+    top: direction === 'down' ? GALLERY_BROWSER_ARROW_STEP : -GALLERY_BROWSER_ARROW_STEP,
+    behavior: 'auto',
   });
 }
 
-function scheduleGalleryKeyboardScrollPulse(): void {
-  if (galleryKeyboardScrollTimer !== null || galleryKeyboardScrollDirection === 0) return;
-  galleryKeyboardScrollTimer = setTimeout(
-    runGalleryKeyboardScrollPulse,
-    GALLERY_KEYBOARD_SCROLL_PULSE_INTERVAL_MS,
-  );
-}
-
-function runGalleryKeyboardScrollPulse(): void {
-  galleryKeyboardScrollTimer = null;
-  if (resolveShortcutContext() !== 'gallery') {
-    cancelGalleryKeyboardScroll();
-    return;
-  }
-  const direction = galleryKeyboardScrollDirection;
-  const directionHeld = direction > 0 ? galleryKeyboardScrollJHeld : galleryKeyboardScrollKHeld;
-  if (direction === 0 || !directionHeld) return;
-  performGalleryKeyboardScrollPulse(direction);
-  scheduleGalleryKeyboardScrollPulse();
-}
-
-function startGalleryKeyboardScroll(direction: -1 | 1, repeat: boolean): void {
-  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-    cancelGalleryKeyboardScroll();
-    window.scrollBy({top: direction * GALLERY_KEYBOARD_SCROLL_STEP, behavior: 'auto'});
-    return;
-  }
-
-  if (direction > 0) galleryKeyboardScrollJHeld = true;
-  else galleryKeyboardScrollKHeld = true;
-  if (repeat) return;
-
-  galleryKeyboardScrollDirection = direction;
-  clearGalleryKeyboardScrollTimer();
-  performGalleryKeyboardScrollPulse(direction);
-  scheduleGalleryKeyboardScrollPulse();
-}
-
-function releaseGalleryKeyboardScroll(direction: -1 | 1): void {
-  const previousDirection = galleryKeyboardScrollDirection;
-  if (direction > 0) galleryKeyboardScrollJHeld = false;
-  else galleryKeyboardScrollKHeld = false;
-  const fallbackDirection: -1 | 0 | 1 = galleryKeyboardScrollJHeld
-    ? 1
-    : galleryKeyboardScrollKHeld
-      ? -1
-      : 0;
-  galleryKeyboardScrollDirection = fallbackDirection;
-  if (fallbackDirection === 0) {
-    clearGalleryKeyboardScrollTimer();
-    return;
-  }
-  if (fallbackDirection !== previousDirection) {
-    clearGalleryKeyboardScrollTimer();
-    performGalleryKeyboardScrollPulse(fallbackDirection);
-    scheduleGalleryKeyboardScrollPulse();
-  }
+function forwardGalleryArrowKeyUp(code: string): void {
+  const direction = code === 'KeyJ' ? 'down' : code === 'KeyK' ? 'up' : null;
+  if (!direction || !forwardedGalleryArrowDirections.delete(direction)) return;
+  sendGalleryArrowInputNative(direction, 'up', false);
 }
 
 function resolveShortcutContext(): ShortcutContext {
@@ -4016,10 +3951,10 @@ function dispatchCommand(command: AppCommand, context: ShortcutContext, event: K
       focusGalleryTagSearch();
       break;
     case 'gallery.moveDown':
-      startGalleryKeyboardScroll(1, event.repeat);
+      forwardGalleryArrowKeyDown('down', event.repeat);
       break;
     case 'gallery.moveUp':
-      startGalleryKeyboardScroll(-1, event.repeat);
+      forwardGalleryArrowKeyDown('up', event.repeat);
       break;
     case 'viewer.panLeft':
       previewModal?.panBy(VIEWER_KEYBOARD_PAN_STEP, 0);
@@ -4093,8 +4028,7 @@ document.addEventListener('keydown', event => {
 });
 
 document.addEventListener('keyup', event => {
-  if (event.code === 'KeyJ') releaseGalleryKeyboardScroll(1);
-  else if (event.code === 'KeyK') releaseGalleryKeyboardScroll(-1);
+  forwardGalleryArrowKeyUp(event.code);
 });
 
 function saveSessionSoon(): void {
@@ -5023,14 +4957,11 @@ requiredInput('tag-admin-create').addEventListener('keydown', e => {
   if (e.key === 'Enter') createTagFromSettings();
 });
 window.addEventListener('scroll', updateScrollTopButton, {passive: true});
-window.addEventListener('wheel', cancelGalleryKeyboardScroll, {passive: true});
-window.addEventListener('blur', cancelGalleryKeyboardScroll);
 window.addEventListener('resize', () => {
   handleGalleryResize();
   if (graphState && graphState.open) rebuildGraph();
 });
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') cancelGalleryKeyboardScroll();
   if (document.visibilityState === 'visible') scheduleProblemsRefresh(false);
 });
 

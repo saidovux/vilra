@@ -74,3 +74,23 @@ test('Electron removes both application and BrowserWindow menus', () => {
   assert.ok(windowConstruction >= 0 && windowMenu > windowConstruction && windowMenu < windowLoad);
   assert.equal(mainSource.includes('autoHideMenuBar'), false);
 });
+
+test('Gallery arrow input bridge is narrow, validated, and trusted', () => {
+  const mainSource = fs.readFileSync(path.join(repoRoot, 'electron', 'main.cjs'), 'utf8');
+  const preloadSource = fs.readFileSync(path.join(repoRoot, 'electron', 'preload.cjs'), 'utf8');
+  const listenerStart = mainSource.indexOf("ipcMain.on('vilra:gallery-arrow-input'");
+  const listenerEnd = mainSource.indexOf("ipcMain.handle('vilra:pick-folder'", listenerStart);
+  const listener = mainSource.slice(listenerStart, listenerEnd);
+
+  assert.ok(listenerStart >= 0 && listenerEnd > listenerStart);
+  assert.ok(listener.indexOf('requireTrustedSender(event)') < listener.indexOf('sendInputEvent'));
+  assert.match(listener, /direction !== 'up' && direction !== 'down'/);
+  assert.match(listener, /phase !== 'down' && phase !== 'up'/);
+  assert.match(listener, /typeof repeat !== 'boolean'/);
+  assert.match(listener, /type: phase === 'down' \? 'keyDown' : 'keyUp'/);
+  assert.match(listener, /keyCode: direction === 'down' \? 'Down' : 'Up'/);
+  assert.match(listener, /modifiers: repeat \? \['isautorepeat'\] : \[\]/);
+  assert.match(preloadSource, /sendGalleryArrowInput\(direction, phase, repeat\)/);
+  assert.match(preloadSource, /ipcRenderer\.send\(\s*'vilra:gallery-arrow-input'/);
+  assert.equal(preloadSource.includes('sendInputEvent'), false);
+});

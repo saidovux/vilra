@@ -260,6 +260,24 @@ function requireTrustedSender(event) {
 function registerNativeBridge() {
   const diagnostics = createGalleryDiagnostics({diagnosticsDirectory: resolveDiagnosticsPath()});
 
+  ipcMain.on('vilra:gallery-arrow-input', (event, direction, phase, repeat) => {
+    try {
+      requireTrustedSender(event);
+    } catch {
+      return;
+    }
+    if ((direction !== 'up' && direction !== 'down')
+      || (phase !== 'down' && phase !== 'up')
+      || typeof repeat !== 'boolean') {
+      return;
+    }
+    event.sender.sendInputEvent({
+      type: phase === 'down' ? 'keyDown' : 'keyUp',
+      keyCode: direction === 'down' ? 'Down' : 'Up',
+      modifiers: repeat ? ['isautorepeat'] : [],
+    });
+  });
+
   ipcMain.handle('vilra:pick-folder', async (event, requestedDefault) => {
     requireTrustedSender(event);
     const options = {title: 'Выберите папку с изображениями', properties: ['openDirectory']};

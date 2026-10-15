@@ -167,6 +167,7 @@ test('native stop saves JSON and Markdown automatically without clipboard access
         runtime: 'electron';
         pickFolder: () => Promise<null>;
         revealPath: () => Promise<void>;
+        sendGalleryArrowInput: () => void;
         diagnosticsBegin: () => Promise<unknown>;
         diagnosticsCheckpoint: (sessionId: string, reportJson: string) => Promise<unknown>;
         diagnosticsFinalize: (sessionId: string, reportJson: string) => Promise<unknown>;
@@ -209,6 +210,7 @@ test('native stop saves JSON and Markdown automatically without clipboard access
       runtime: 'electron',
       pickFolder: async () => null,
       revealPath: async () => undefined,
+      sendGalleryArrowInput: () => undefined,
       diagnosticsBegin: () => invoke('diagnosticsBegin'),
       diagnosticsCheckpoint: (sessionId, reportJson) => invoke('diagnosticsCheckpoint', {sessionId, reportJson}),
       diagnosticsFinalize: (sessionId, reportJson) => invoke('diagnosticsFinalize', {sessionId, reportJson}),

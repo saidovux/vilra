@@ -155,119 +155,92 @@ async function loadAllSyntheticPages(page: Page, state: SyntheticState): Promise
   expect(state.servedThrough).toBe(TOTAL_IMAGES);
 }
 
-async function waitForKeyboardScroll(page: Page, start: number, direction: 1 | -1): Promise<number> {
-  if (direction > 0) {
-    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(start);
-  } else {
-    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeLessThan(start);
-  }
-  return page.evaluate(() => window.scrollY);
+type GalleryArrowCall = {
+  direction: 'up' | 'down';
+  phase: 'down' | 'up';
+  repeat: boolean;
+};
+
+async function installGalleryArrowBridge(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const runtime = window as Window & {
+      __galleryArrowCalls?: GalleryArrowCall[];
+    };
+    runtime.__galleryArrowCalls = [];
+    runtime.vilraDesktop = {
+      runtime: 'electron',
+      pickFolder: async () => null,
+      revealPath: async () => undefined,
+      sendGalleryArrowInput: (direction, phase, repeat) => {
+        runtime.__galleryArrowCalls!.push({direction, phase, repeat});
+      },
+      diagnosticsBegin: async () => ({}),
+      diagnosticsCheckpoint: async () => ({}),
+      diagnosticsFinalize: async () => ({}),
+      diagnosticsStatus: async () => ({}),
+    };
+  });
 }
 
-async function expectKeyboardScrollSettled(page: Page): Promise<number> {
-  await page.waitForTimeout(450);
-  const settled = await page.evaluate(() => window.scrollY);
-  await page.waitForTimeout(500);
-  const after = await page.evaluate(() => window.scrollY);
-  expect(Math.abs(after - settled)).toBeLessThanOrEqual(5);
-  return after;
+async function galleryArrowCalls(page: Page): Promise<GalleryArrowCall[]> {
+  return page.evaluate(() => (
+    (window as Window & {__galleryArrowCalls?: GalleryArrowCall[]}).__galleryArrowCalls || []
+  ));
 }
 
-test('Gallery j and k scrolling follows held keys without release backlog', async ({page}) => {
+test('Gallery j and k forward a complete native arrow key lifecycle', async ({page}) => {
+  await installGalleryArrowBridge(page);
   await installSyntheticGallery(page);
   await page.setViewportSize({width: 1366, height: 768});
   await page.goto('/');
-  await page.locator('html').evaluate(element => { element.style.scrollBehavior = 'auto'; });
   await expect(page.locator('.card[data-id]').first()).toBeVisible();
+  await page.keyboard.down('j');
   await page.evaluate(() => {
-    window.scrollTo({top: 1200});
-    (document.activeElement as HTMLElement | null)?.blur();
+    document.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'j', code: 'KeyJ', repeat: true, bubbles: true, cancelable: true,
+    }));
   });
-  const beforeDown = await page.evaluate(() => window.scrollY);
-  await page.keyboard.press('j');
-  await waitForKeyboardScroll(page, beforeDown, 1);
-  await expectKeyboardScrollSettled(page);
-
-  const beforeUp = await page.evaluate(() => window.scrollY);
-  await page.keyboard.press('k');
-  await waitForKeyboardScroll(page, beforeUp, -1);
-  await expectKeyboardScrollSettled(page);
-
-  await page.evaluate(() => window.scrollTo({top: 1200}));
-  const beforeHeldDown = await page.evaluate(() => window.scrollY);
-  await page.keyboard.down('j');
-  await page.waitForTimeout(280);
-  const heldDown = await page.evaluate(() => window.scrollY);
-  expect(heldDown - beforeHeldDown).toBeGreaterThan(100);
   await page.keyboard.up('j');
-  await expectKeyboardScrollSettled(page);
-
-  await page.evaluate(() => window.scrollTo({top: 1600}));
-  const beforeHeldUp = await page.evaluate(() => window.scrollY);
   await page.keyboard.down('k');
-  await page.waitForTimeout(280);
-  const heldUp = await page.evaluate(() => window.scrollY);
-  expect(beforeHeldUp - heldUp).toBeGreaterThan(100);
-  await page.keyboard.up('k');
-  await expectKeyboardScrollSettled(page);
-
-  await page.evaluate(() => window.scrollTo({top: 1200}));
-  await page.keyboard.down('j');
-  await page.waitForTimeout(100);
   await page.evaluate(() => {
-    for (let index = 0; index < 12; index += 1) {
-      document.dispatchEvent(new KeyboardEvent('keydown', {
-        key: 'j',
-        code: 'KeyJ',
-        repeat: true,
-        bubbles: true,
-        cancelable: true,
-      }));
-    }
+    document.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'k', code: 'KeyK', repeat: true, bubbles: true, cancelable: true,
+    }));
   });
-  await page.waitForTimeout(120);
-  await page.keyboard.up('j');
-  await expectKeyboardScrollSettled(page);
-
-  await page.evaluate(() => window.scrollTo({top: 1600}));
-  await page.keyboard.down('j');
-  await page.waitForTimeout(180);
-  const afterDown = await page.evaluate(() => window.scrollY);
-  await page.keyboard.down('k');
-  const afterReverse = await waitForKeyboardScroll(page, afterDown, -1);
   await page.keyboard.up('k');
-  await waitForKeyboardScroll(page, afterReverse, 1);
-  await page.keyboard.up('j');
-  await expectKeyboardScrollSettled(page);
 
-  await page.emulateMedia({reducedMotion: 'no-preference'});
-  await page.evaluate(() => window.scrollTo({top: 1200}));
-  await page.keyboard.down('j');
-  await page.waitForTimeout(140);
-  await page.locator('body').dispatchEvent('wheel', {deltaY: 1, bubbles: true, cancelable: true});
-  const afterWheelCancel = await page.evaluate(() => window.scrollY);
-  await page.waitForTimeout(400);
-  expect(Math.abs(await page.evaluate(() => window.scrollY) - afterWheelCancel)).toBeLessThanOrEqual(5);
-  await page.keyboard.up('j');
+  expect(await galleryArrowCalls(page)).toEqual([
+    {direction: 'down', phase: 'down', repeat: false},
+    {direction: 'down', phase: 'down', repeat: true},
+    {direction: 'down', phase: 'up', repeat: false},
+    {direction: 'up', phase: 'down', repeat: false},
+    {direction: 'up', phase: 'down', repeat: true},
+    {direction: 'up', phase: 'up', repeat: false},
+  ]);
 
-  await page.emulateMedia({reducedMotion: 'reduce'});
-  await page.evaluate(() => window.scrollTo({top: 1200}));
-  const reducedBefore = await page.evaluate(() => window.scrollY);
+  const forwardedCount = (await galleryArrowCalls(page)).length;
+  await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('ArrowUp');
+  expect(await galleryArrowCalls(page)).toHaveLength(forwardedCount);
+
+  await page.locator('.card[data-id]').first().click();
+  await expect(page.locator('#preview-modal')).toBeVisible();
   await page.keyboard.press('j');
-  const reducedAfter = await page.evaluate(() => window.scrollY);
-  expect(reducedAfter - reducedBefore).toBeGreaterThanOrEqual(90);
-  expect(reducedAfter - reducedBefore).toBeLessThanOrEqual(100);
   await page.keyboard.press('k');
-  const reducedAfterUp = await page.evaluate(() => window.scrollY);
-  expect(reducedAfter - reducedAfterUp).toBeGreaterThanOrEqual(90);
-  expect(reducedAfter - reducedAfterUp).toBeLessThanOrEqual(100);
+  expect(await galleryArrowCalls(page)).toHaveLength(forwardedCount);
+  await page.keyboard.press('q');
 
-  const beforeModifiedKeys = await page.evaluate(() => window.scrollY);
+  const input = page.locator('#filter-tag-input');
+  await input.focus();
+  await page.keyboard.type('jk');
+  await expect(input).toHaveValue('jk');
+  expect(await galleryArrowCalls(page)).toHaveLength(forwardedCount);
+
   await page.locator('body').dispatchEvent('keydown', {key: 'j', ctrlKey: true, bubbles: true, cancelable: true});
   await page.locator('body').dispatchEvent('keydown', {key: 'j', altKey: true, bubbles: true, cancelable: true});
   await page.locator('body').dispatchEvent('keydown', {key: 'j', metaKey: true, bubbles: true, cancelable: true});
   await page.locator('body').dispatchEvent('keydown', {key: 'J', shiftKey: true, bubbles: true, cancelable: true});
-  expect(await page.evaluate(() => window.scrollY)).toBe(beforeModifiedKeys);
+  expect(await galleryArrowCalls(page)).toHaveLength(forwardedCount);
 });
 
 test('desktop Gallery filter keeps search flexible and sort compact', async ({page}) => {

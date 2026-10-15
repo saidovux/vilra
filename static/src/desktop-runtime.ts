@@ -1,9 +1,16 @@
 export type DesktopRuntimeKind = 'electron' | 'browser';
+export type GalleryArrowDirection = 'up' | 'down';
+export type GalleryArrowPhase = 'down' | 'up';
 
 type ElectronBridge = {
   runtime: 'electron';
   pickFolder: (defaultPath?: string) => Promise<string | null>;
   revealPath: (path: string) => Promise<void>;
+  sendGalleryArrowInput: (
+    direction: GalleryArrowDirection,
+    phase: GalleryArrowPhase,
+    repeat: boolean,
+  ) => void;
   diagnosticsBegin: () => Promise<unknown>;
   diagnosticsCheckpoint: (sessionId: string, reportJson: string) => Promise<unknown>;
   diagnosticsFinalize: (sessionId: string, reportJson: string) => Promise<unknown>;
@@ -45,6 +52,16 @@ export async function revealFileNative(absolutePath: string): Promise<void> {
     throw new Error('Native file reveal is unavailable');
   }
   await window.vilraDesktop!.revealPath(absolutePath);
+}
+
+export function sendGalleryArrowInputNative(
+  direction: GalleryArrowDirection,
+  phase: GalleryArrowPhase,
+  repeat: boolean,
+): boolean {
+  if (desktopRuntimeKind() !== 'electron') return false;
+  electronBridge().sendGalleryArrowInput(direction, phase, repeat);
+  return true;
 }
 
 function electronBridge(): ElectronBridge {
