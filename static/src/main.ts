@@ -983,17 +983,24 @@ let thumbLifecycleGeneration = 0;
 let thumbnailAdmissionFrame: number | null = null;
 let thumbnailScrollSettleTimer: ReturnType<typeof setTimeout> | null = null;
 let terminalGalleryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-let galleryKeyboardScrollTarget: number | null = null;
-let galleryKeyboardScrollDirection = 0;
 let galleryKeyboardScrollFrame: number | null = null;
+let galleryKeyboardScrollVelocity = 0;
 let galleryKeyboardScrollLastTimestamp: number | null = null;
+let galleryKeyboardScrollJHeld = false;
+let galleryKeyboardScrollKHeld = false;
+let galleryKeyboardScrollDirection: -1 | 0 | 1 = 0;
 const PAGE = 48;
 const MASONRY_COL_MIN = 218;
 const GALLERY_OVERSCAN = 20;
 const CARD_BORDER_WIDTH = 1;
 const GALLERY_KEYBOARD_SCROLL_STEP = 96;
-const GALLERY_KEYBOARD_SCROLL_SPEED = 900;
-const GALLERY_KEYBOARD_SCROLL_MAX_BACKLOG = GALLERY_KEYBOARD_SCROLL_STEP * 6;
+const GALLERY_KEYBOARD_SCROLL_INITIAL_SPEED = 900;
+const GALLERY_KEYBOARD_SCROLL_MAX_SPEED = 1200;
+const GALLERY_KEYBOARD_SCROLL_ACCELERATION = 6000;
+const GALLERY_KEYBOARD_SCROLL_DECELERATION = 9000;
+const GALLERY_KEYBOARD_SCROLL_REVERSE_ACCELERATION = 13000;
+const GALLERY_KEYBOARD_SCROLL_STOP_THRESHOLD = 15;
+const GALLERY_KEYBOARD_SCROLL_MAX_DT = 0.05;
 const VIEWER_KEYBOARD_PAN_STEP = 80;
 const THUMB_VELOCITY_EMA_ALPHA = 0.35;
 const THUMB_FAST_ENTER_THRESHOLD = 1.25;
@@ -3858,53 +3865,94 @@ function galleryScrollLimit(): number {
 function cancelGalleryKeyboardScroll(): void {
   if (galleryKeyboardScrollFrame !== null) cancelAnimationFrame(galleryKeyboardScrollFrame);
   galleryKeyboardScrollFrame = null;
-  galleryKeyboardScrollTarget = null;
+  galleryKeyboardScrollVelocity = 0;
   galleryKeyboardScrollDirection = 0;
   galleryKeyboardScrollLastTimestamp = null;
+  galleryKeyboardScrollJHeld = false;
+  galleryKeyboardScrollKHeld = false;
+}
+
+function moveTowards(current: number, target: number, maxDelta: number): number {
+  if (Math.abs(target - current) <= maxDelta) return target;
+  return current + Math.sign(target - current) * maxDelta;
+}
+
+function requestGalleryKeyboardScrollFrame(): void {
+  if (galleryKeyboardScrollFrame === null) {
+    galleryKeyboardScrollFrame = requestAnimationFrame(animateGalleryKeyboardScroll);
+  }
+}
+
+function startGalleryKeyboardScroll(direction: -1 | 1, repeat: boolean): void {
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    cancelGalleryKeyboardScroll();
+    window.scrollTo({
+      top: clamp(window.scrollY + direction * GALLERY_KEYBOARD_SCROLL_STEP, 0, galleryScrollLimit()),
+      behavior: 'auto',
+    });
+    return;
+  }
+
+  const wasHeld = direction > 0 ? galleryKeyboardScrollJHeld : galleryKeyboardScrollKHeld;
+  if (direction > 0) galleryKeyboardScrollJHeld = true;
+  else galleryKeyboardScrollKHeld = true;
+  if (!repeat || !wasHeld || galleryKeyboardScrollDirection === 0) {
+    galleryKeyboardScrollDirection = direction;
+  }
+  if (Math.abs(galleryKeyboardScrollVelocity) < GALLERY_KEYBOARD_SCROLL_STOP_THRESHOLD) {
+    galleryKeyboardScrollVelocity = direction * GALLERY_KEYBOARD_SCROLL_INITIAL_SPEED;
+  }
+  requestGalleryKeyboardScrollFrame();
+}
+
+function releaseGalleryKeyboardScroll(direction: -1 | 1): void {
+  if (direction > 0) galleryKeyboardScrollJHeld = false;
+  else galleryKeyboardScrollKHeld = false;
+  if (direction > 0) galleryKeyboardScrollDirection = galleryKeyboardScrollKHeld ? -1 : 0;
+  else galleryKeyboardScrollDirection = galleryKeyboardScrollJHeld ? 1 : 0;
+  if (galleryKeyboardScrollVelocity !== 0) requestGalleryKeyboardScrollFrame();
 }
 
 function animateGalleryKeyboardScroll(timestamp: number): void {
   galleryKeyboardScrollFrame = null;
-  if (galleryKeyboardScrollTarget === null) return;
-  galleryKeyboardScrollTarget = clamp(galleryKeyboardScrollTarget, 0, galleryScrollLimit());
-  const current = window.scrollY;
-  const remaining = galleryKeyboardScrollTarget - current;
-  if (Math.abs(remaining) <= 0.5) {
-    window.scrollTo({top: galleryKeyboardScrollTarget, behavior: 'auto'});
+  if (resolveShortcutContext() !== 'gallery') {
     cancelGalleryKeyboardScroll();
     return;
   }
 
   const previousTimestamp = galleryKeyboardScrollLastTimestamp ?? timestamp;
-  const elapsed = clamp(timestamp - previousTimestamp, 0, 50);
+  const dt = clamp((timestamp - previousTimestamp) / 1000, 0, GALLERY_KEYBOARD_SCROLL_MAX_DT);
   galleryKeyboardScrollLastTimestamp = timestamp;
-  const distance = Math.min(Math.abs(remaining), GALLERY_KEYBOARD_SCROLL_SPEED * elapsed / 1000);
-  window.scrollTo({top: current + Math.sign(remaining) * distance, behavior: 'auto'});
-  galleryKeyboardScrollFrame = requestAnimationFrame(animateGalleryKeyboardScroll);
-}
+  const desiredVelocity = galleryKeyboardScrollDirection * GALLERY_KEYBOARD_SCROLL_MAX_SPEED;
+  const reversing = desiredVelocity !== 0
+    && galleryKeyboardScrollVelocity !== 0
+    && Math.sign(desiredVelocity) !== Math.sign(galleryKeyboardScrollVelocity);
+  const acceleration = desiredVelocity === 0
+    ? GALLERY_KEYBOARD_SCROLL_DECELERATION
+    : reversing
+      ? GALLERY_KEYBOARD_SCROLL_REVERSE_ACCELERATION
+      : GALLERY_KEYBOARD_SCROLL_ACCELERATION;
+  galleryKeyboardScrollVelocity = moveTowards(
+    galleryKeyboardScrollVelocity,
+    desiredVelocity,
+    acceleration * dt,
+  );
 
-function queueGalleryKeyboardScroll(delta: number): void {
-  const current = window.scrollY;
-  const limit = galleryScrollLimit();
-  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+  if (desiredVelocity === 0
+    && Math.abs(galleryKeyboardScrollVelocity) < GALLERY_KEYBOARD_SCROLL_STOP_THRESHOLD) {
     cancelGalleryKeyboardScroll();
-    window.scrollTo({top: clamp(current + delta, 0, limit), behavior: 'auto'});
     return;
   }
 
-  const direction = Math.sign(delta);
-  const continuing = galleryKeyboardScrollDirection === direction && galleryKeyboardScrollTarget !== null;
-  const base = continuing ? galleryKeyboardScrollTarget as number : current;
-  galleryKeyboardScrollTarget = clamp(
-    base + delta,
-    Math.max(0, current - GALLERY_KEYBOARD_SCROLL_MAX_BACKLOG),
-    Math.min(limit, current + GALLERY_KEYBOARD_SCROLL_MAX_BACKLOG),
-  );
-  galleryKeyboardScrollDirection = direction;
-  if (galleryKeyboardScrollFrame === null) {
-    galleryKeyboardScrollLastTimestamp = performance.now();
-    galleryKeyboardScrollFrame = requestAnimationFrame(animateGalleryKeyboardScroll);
+  const current = window.scrollY;
+  const next = clamp(current + galleryKeyboardScrollVelocity * dt, 0, galleryScrollLimit());
+  window.scrollTo({top: next, behavior: 'auto'});
+  if (next === current && ((next <= 0 && galleryKeyboardScrollVelocity < 0)
+    || (next >= galleryScrollLimit() && galleryKeyboardScrollVelocity > 0))) {
+    cancelGalleryKeyboardScroll();
+    return;
   }
+  requestGalleryKeyboardScrollFrame();
 }
 
 function resolveShortcutContext(): ShortcutContext {
@@ -3971,7 +4019,7 @@ function resolveShortcut(event: KeyboardEvent, context: ShortcutContext): AppCom
   return null;
 }
 
-function dispatchCommand(command: AppCommand, context: ShortcutContext): void {
+function dispatchCommand(command: AppCommand, context: ShortcutContext, event: KeyboardEvent): void {
   switch (command) {
     case 'ui.consumeShortcut':
       break;
@@ -3993,10 +4041,10 @@ function dispatchCommand(command: AppCommand, context: ShortcutContext): void {
       focusGalleryTagSearch();
       break;
     case 'gallery.moveDown':
-      queueGalleryKeyboardScroll(GALLERY_KEYBOARD_SCROLL_STEP);
+      startGalleryKeyboardScroll(1, event.repeat);
       break;
     case 'gallery.moveUp':
-      queueGalleryKeyboardScroll(-GALLERY_KEYBOARD_SCROLL_STEP);
+      startGalleryKeyboardScroll(-1, event.repeat);
       break;
     case 'viewer.panLeft':
       previewModal?.panBy(VIEWER_KEYBOARD_PAN_STEP, 0);
@@ -4066,7 +4114,12 @@ document.addEventListener('keydown', event => {
   if (isTextEntryTarget(event.target) && !preserveContextEscape && !applicationCommand) return;
   if (!command) return;
   event.preventDefault();
-  dispatchCommand(command, context);
+  dispatchCommand(command, context, event);
+});
+
+document.addEventListener('keyup', event => {
+  if (event.code === 'KeyJ') releaseGalleryKeyboardScroll(1);
+  else if (event.code === 'KeyK') releaseGalleryKeyboardScroll(-1);
 });
 
 function saveSessionSoon(): void {
@@ -4996,11 +5049,13 @@ requiredInput('tag-admin-create').addEventListener('keydown', e => {
 });
 window.addEventListener('scroll', updateScrollTopButton, {passive: true});
 window.addEventListener('wheel', cancelGalleryKeyboardScroll, {passive: true});
+window.addEventListener('blur', cancelGalleryKeyboardScroll);
 window.addEventListener('resize', () => {
   handleGalleryResize();
   if (graphState && graphState.open) rebuildGraph();
 });
 document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') cancelGalleryKeyboardScroll();
   if (document.visibilityState === 'visible') scheduleProblemsRefresh(false);
 });
 

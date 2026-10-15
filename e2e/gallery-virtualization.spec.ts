@@ -161,20 +161,19 @@ async function waitForKeyboardScroll(page: Page, start: number, direction: 1 | -
   } else {
     await expect.poll(() => page.evaluate(() => window.scrollY)).toBeLessThan(start);
   }
-  let previous = Number.NaN;
-  let stableSamples = 0;
-  await expect.poll(async () => {
-    const current = await page.evaluate(() => window.scrollY);
-    stableSamples = Number.isFinite(previous) && Math.abs(current - previous) < 1
-      ? stableSamples + 1
-      : 0;
-    previous = current;
-    return stableSamples;
-  }).toBeGreaterThanOrEqual(2);
   return page.evaluate(() => window.scrollY);
 }
 
-test('Gallery j and k scrolling is smooth coalesced and reduced-motion aware', async ({page}) => {
+async function expectKeyboardScrollSettled(page: Page): Promise<number> {
+  await page.waitForTimeout(250);
+  const settled = await page.evaluate(() => window.scrollY);
+  await page.waitForTimeout(400);
+  const after = await page.evaluate(() => window.scrollY);
+  expect(Math.abs(after - settled)).toBeLessThanOrEqual(3);
+  return after;
+}
+
+test('Gallery j and k scrolling follows held keys without release backlog', async ({page}) => {
   await installSyntheticGallery(page);
   await page.setViewportSize({width: 1366, height: 768});
   await page.goto('/');
@@ -186,26 +185,60 @@ test('Gallery j and k scrolling is smooth coalesced and reduced-motion aware', a
   });
   const beforeDown = await page.evaluate(() => window.scrollY);
   await page.keyboard.press('j');
-  const afterSingleDown = await waitForKeyboardScroll(page, beforeDown, 1);
-  const singleDownDistance = afterSingleDown - beforeDown;
+  await waitForKeyboardScroll(page, beforeDown, 1);
+  await expectKeyboardScrollSettled(page);
 
-  await page.evaluate(() => window.scrollTo({top: 1200}));
-  const beforeRapidDown = await page.evaluate(() => window.scrollY);
-  for (let index = 0; index < 4; index += 1) await page.keyboard.press('j');
-  const afterRapidDown = await waitForKeyboardScroll(page, beforeRapidDown, 1);
-  expect(afterRapidDown - beforeRapidDown).toBeGreaterThan(singleDownDistance * 2);
-
-  await page.evaluate(() => window.scrollTo({top: 1600}));
   const beforeUp = await page.evaluate(() => window.scrollY);
   await page.keyboard.press('k');
-  const afterSingleUp = await waitForKeyboardScroll(page, beforeUp, -1);
-  const singleUpDistance = beforeUp - afterSingleUp;
+  await waitForKeyboardScroll(page, beforeUp, -1);
+  await expectKeyboardScrollSettled(page);
+
+  await page.evaluate(() => window.scrollTo({top: 1200}));
+  const beforeHeldDown = await page.evaluate(() => window.scrollY);
+  await page.keyboard.down('j');
+  await page.waitForTimeout(240);
+  const heldDown = await page.evaluate(() => window.scrollY);
+  expect(heldDown - beforeHeldDown).toBeGreaterThan(100);
+  await page.keyboard.up('j');
+  await expectKeyboardScrollSettled(page);
 
   await page.evaluate(() => window.scrollTo({top: 1600}));
-  const beforeRapidUp = await page.evaluate(() => window.scrollY);
-  for (let index = 0; index < 4; index += 1) await page.keyboard.press('k');
-  const afterRapidUp = await waitForKeyboardScroll(page, beforeRapidUp, -1);
-  expect(beforeRapidUp - afterRapidUp).toBeGreaterThan(singleUpDistance * 2);
+  const beforeHeldUp = await page.evaluate(() => window.scrollY);
+  await page.keyboard.down('k');
+  await page.waitForTimeout(240);
+  const heldUp = await page.evaluate(() => window.scrollY);
+  expect(beforeHeldUp - heldUp).toBeGreaterThan(100);
+  await page.keyboard.up('k');
+  await expectKeyboardScrollSettled(page);
+
+  await page.evaluate(() => window.scrollTo({top: 1200}));
+  await page.keyboard.down('j');
+  await page.waitForTimeout(100);
+  await page.evaluate(() => {
+    for (let index = 0; index < 12; index += 1) {
+      document.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'j',
+        code: 'KeyJ',
+        repeat: true,
+        bubbles: true,
+        cancelable: true,
+      }));
+    }
+  });
+  await page.waitForTimeout(120);
+  await page.keyboard.up('j');
+  await expectKeyboardScrollSettled(page);
+
+  await page.evaluate(() => window.scrollTo({top: 1600}));
+  await page.keyboard.down('j');
+  await page.waitForTimeout(180);
+  const afterDown = await page.evaluate(() => window.scrollY);
+  await page.keyboard.down('k');
+  const afterReverse = await waitForKeyboardScroll(page, afterDown, -1);
+  await page.keyboard.up('k');
+  await waitForKeyboardScroll(page, afterReverse, 1);
+  await page.keyboard.up('j');
+  await expectKeyboardScrollSettled(page);
 
   await page.emulateMedia({reducedMotion: 'reduce'});
   await page.evaluate(() => window.scrollTo({top: 1200}));
@@ -214,6 +247,10 @@ test('Gallery j and k scrolling is smooth coalesced and reduced-motion aware', a
   const reducedAfter = await page.evaluate(() => window.scrollY);
   expect(reducedAfter - reducedBefore).toBeGreaterThanOrEqual(90);
   expect(reducedAfter - reducedBefore).toBeLessThanOrEqual(100);
+  await page.keyboard.press('k');
+  const reducedAfterUp = await page.evaluate(() => window.scrollY);
+  expect(reducedAfter - reducedAfterUp).toBeGreaterThanOrEqual(90);
+  expect(reducedAfter - reducedAfterUp).toBeLessThanOrEqual(100);
 
   const beforeModifiedKeys = await page.evaluate(() => window.scrollY);
   await page.locator('body').dispatchEvent('keydown', {key: 'j', ctrlKey: true, bubbles: true, cancelable: true});
@@ -221,6 +258,22 @@ test('Gallery j and k scrolling is smooth coalesced and reduced-motion aware', a
   await page.locator('body').dispatchEvent('keydown', {key: 'j', metaKey: true, bubbles: true, cancelable: true});
   await page.locator('body').dispatchEvent('keydown', {key: 'J', shiftKey: true, bubbles: true, cancelable: true});
   expect(await page.evaluate(() => window.scrollY)).toBe(beforeModifiedKeys);
+});
+
+test('desktop Gallery filter keeps search flexible and sort compact', async ({page}) => {
+  await installSyntheticGallery(page);
+  await page.setViewportSize({width: 1366, height: 768});
+  await page.goto('/');
+  const search = page.locator('#filter-tag-input');
+  const sort = page.locator('#sort-select');
+  await expect(search).toBeVisible();
+  await expect(sort).toBeVisible();
+  const searchBox = await search.boundingBox();
+  const sortBox = await sort.boundingBox();
+  expect(searchBox).toBeTruthy();
+  expect(sortBox).toBeTruthy();
+  expect(searchBox!.width).toBeGreaterThan(sortBox!.width * 2);
+  expect(sortBox!.width).toBeLessThanOrEqual(180);
 });
 
 test('explicit Gallery Focus and sidebar controls preserve the visible virtual anchor', async ({page}) => {

@@ -1013,7 +1013,7 @@ body.modal-open { overflow: hidden; }
 }
 #filter-bar .filter-head {
   display: grid;
-  grid-template-columns: auto auto auto minmax(240px, 1fr) minmax(150px, auto);
+  grid-template-columns: auto auto auto minmax(220px, 1fr) 150px;
   align-items: center;
   justify-content: stretch;
   gap: 8px;
@@ -1676,7 +1676,7 @@ body.modal-open { overflow: hidden; }
 }
 
 #filter-bar .filter-head {
-  grid-template-columns: auto auto auto auto minmax(240px, 1fr) minmax(150px, auto);
+  grid-template-columns: auto auto auto minmax(220px, 1fr) 150px;
 }
 
 #settings-panel {
@@ -2111,8 +2111,12 @@ body { background: #000; font-size: 12px; }
 }
 #filter-bar .filter-head {
   height: 30px; display: grid;
-  grid-template-columns: auto auto auto auto minmax(220px, 1fr) 150px;
   align-items: center; gap: 7px;
+}
+@media (min-width: 901px) {
+  #filter-bar .filter-head {
+    grid-template-columns: auto auto auto minmax(220px, 1fr) 150px;
+  }
 }
 #filter-bar .match-toggle { height: 30px; padding: 2px; border-radius: 4px; background: #080808; }
 #filter-bar .match-toggle button { min-width: 48px; min-height: 24px; padding: 0 7px; border-radius: 2px; }
