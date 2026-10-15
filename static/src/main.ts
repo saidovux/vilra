@@ -936,6 +936,8 @@ let previewPendingDirection: -1 | 1 | null = null;
 let previewNavigationGeneration = 0;
 let pendingGalleryAnchorImageId: string | null = null;
 let previewFilmMode: 'nearby' | 'tag' | 'folder' = 'nearby';
+let previewFilmNearbyCapacity = 15;
+let previewFilmLayoutFrame: number | null = null;
 let previewFocusMode = false;
 let previewInspectorVisible = true;
 let previewInspectorBeforeFocus = true;
@@ -3516,6 +3518,7 @@ function openLightbox(
       if (isCurrentPreviewRequest(img.id, token)) void diagnosePreviewOriginalFailure(img, token);
     },
   });
+  schedulePreviewFilmstripLayoutRefresh();
   if (persist) saveSessionSoon();
 }
 
@@ -3570,6 +3573,8 @@ function handlePreviewClosed(): void {
     && Boolean(closingImageId);
   previewRequestToken += 1;
   invalidatePreviewNavigation();
+  if (previewFilmLayoutFrame !== null) cancelAnimationFrame(previewFilmLayoutFrame);
+  previewFilmLayoutFrame = null;
   document.body.style.overflow = '';
   togglePreviewTagDropdown(false);
   closePreviewQuickMenu();
@@ -3702,9 +3707,40 @@ function previewFilmCandidates(): ImageItem[] {
     const folder = imageParentPath(current.path);
     return source.filter(image => imageParentPath(image.path) === folder);
   }
-  const start = Math.max(0, currentIndex - 7);
-  const end = Math.min(source.length, currentIndex + 8);
+  const capacity = Math.min(Math.max(1, previewFilmNearbyCapacity), source.length);
+  const start = clamp(
+    currentIndex - Math.floor(capacity / 2),
+    0,
+    Math.max(0, source.length - capacity),
+  );
+  const end = Math.min(source.length, start + capacity);
   return source.slice(start, end);
+}
+
+function measurePreviewFilmNearbyCapacity(): number | null {
+  const target = optionalHtml('preview-film-items');
+  if (!target || target.clientWidth <= 0) return null;
+  const style = getComputedStyle(target);
+  const itemWidth = Number.parseFloat(style.getPropertyValue('--preview-film-item-width'));
+  const gap = Number.parseFloat(style.getPropertyValue('--preview-film-gap'));
+  const paddingLeft = Number.parseFloat(style.paddingLeft) || 0;
+  const paddingRight = Number.parseFloat(style.paddingRight) || 0;
+  if (!Number.isFinite(itemWidth) || itemWidth <= 0 || !Number.isFinite(gap) || gap < 0) return null;
+  const usableWidth = target.clientWidth - paddingLeft - paddingRight;
+  if (usableWidth <= 0) return null;
+  return Math.max(1, Math.floor((usableWidth + gap) / (itemWidth + gap)));
+}
+
+function schedulePreviewFilmstripLayoutRefresh(): void {
+  if (previewFilmLayoutFrame !== null) return;
+  previewFilmLayoutFrame = requestAnimationFrame(() => {
+    previewFilmLayoutFrame = null;
+    if (!previewModal?.isOpen || previewFocusMode) return;
+    const measuredCapacity = measurePreviewFilmNearbyCapacity();
+    if (measuredCapacity === null || measuredCapacity === previewFilmNearbyCapacity) return;
+    previewFilmNearbyCapacity = measuredCapacity;
+    if (previewFilmMode === 'nearby') renderPreviewFilmstrip();
+  });
 }
 
 function renderPreviewFilmstrip(): void {
@@ -3764,7 +3800,11 @@ function renderPreviewUiState(): void {
 }
 
 function refreshPreviewLayout(): void {
-  if (previewModal?.isOpen) requestAnimationFrame(() => previewModal?.refreshLayout());
+  if (!previewModal?.isOpen) return;
+  requestAnimationFrame(() => {
+    previewModal?.refreshLayout();
+    schedulePreviewFilmstripLayoutRefresh();
+  });
 }
 
 function setPreviewFocusMode(enabled: boolean): void {
@@ -5129,6 +5169,7 @@ window.addEventListener('scroll', updateScrollTopButton, {passive: true});
 window.addEventListener('resize', () => {
   handleGalleryResize();
   if (graphState && graphState.open) rebuildGraph();
+  if (previewModal?.isOpen) schedulePreviewFilmstripLayoutRefresh();
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') scheduleProblemsRefresh(false);

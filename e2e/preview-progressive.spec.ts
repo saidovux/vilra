@@ -19,6 +19,19 @@ type PreviewFixture = {
 type PreviewFixtureOptions = {
   width?: number;
   height?: number;
+  ids?: string[];
+  lastImageId?: string | null;
+  immediateOriginals?: boolean;
+};
+
+type FilmstripSnapshot = {
+  count: number;
+  remaining: number;
+  pitch: number;
+  itemWidth: number;
+  itemHeight: number;
+  titles: string[];
+  activeTitle: string | null;
 };
 
 type PaginatedPreviewFixture = {
@@ -55,7 +68,7 @@ async function fulfillOriginal(route: Route, wait: Deferred): Promise<void> {
 }
 
 async function installPreviewFixture(page: Page, options: PreviewFixtureOptions = {}): Promise<PreviewFixture> {
-  const ids = ['preview-a', 'preview-b', 'preview-c'];
+  const ids = options.ids || ['preview-a', 'preview-b', 'preview-c'];
   const controls = new Map(ids.map(id => [id, deferred()]));
   const originalRequests: string[] = [];
   const tagRequests: Array<{id: string; tags: string[]}> = [];
@@ -73,7 +86,7 @@ async function installPreviewFixture(page: Page, options: PreviewFixtureOptions 
       search_mode: 'any',
       tabs: [],
       active_tab_id: null,
-      last_image_id: null,
+      last_image_id: options.lastImageId || null,
       folder_tag_sync: true,
     }});
   });
@@ -107,6 +120,10 @@ async function installPreviewFixture(page: Page, options: PreviewFixtureOptions 
   await page.route('**/file/preview-*', async route => {
     const id = new URL(route.request().url()).pathname.split('/').pop() || '';
     originalRequests.push(id);
+    if (options.immediateOriginals) {
+      await route.fulfill({status: 200, contentType: 'image/png', body: IMAGE_BYTES});
+      return;
+    }
     const control = controls.get(id);
     if (!control) {
       await route.fulfill({status: 404});
@@ -208,6 +225,112 @@ async function expectGalleryCardInViewport(page: Page, imageId: string): Promise
   });
   expect(intersects).toBe(true);
 }
+
+async function openFilmstripFixture(page: Page, currentIndex: number, imageCount = 64): Promise<string[]> {
+  const ids = Array.from({length: imageCount}, (_, index) => `preview-${String(index).padStart(3, '0')}`);
+  await installPreviewFixture(page, {
+    ids,
+    lastImageId: ids[currentIndex],
+    immediateOriginals: true,
+  });
+  await page.setViewportSize({width: 1366, height: 768});
+  await page.goto('/');
+  await expect(page.locator('#preview-modal')).toHaveAttribute('data-image-id', ids[currentIndex]);
+  return ids;
+}
+
+async function filmstripSnapshot(page: Page): Promise<FilmstripSnapshot> {
+  return page.locator('#preview-film-items').evaluate(element => {
+    const target = element as HTMLElement;
+    const items = [...target.querySelectorAll<HTMLElement>('.preview-film-item')];
+    const last = items[items.length - 1];
+    if (!last) throw new Error('filmstrip has no items');
+    const targetRect = target.getBoundingClientRect();
+    const itemRect = items[0].getBoundingClientRect();
+    const lastRect = last.getBoundingClientRect();
+    const style = getComputedStyle(target);
+    const gap = Number.parseFloat(style.getPropertyValue('--preview-film-gap'));
+    const paddingRight = Number.parseFloat(style.paddingRight) || 0;
+    return {
+      count: items.length,
+      remaining: targetRect.right - paddingRight - lastRect.right,
+      pitch: itemRect.width + gap,
+      itemWidth: itemRect.width,
+      itemHeight: itemRect.height,
+      titles: items.map(item => item.title),
+      activeTitle: target.querySelector<HTMLElement>('.preview-film-item.active')?.title || null,
+    };
+  });
+}
+
+function expectFilledFilmstrip(snapshot: FilmstripSnapshot): void {
+  expect(snapshot.remaining).toBeGreaterThanOrEqual(-1);
+  expect(snapshot.remaining).toBeLessThan(snapshot.pitch + 1);
+  expect(Math.abs(snapshot.itemWidth - 52)).toBeLessThanOrEqual(1);
+  expect(Math.abs(snapshot.itemHeight - 50)).toBeLessThanOrEqual(1);
+}
+
+test('Nearby filmstrip fills visible width from the first image after opening', async ({page}) => {
+  const ids = await openFilmstripFixture(page, 0);
+  await expect.poll(() => page.locator('.preview-film-item').count()).toBeGreaterThan(8);
+
+  const snapshot = await filmstripSnapshot(page);
+  expect(snapshot.activeTitle).toBe(`${ids[0]}.png`);
+  expect(snapshot.titles[0]).toBe(`${ids[0]}.png`);
+  expectFilledFilmstrip(snapshot);
+});
+
+test('Nearby filmstrip keeps a filled centered window around a middle image', async ({page}) => {
+  const ids = await openFilmstripFixture(page, 32);
+  await expect.poll(() => page.locator('.preview-film-item').count()).toBeGreaterThan(15);
+
+  const snapshot = await filmstripSnapshot(page);
+  expect(snapshot.activeTitle).toBe(`${ids[32]}.png`);
+  expect(snapshot.titles.indexOf(`${ids[32]}.png`)).toBeGreaterThan(0);
+  expect(snapshot.titles.indexOf(`${ids[32]}.png`)).toBeLessThan(snapshot.count - 1);
+  expect(snapshot.count).toBeLessThan(ids.length);
+  expectFilledFilmstrip(snapshot);
+});
+
+test('Nearby filmstrip shifts left and fills width at the final image', async ({page}) => {
+  const ids = await openFilmstripFixture(page, 63);
+  await expect.poll(() => page.locator('.preview-film-item').count()).toBeGreaterThan(15);
+
+  const snapshot = await filmstripSnapshot(page);
+  expect(snapshot.activeTitle).toBe(`${ids[63]}.png`);
+  expect(snapshot.titles[snapshot.titles.length - 1]).toBe(`${ids[63]}.png`);
+  expect(snapshot.titles[0]).not.toBe(`${ids[63]}.png`);
+  expectFilledFilmstrip(snapshot);
+});
+
+test('Nearby capacity follows Inspector, window resize, and leaving Focus mode', async ({page}) => {
+  await openFilmstripFixture(page, 32);
+  await expect.poll(() => page.locator('.preview-film-item').count()).toBeGreaterThan(15);
+  const inspectorCount = await page.locator('.preview-film-item').count();
+
+  await page.keyboard.press('Control+b');
+  await expect(page.locator('#preview-inspector')).not.toBeVisible();
+  await expect.poll(() => page.locator('.preview-film-item').count()).toBeGreaterThan(inspectorCount);
+  const expandedCount = await page.locator('.preview-film-item').count();
+  expectFilledFilmstrip(await filmstripSnapshot(page));
+
+  await page.keyboard.press('Control+b');
+  await expect(page.locator('#preview-inspector')).toBeVisible();
+  await expect.poll(() => page.locator('.preview-film-item').count()).toBe(inspectorCount);
+
+  await page.setViewportSize({width: 1600, height: 768});
+  await expect.poll(() => page.locator('.preview-film-item').count()).toBeGreaterThan(inspectorCount);
+  expect(await page.locator('.preview-film-item').count()).toBeLessThan(expandedCount + 8);
+
+  const wideCount = await page.locator('.preview-film-item').count();
+  await page.keyboard.press('Tab');
+  await expect(page.locator('#preview-filmstrip')).not.toBeVisible();
+  await page.setViewportSize({width: 1100, height: 768});
+  await page.keyboard.press('Tab');
+  await expect(page.locator('#preview-filmstrip')).toBeVisible();
+  await expect.poll(() => page.locator('.preview-film-item').count()).toBeLessThan(wideCount);
+  expectFilledFilmstrip(await filmstripSnapshot(page));
+});
 
 test('Viewer crosses the Gallery cursor boundary and wraps only at the true end', async ({page}) => {
   const fixture = await installPaginatedPreviewFixture(page, 47, 2);

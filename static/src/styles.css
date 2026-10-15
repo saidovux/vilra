@@ -2374,11 +2374,14 @@ body.image-selection-mode .card-select, .card:hover .card-select, .card.selected
 #preview-film-modes button.active { border-color: #2b2b2b; background: #0a0a0a; color: #ddd; }
 #preview-film-info { margin-left: auto; color: #555; font: 9px/1 var(--font-mono); }
 #preview-film-items {
-  min-width: 0; display: flex; gap: 5px; overflow-x: auto; padding: 6px 8px;
+  --preview-film-item-width: 52px;
+  --preview-film-gap: 5px;
+  min-width: 0; display: flex; gap: var(--preview-film-gap); overflow-x: auto; padding: 6px 8px;
   scrollbar-color: #2f2f2f #030303;
 }
 .preview-film-item {
-  position: relative; width: 52px; height: 50px; flex: 0 0 52px; padding: 0;
+  position: relative; width: var(--preview-film-item-width); height: 50px;
+  flex: 0 0 var(--preview-film-item-width); padding: 0;
   overflow: hidden; border: 1px solid #1f1f1f; border-radius: 0; background: #080808; cursor: pointer;
 }
 .preview-film-item.active { border-color: var(--accent); }
