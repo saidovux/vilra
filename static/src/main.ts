@@ -18,9 +18,48 @@ import {
   revealFileNative,
   sendGalleryArrowInputNative,
 } from './desktop-runtime';
+import {
+  clamp,
+  isRecord,
+  optionalNumber,
+  optionalElement,
+  optionalHtml,
+  readJsonRecord,
+  requireElement,
+  stringArray,
+  type JsonRecord,
+} from './shared/helpers';
+import {
+  imagePage,
+  imagesFromRecord,
+  mergeRefreshedPageIntoLoadedImages,
+  normalizeImageItem,
+  pageTotalValue,
+  type ImageItem,
+  type ImagePage,
+} from './gallery/image-data';
+import {
+  buildImageQueryParams,
+  type MatchMode,
+  type SortMode,
+} from './gallery/image-query';
+import {
+  aspectCss,
+  calculateVirtualCardLayout,
+  computeGalleryGeometry,
+  estimateVirtualCardSize,
+  virtualItemIsNear,
+  virtualItemIsVisible,
+  type GalleryGeometry,
+  type GalleryScrollDirection,
+} from './gallery/geometry';
+import {
+  decodeCurrentThumbnail,
+  ThumbnailLifecycleManager,
+  type ThumbLifecycle,
+} from './gallery/thumbnail-lifecycle';
+import {PreviewModal} from './viewer/preview-modal';
 
-type MatchMode = 'any' | 'all';
-type SortMode = 'path_asc' | 'path_desc' | 'date_desc' | 'date_asc' | 'size_desc' | 'size_asc';
 type SettingsTab = 'general' | 'tags' | 'graph' | 'problems';
 type AppWorkspace = 'gallery' | 'settings';
 type ShortcutContext = 'gallery' | 'viewer' | 'settings' | 'graph' | 'blocked';
@@ -51,9 +90,6 @@ type AppCommand =
 type GraphScope = 'current' | 'all';
 type TagAdminSort = 'name' | 'image_count' | 'user_count' | 'auto_count';
 type TagKind = 'include' | 'exclude';
-type ElementConstructor<T extends Element> = { new (...args: any[]): T };
-type JsonRecord = Record<string, unknown>;
-
 interface TagMeta {
   name: string;
   normalized: string;
@@ -65,21 +101,6 @@ interface TagMeta {
   is_auto: boolean;
   source: 'auto' | 'user';
   sources: Array<'auto' | 'user'>;
-}
-
-interface ImageItem {
-  id: string;
-  path: string;
-  thumb_url?: string;
-  tags?: string[];
-  auto_tags?: string[];
-  folder_tags?: string[];
-  user_tags?: string[];
-  width?: number;
-  height?: number;
-  aspect_ratio?: number;
-  size?: number;
-  mtime?: number;
 }
 
 interface GalleryTab {
@@ -105,44 +126,10 @@ interface StatusResponse {
   error?: string;
 }
 
-interface ImagePage {
-  total?: unknown;
-  next_cursor?: string | null;
-  has_more?: boolean;
-}
-
-interface GalleryGeometry {
-  width: number;
-  gap: number;
-  laneCount: number;
-  laneWidth: number;
-  borderWidth: number;
-  scrollMargin: number;
-}
-
 interface MountedGalleryCard {
   slot: HTMLDivElement;
   card: HTMLElement;
   signature: string;
-}
-
-type ThumbAdmissionClass = 'visible' | 'near';
-type GalleryScrollDirection = 'forward' | 'backward' | null;
-type ThumbLifecycleState = 'missing' | 'admitting' | 'polling';
-type ThumbnailDecodeResult = 'ready' | 'stale' | 'failed';
-
-interface ThumbLifecycle {
-  imageId: string;
-  version: number;
-  image: HTMLImageElement;
-  primaryUrl: string;
-  admissionUrl: string;
-  state: ThumbLifecycleState;
-  generation: number;
-  startedAt: number;
-  pollAttempts: number;
-  timer: ReturnType<typeof setTimeout> | null;
-  controller: AbortController | null;
 }
 
 interface ThumbnailScrollState {
@@ -253,33 +240,6 @@ interface GraphState {
   ctx: CanvasRenderingContext2D;
 }
 
-interface PreviewModalOptions {
-  modalId: string;
-  viewportId: string;
-  stageId: string;
-  thumbnailId: string;
-  imageId: string;
-  closeId: string;
-  zoomId: string;
-  minScale: number;
-  maxScale: number;
-  initialViewportFill: number;
-  messageType: string;
-  postToParent: boolean;
-}
-
-interface PreviewImageRequest {
-  imageId: string;
-  thumbnailUrl: string;
-  thumbnailFallbackUrl: string;
-  originalUrl: string;
-  width: number;
-  height: number;
-  alt: string;
-  onOriginalReady?: () => void;
-  onOriginalError?: () => void;
-}
-
 interface FishController {
   suggestion: string;
   update?: () => void;
@@ -294,62 +254,8 @@ interface TagChipOptions {
   actionKind?: 'include' | 'exclude' | '';
 }
 
-/*!
- * PreviewModal standalone lightbox for progressive native images.
- *
- * Required HTML contract:
- * - #preview-modal            (overlay root)
- * - #preview-close            (close button)
- * - #preview-stage-viewport   (fixed Viewer viewport)
- * - #preview-image-stage      (positioned zoom/pan surface inside viewport)
- * - #preview-modal-thumbnail  (temporary thumbnail)
- * - #preview-modal-image      (full-quality original)
- * - #zoom-level               (zoom label, e.g. "100%")
- */
-const PREVIEW_MODAL_DEFAULTS: PreviewModalOptions = {
-  modalId: "preview-modal",
-  viewportId: "preview-stage-viewport",
-  stageId: "preview-image-stage",
-  thumbnailId: "preview-modal-thumbnail",
-  imageId: "preview-modal-image",
-  closeId: "preview-close",
-  zoomId: "zoom-level",
-  minScale: 0.1,
-  maxScale: 10,
-  initialViewportFill: 0.97,
-  messageType: "web-tools:preview-modal",
-  postToParent: true
-};
-
-function clamp(value: number, min: number, max: number): number {
-  if (value < min) return min;
-  if (value > max) return max;
-  return value;
-}
-
-function requireElement<T extends Element>(
-  id: string,
-  expected: ElementConstructor<T>,
-  message: string
-): T {
-  const node = document.getElementById(id);
-  if (!(node instanceof expected)) {
-    throw new Error(`${message} (id="${id}")`);
-  }
-  return node;
-}
-
-function optionalElement<T extends Element>(id: string, expected: ElementConstructor<T>): T | null {
-  const node = document.getElementById(id);
-  return node instanceof expected ? node : null;
-}
-
 function requiredHtml(id: string): HTMLElement {
   return requireElement(id, HTMLElement, "Required page element is missing");
-}
-
-function optionalHtml(id: string): HTMLElement | null {
-  return optionalElement(id, HTMLElement);
 }
 
 function requiredInput(id: string): HTMLInputElement {
@@ -366,65 +272,6 @@ function requiredAnchor(id: string): HTMLAnchorElement {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function isRecord(value: unknown): value is JsonRecord {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-async function readJsonRecord(response: Response): Promise<JsonRecord> {
-  const value: unknown = await response.json();
-  return isRecord(value) ? value : {};
-}
-
-function stringArray(value: unknown): string[] {
-  return Array.isArray(value) ? value.map(item => String(item)).filter(Boolean) : [];
-}
-
-function optionalNumber(value: unknown): number | undefined {
-  const numberValue = Number(value);
-  return Number.isFinite(numberValue) ? numberValue : undefined;
-}
-
-function normalizeImageItem(value: unknown): ImageItem | null {
-  if (!isRecord(value)) return null;
-  const id = String(value.id || '');
-  const path = String(value.path || '');
-  if (!id || !path) return null;
-  return {
-    id,
-    path,
-    thumb_url: typeof value.thumb_url === 'string' ? value.thumb_url : undefined,
-    tags: stringArray(value.tags),
-    auto_tags: stringArray(value.auto_tags),
-    folder_tags: stringArray(value.folder_tags),
-    user_tags: stringArray(value.user_tags),
-    width: optionalNumber(value.width),
-    height: optionalNumber(value.height),
-    aspect_ratio: optionalNumber(value.aspect_ratio),
-    size: optionalNumber(value.size),
-    mtime: optionalNumber(value.mtime)
-  };
-}
-
-function imageArray(value: unknown): ImageItem[] {
-  return Array.isArray(value)
-    ? value.map(normalizeImageItem).filter((item): item is ImageItem => Boolean(item))
-    : [];
-}
-
-function imagesFromRecord(value: JsonRecord): ImageItem[] {
-  const items = imageArray(value.items);
-  return items.length || Array.isArray(value.items) ? items : imageArray(value.images);
-}
-
-function imagePage(value: unknown): ImagePage | null {
-  if (!isRecord(value)) return null;
-  return {
-    total: value.total,
-    next_cursor: typeof value.next_cursor === 'string' ? value.next_cursor : null,
-    has_more: Boolean(value.has_more)
-  };
 }
 
 function statusResponse(value: JsonRecord): StatusResponse {
@@ -489,416 +336,6 @@ function isTextEntryTarget(target: EventTarget | null): boolean {
   return ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)
     || target.isContentEditable
     || Boolean(target.closest('[contenteditable]:not([contenteditable="false"])'));
-}
-
-class PreviewModal {
-  readonly options: PreviewModalOptions;
-  readonly modal: HTMLElement;
-  readonly viewport: HTMLElement;
-  readonly stage: HTMLElement;
-  readonly thumbnail: HTMLImageElement;
-  readonly image: HTMLImageElement;
-  readonly closeBtn: HTMLElement;
-  readonly zoomLevel: HTMLElement;
-  readonly onClosed?: () => void;
-  isOpen = false;
-  fitMode = true;
-  scale = 1;
-  minScale: number;
-  maxScale: number;
-  offsetX = 0;
-  offsetY = 0;
-  isDragging = false;
-  hasDragged = false;
-  dragStartX = 0;
-  dragStartY = 0;
-  lastX = 0;
-  lastY = 0;
-  imageWidth = 0;
-  imageHeight = 0;
-  containerWidth = 0;
-  containerHeight = 0;
-
-  private generation = 0;
-  private thumbnailRetryTimer: ReturnType<typeof setTimeout> | null = null;
-  private thumbnailObjectUrl: string | null = null;
-
-  private readonly boundWheel = this.handleWheel.bind(this);
-  private readonly boundMouseDown = this.handleMouseDown.bind(this);
-  private readonly boundMouseMove = this.handleMouseMove.bind(this);
-  private readonly boundMouseUp = this.handleMouseUp.bind(this);
-  private readonly boundBackdropClick = this.handleBackdropClick.bind(this);
-  private readonly boundCloseClick = this.close.bind(this);
-  private readonly boundResize = this.handleResize.bind(this);
-  private readonly boundDoubleClick = this.handleDoubleClick.bind(this);
-
-  constructor(options: Partial<PreviewModalOptions> = {}, onClosed?: () => void) {
-    this.options = {...PREVIEW_MODAL_DEFAULTS, ...options};
-    this.modal = requireElement(this.options.modalId, HTMLElement, "Preview modal element is missing");
-    this.viewport = requireElement(this.options.viewportId, HTMLElement, "Preview viewport element is missing");
-    this.stage = requireElement(this.options.stageId, HTMLElement, "Preview image stage is missing");
-    this.thumbnail = requireElement(this.options.thumbnailId, HTMLImageElement, "Preview thumbnail is missing");
-    this.image = requireElement(this.options.imageId, HTMLImageElement, "Preview original image is missing");
-    this.closeBtn = requireElement(this.options.closeId, HTMLElement, "Preview close button is missing");
-    this.zoomLevel = requireElement(this.options.zoomId, HTMLElement, "Preview zoom label is missing");
-    this.minScale = Number(this.options.minScale);
-    this.maxScale = Number(this.options.maxScale);
-    this.onClosed = onClosed;
-    if (!Number.isFinite(this.minScale) || this.minScale <= 0) this.minScale = PREVIEW_MODAL_DEFAULTS.minScale;
-    if (!Number.isFinite(this.maxScale) || this.maxScale <= this.minScale) this.maxScale = PREVIEW_MODAL_DEFAULTS.maxScale;
-    this.initEventListeners();
-  }
-
-  private notifyShell(open: boolean): void {
-    if (!this.options.postToParent) return;
-    if (!window.parent || window.parent === window) return;
-    window.parent.postMessage({ type: this.options.messageType, open: Boolean(open) }, "*");
-  }
-
-  private initEventListeners(): void {
-    this.closeBtn.addEventListener("click", this.boundCloseClick);
-    this.modal.addEventListener("click", this.boundBackdropClick);
-    this.stage.addEventListener("wheel", this.boundWheel, { passive: false });
-    this.stage.addEventListener("mousedown", this.boundMouseDown);
-    this.stage.addEventListener("mousemove", this.boundMouseMove);
-    this.stage.addEventListener("mouseup", this.boundMouseUp);
-    this.stage.addEventListener("mouseleave", this.boundMouseUp);
-    this.stage.addEventListener("dblclick", this.boundDoubleClick);
-    window.addEventListener("resize", this.boundResize);
-  }
-
-  private handleBackdropClick(event: MouseEvent): void {
-    if (event.target === this.modal) this.close();
-  }
-
-  open(source: PreviewImageRequest): void {
-    this.releaseMedia(false);
-    const generation = this.generation;
-    this.imageWidth = Math.max(1, source.width);
-    this.imageHeight = Math.max(1, source.height);
-    this.modal.style.display = "block";
-    this.modal.setAttribute("aria-hidden", "false");
-    this.isOpen = true;
-    this.fit();
-    this.modal.dataset.imageId = source.imageId;
-    this.stage.dataset.imageId = source.imageId;
-    this.stage.dataset.originalState = "loading";
-    this.stage.classList.remove("original-ready");
-    this.thumbnail.dataset.state = "loading";
-    this.thumbnail.alt = source.alt;
-    this.image.dataset.state = "loading";
-    this.image.alt = source.alt;
-    this.notifyShell(true);
-    this.render();
-
-    this.thumbnail.onload = () => {
-      if (!this.isCurrent(generation, source.imageId)) return;
-      this.thumbnail.dataset.state = "ready";
-    };
-    this.thumbnail.onerror = () => {
-      if (!this.isCurrent(generation, source.imageId)) return;
-      this.thumbnail.onload = null;
-      this.thumbnail.onerror = null;
-      void this.loadFallbackThumbnail(source, generation);
-    };
-    this.thumbnail.src = source.thumbnailUrl;
-
-    this.image.onload = () => {
-      if (!this.isCurrent(generation, source.imageId)) return;
-      const naturalWidth = this.image.naturalWidth || this.imageWidth;
-      const naturalHeight = this.image.naturalHeight || this.imageHeight;
-      this.adoptNaturalDimensions(naturalWidth, naturalHeight);
-      this.image.dataset.state = "ready";
-      this.stage.dataset.originalState = "ready";
-      this.stage.classList.add("original-ready");
-      requestAnimationFrame(() => requestAnimationFrame(() => {
-        if (this.isCurrent(generation, source.imageId)) source.onOriginalReady?.();
-      }));
-    };
-    this.image.onerror = () => {
-      if (!this.isCurrent(generation, source.imageId)) return;
-      this.image.dataset.state = "error";
-      this.stage.dataset.originalState = "error";
-      source.onOriginalError?.();
-    };
-    this.image.src = source.originalUrl;
-  }
-
-  close(): void {
-    const wasOpen = this.isOpen;
-    this.modal.style.display = "none";
-    this.modal.setAttribute("aria-hidden", "true");
-    this.modal.classList.remove("preview-focus-mode", "preview-inspector-hidden");
-    this.isOpen = false;
-    this.isDragging = false;
-    this.hasDragged = false;
-    const generation = this.releaseMedia(false);
-    this.releaseSourcesAfterPaint(generation);
-    this.notifyShell(false);
-    if (wasOpen) this.onClosed?.();
-  }
-
-  private isCurrent(generation: number, imageId: string): boolean {
-    return this.isOpen && this.generation === generation && this.modal.dataset.imageId === imageId;
-  }
-
-  private releaseMedia(removeSources = true): number {
-    this.generation += 1;
-    if (this.thumbnailRetryTimer) clearTimeout(this.thumbnailRetryTimer);
-    this.thumbnailRetryTimer = null;
-    if (this.thumbnailObjectUrl) URL.revokeObjectURL(this.thumbnailObjectUrl);
-    this.thumbnailObjectUrl = null;
-    this.thumbnail.onload = null;
-    this.thumbnail.onerror = null;
-    this.image.onload = null;
-    this.image.onerror = null;
-    if (removeSources) {
-      this.thumbnail.removeAttribute("src");
-      this.image.removeAttribute("src");
-    }
-    this.thumbnail.dataset.state = "idle";
-    this.image.dataset.state = "idle";
-    this.stage.dataset.originalState = "idle";
-    this.stage.classList.remove("original-ready");
-    delete this.modal.dataset.imageId;
-    delete this.stage.dataset.imageId;
-    return this.generation;
-  }
-
-  private releaseSourcesAfterPaint(generation: number): void {
-    requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(() => {
-      if (this.generation !== generation || this.isOpen) return;
-      this.thumbnail.removeAttribute("src");
-      this.image.removeAttribute("src");
-    }, 0)));
-  }
-
-  private async loadFallbackThumbnail(source: PreviewImageRequest, generation: number, attempt = 0): Promise<void> {
-    try {
-      const response = await fetch(source.thumbnailFallbackUrl, {cache: "no-store"});
-      if (!this.isCurrent(generation, source.imageId)) return;
-      if (response.status === 200) {
-        const objectUrl = URL.createObjectURL(await response.blob());
-        if (!this.isCurrent(generation, source.imageId)) {
-          URL.revokeObjectURL(objectUrl);
-          return;
-        }
-        this.thumbnailObjectUrl = objectUrl;
-        this.thumbnail.onload = () => {
-          if (!this.isCurrent(generation, source.imageId)) return;
-          this.thumbnail.dataset.state = "ready";
-          URL.revokeObjectURL(objectUrl);
-          if (this.thumbnailObjectUrl === objectUrl) this.thumbnailObjectUrl = null;
-        };
-        this.thumbnail.onerror = () => {
-          URL.revokeObjectURL(objectUrl);
-          if (this.thumbnailObjectUrl === objectUrl) this.thumbnailObjectUrl = null;
-          if (this.isCurrent(generation, source.imageId)) this.thumbnail.dataset.state = "error";
-        };
-        this.thumbnail.src = objectUrl;
-        return;
-      }
-      if (response.status === 202 && attempt < 120) {
-        const payload = await readJsonRecord(response).catch((): JsonRecord => ({}));
-        const delay = Math.min(1500, Math.max(80, Number(payload.retry_after_ms || 180)));
-        this.thumbnailRetryTimer = setTimeout(() => {
-          this.thumbnailRetryTimer = null;
-          if (this.isCurrent(generation, source.imageId)) {
-            void this.loadFallbackThumbnail(source, generation, attempt + 1);
-          }
-        }, delay);
-        return;
-      }
-    } catch (error) {
-      console.warn("Preview thumbnail request failed", {imageId: source.imageId, attempt, error});
-    }
-    if (this.isCurrent(generation, source.imageId)) this.thumbnail.dataset.state = "error";
-  }
-
-  private measureViewport(): void {
-    const rect = this.viewport.getBoundingClientRect();
-    this.containerWidth = Math.max(1, rect.width);
-    this.containerHeight = Math.max(1, rect.height);
-  }
-
-  fit(): void {
-    if (!this.isOpen) return;
-    this.measureViewport();
-    let fill = Number(this.options.initialViewportFill);
-    if (!Number.isFinite(fill) || fill <= 0 || fill > 1) fill = PREVIEW_MODAL_DEFAULTS.initialViewportFill;
-    const scaleX = (this.containerWidth * fill) / this.imageWidth;
-    const scaleY = (this.containerHeight * fill) / this.imageHeight;
-    const fitScale = Math.min(scaleX, scaleY, previewFocusMode ? this.maxScale : 1);
-    this.minScale = Math.min(Number(this.options.minScale), fitScale);
-    this.scale = clamp(fitScale, this.minScale, this.maxScale);
-    this.fitMode = true;
-    this.offsetX = (this.containerWidth - this.imageWidth * this.scale) / 2;
-    this.offsetY = (this.containerHeight - this.imageHeight * this.scale) / 2;
-    this.render();
-  }
-
-  oneToOne(): void {
-    if (!this.isOpen) return;
-    this.measureViewport();
-    this.fitMode = false;
-    this.scale = clamp(1, this.minScale, this.maxScale);
-    this.offsetX = (this.containerWidth - this.imageWidth * this.scale) / 2;
-    this.offsetY = (this.containerHeight - this.imageHeight * this.scale) / 2;
-    this.constrainOffset();
-    this.render();
-  }
-
-  zoomBy(factor: number): void {
-    if (!this.isOpen || !Number.isFinite(factor) || factor <= 0) return;
-    this.measureViewport();
-    this.zoomAt(this.containerWidth / 2, this.containerHeight / 2, factor);
-  }
-
-  panBy(dx: number, dy: number): void {
-    if (!this.isOpen || !Number.isFinite(dx) || !Number.isFinite(dy)) return;
-    this.offsetX += dx;
-    this.offsetY += dy;
-    this.constrainOffset();
-    this.render();
-  }
-
-  refreshLayout(): void {
-    if (!this.isOpen) return;
-    if (this.fitMode) {
-      this.fit();
-      return;
-    }
-    this.handleResize();
-  }
-
-  private adoptNaturalDimensions(width: number, height: number): void {
-    if (width <= 0 || height <= 0 || (width === this.imageWidth && height === this.imageHeight)) return;
-    if (this.fitMode) {
-      this.imageWidth = width;
-      this.imageHeight = height;
-      this.fit();
-      return;
-    }
-    const centerX = (this.containerWidth / 2 - this.offsetX) / (this.imageWidth * this.scale);
-    const centerY = (this.containerHeight / 2 - this.offsetY) / (this.imageHeight * this.scale);
-    this.imageWidth = width;
-    this.imageHeight = height;
-    this.offsetX = this.containerWidth / 2 - centerX * this.imageWidth * this.scale;
-    this.offsetY = this.containerHeight / 2 - centerY * this.imageHeight * this.scale;
-    this.constrainOffset();
-    this.render();
-  }
-
-  private zoomAt(mouseX: number, mouseY: number, factor: number): void {
-    const newScale = clamp(this.scale * factor, this.minScale, this.maxScale);
-    if (Math.abs(newScale - this.scale) < 0.0001) return;
-    const canvasX = (mouseX - this.offsetX) / this.scale;
-    const canvasY = (mouseY - this.offsetY) / this.scale;
-    this.scale = newScale;
-    this.fitMode = false;
-    this.offsetX = mouseX - canvasX * this.scale;
-    this.offsetY = mouseY - canvasY * this.scale;
-    this.constrainOffset();
-    this.render();
-  }
-
-  private handleWheel(event: WheelEvent): void {
-    event.preventDefault();
-    const viewportRect = this.viewport.getBoundingClientRect();
-    const mouseX = event.clientX - viewportRect.left;
-    const mouseY = event.clientY - viewportRect.top;
-    this.zoomAt(mouseX, mouseY, event.deltaY > 0 ? 0.9 : 1.1);
-  }
-
-  private handleDoubleClick(event: MouseEvent): void {
-    event.preventDefault();
-    if (this.fitMode) this.oneToOne();
-    else this.fit();
-  }
-
-  private handleMouseDown(event: MouseEvent): void {
-    if (event.button !== 0) return;
-    const scaledWidth = this.imageWidth * this.scale;
-    const scaledHeight = this.imageHeight * this.scale;
-    if (scaledWidth <= this.containerWidth && scaledHeight <= this.containerHeight) return;
-    this.isDragging = true;
-    this.hasDragged = false;
-    this.dragStartX = event.clientX;
-    this.dragStartY = event.clientY;
-    this.lastX = event.clientX;
-    this.lastY = event.clientY;
-    this.stage.style.cursor = "grabbing";
-  }
-
-  private handleMouseMove(event: MouseEvent): void {
-    if (!this.isDragging) return;
-    const deltaX = event.clientX - this.lastX;
-    const deltaY = event.clientY - this.lastY;
-    const totalDx = event.clientX - this.dragStartX;
-    const totalDy = event.clientY - this.dragStartY;
-    if (!this.hasDragged && (Math.abs(totalDx) > 3 || Math.abs(totalDy) > 3)) this.hasDragged = true;
-    if (this.hasDragged) {
-      this.offsetX += deltaX;
-      this.offsetY += deltaY;
-      this.constrainOffset();
-      this.render();
-    }
-    this.lastX = event.clientX;
-    this.lastY = event.clientY;
-  }
-
-  private handleMouseUp(): void {
-    if (!this.isDragging) return;
-    this.isDragging = false;
-    this.hasDragged = false;
-    this.render();
-  }
-
-  private handleResize(): void {
-    if (!this.isOpen) return;
-    if (this.fitMode) {
-      this.fit();
-      return;
-    }
-    const oldWidth = this.containerWidth;
-    const oldHeight = this.containerHeight;
-    const centerX = (oldWidth / 2 - this.offsetX) / (this.imageWidth * this.scale);
-    const centerY = (oldHeight / 2 - this.offsetY) / (this.imageHeight * this.scale);
-    this.measureViewport();
-    this.offsetX = this.containerWidth / 2 - centerX * this.imageWidth * this.scale;
-    this.offsetY = this.containerHeight / 2 - centerY * this.imageHeight * this.scale;
-    this.constrainOffset();
-    this.render();
-  }
-
-  private constrainOffset(): void {
-    const scaledWidth = this.imageWidth * this.scale;
-    const scaledHeight = this.imageHeight * this.scale;
-    const minOffsetX = this.containerWidth - scaledWidth;
-    const maxOffsetX = 0;
-    const minOffsetY = this.containerHeight - scaledHeight;
-    const maxOffsetY = 0;
-    if (scaledWidth < this.containerWidth) this.offsetX = (this.containerWidth - scaledWidth) / 2;
-    else this.offsetX = Math.max(minOffsetX, Math.min(maxOffsetX, this.offsetX));
-    if (scaledHeight < this.containerHeight) this.offsetY = (this.containerHeight - scaledHeight) / 2;
-    else this.offsetY = Math.max(minOffsetY, Math.min(maxOffsetY, this.offsetY));
-  }
-
-  private render(): void {
-    if (!this.isOpen) return;
-    const scaledWidth = this.imageWidth * this.scale;
-    const scaledHeight = this.imageHeight * this.scale;
-    this.stage.style.width = `${scaledWidth}px`;
-    this.stage.style.height = `${scaledHeight}px`;
-    this.stage.style.left = `${this.offsetX}px`;
-    this.stage.style.top = `${this.offsetY}px`;
-    const zoomText = this.fitMode ? "FIT" : `${Math.round(this.scale * 100)}%`;
-    this.zoomLevel.textContent = zoomText;
-    const hudMode = optionalHtml("preview-hud-mode");
-    if (hudMode) hudMode.textContent = zoomText;
-    const canPan = scaledWidth > this.containerWidth || scaledHeight > this.containerHeight;
-    this.stage.style.cursor = this.isDragging ? "grabbing" : (canPan ? "grab" : "default");
-  }
 }
 
 let allImages: ImageItem[] = [];
@@ -981,7 +418,6 @@ let problemsListReloadQueued = false;
 let problemsPollTimer: ReturnType<typeof setInterval> | null = null;
 const problemRowRechecks = new Set<number>();
 const terminalThumbIds = new Set<string>();
-const thumbLifecycles = new Map<string, ThumbLifecycle>();
 const thumbnailScrollState: ThumbnailScrollState = {
   offset: null,
   sampledAt: null,
@@ -992,15 +428,12 @@ const thumbnailScrollState: ThumbnailScrollState = {
   fastSamples: 0,
   slowSamples: 0,
 };
-let thumbLifecycleGeneration = 0;
 let thumbnailAdmissionFrame: number | null = null;
 let thumbnailScrollSettleTimer: ReturnType<typeof setTimeout> | null = null;
 let terminalGalleryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 const forwardedGalleryArrowDirections = new Set<GalleryArrowDirection>();
 const PAGE = 48;
-const MASONRY_COL_MIN = 218;
 const GALLERY_OVERSCAN = 20;
-const CARD_BORDER_WIDTH = 1;
 const GALLERY_BROWSER_ARROW_STEP = 96;
 const VIEWER_KEYBOARD_PAN_STEP = 80;
 const THUMB_VELOCITY_EMA_ALPHA = 0.35;
@@ -1010,15 +443,15 @@ const THUMB_FAST_ENTER_SAMPLES = 2;
 const THUMB_FAST_EXIT_SAMPLES = 2;
 const THUMB_SCROLL_SAMPLE_MAX_MS = 250;
 const THUMB_SCROLL_SETTLE_FALLBACK_MS = 180;
-const THUMB_NEAR_LOOKAHEAD_MIN_PX = 480;
-const THUMB_NEAR_LOOKAHEAD_VIEWPORTS = 0.75;
-const THUMB_POLL_INITIAL_DELAY_MS = 300;
-const THUMB_POLL_BACKOFF = 1.5;
-const THUMB_POLL_MAX_INTERVAL_MS = 2000;
-const THUMB_POLL_MAX_ATTEMPTS = 30;
-const THUMB_POLL_MAX_LIFETIME_MS = 45_000;
 const SORT_MODES: SortMode[] = ['path_asc', 'path_desc', 'date_desc', 'date_asc', 'size_desc', 'size_asc'];
 const DEFAULT_SORT_MODE: SortMode = 'date_desc';
+const thumbnailLifecycles = new ThumbnailLifecycleManager({
+  isTerminal: imageId => terminalThumbIds.has(imageId),
+  onTerminalUnavailable: handleTerminalImageUnavailable,
+  scheduleAdmissionEvaluation: scheduleThumbnailAdmissionEvaluation,
+  diagnosticRef: diagnosticCardRef,
+  diagnostics: galleryDiagnostics,
+});
 
 function isSortMode(mode: string | undefined): mode is SortMode {
   return Boolean(mode && SORT_MODES.includes(mode as SortMode));
@@ -1842,12 +1275,6 @@ function startProblemsPolling(): void {
   }, 10_000);
 }
 
-function pageTotalValue(page: ImagePage | null | undefined): number | null {
-  if (!page || page.total === null || page.total === undefined || page.total === '') return null;
-  const total = Number(page.total);
-  return Number.isFinite(total) ? total : null;
-}
-
 function setServerTotalFromPage(page: ImagePage | null | undefined, fallbackCount: number, resetKnown: boolean): void {
   const total = pageTotalValue(page);
   if (total !== null) {
@@ -1857,18 +1284,6 @@ function setServerTotalFromPage(page: ImagePage | null | undefined, fallbackCoun
   }
   if (resetKnown) serverTotalKnown = false;
   if (!serverTotalKnown) serverTotal = Number(fallbackCount || 0);
-}
-
-function mergeRefreshedPageIntoLoadedImages(existing: ImageItem[], refreshedPage: ImageItem[]): ImageItem[] {
-  if (!existing.length) return refreshedPage.slice();
-  if (!refreshedPage.length) return existing.slice();
-
-  const refreshedById = new Map(refreshedPage.map(img => [img.id, img]));
-  const retained = existing
-    .map(img => refreshedById.get(img.id) || img)
-    .filter(img => !refreshedById.has(img.id));
-
-  return [...refreshedPage, ...retained];
 }
 
 function updateImageCounter(): void {
@@ -1883,13 +1298,14 @@ async function refreshImages(clear = true): Promise<void> {
   activePageLoad = null;
   isLoadingPage = true;
   const tab = activeTab();
-  const params = new URLSearchParams();
-  if (tab.includeTags && tab.includeTags.length) params.set('include_tags', tab.includeTags.join(','));
-  if (tab.excludeTags && tab.excludeTags.length) params.set('exclude_tags', tab.excludeTags.join(','));
-  params.set('match_mode', tab.matchMode === 'all' ? 'all' : 'any');
-  params.set('limit', String(PAGE));
-  params.set('sort', tab.sortMode || DEFAULT_SORT_MODE);
-  params.set('include_total', '1');
+  const params = buildImageQueryParams({
+    includeTags: tab.includeTags || [],
+    excludeTags: tab.excludeTags || [],
+    matchMode: tab.matchMode === 'all' ? 'all' : 'any',
+    limit: PAGE,
+    sortMode: tab.sortMode || DEFAULT_SORT_MODE,
+    includeTotal: true,
+  });
   try {
     const r = await fetch('/api/images?' + params.toString());
     galleryDiagnostics.pageResponse(diagnosticPage, r);
@@ -1966,14 +1382,15 @@ function loadNextImagesPage(): Promise<void> {
   const load = {requestId, promise: Promise.resolve()};
   load.promise = (async () => {
     const tab = activeTab();
-    const params = new URLSearchParams();
-    if (tab.includeTags && tab.includeTags.length) params.set('include_tags', tab.includeTags.join(','));
-    if (tab.excludeTags && tab.excludeTags.length) params.set('exclude_tags', tab.excludeTags.join(','));
-    params.set('match_mode', tab.matchMode === 'all' ? 'all' : 'any');
-    params.set('limit', String(PAGE));
-    params.set('sort', tab.sortMode || DEFAULT_SORT_MODE);
-    params.set('include_total', '0');
-    params.set('cursor', cursor);
+    const params = buildImageQueryParams({
+      includeTags: tab.includeTags || [],
+      excludeTags: tab.excludeTags || [],
+      matchMode: tab.matchMode === 'all' ? 'all' : 'any',
+      limit: PAGE,
+      sortMode: tab.sortMode || DEFAULT_SORT_MODE,
+      includeTotal: false,
+      cursor,
+    });
     try {
       const r = await fetch('/api/images?' + params.toString());
       galleryDiagnostics.pageResponse(diagnosticPage, r);
@@ -2042,20 +1459,6 @@ function thumbnailUrls(img: ImageItem): {primary: string; fallback: string; vers
     fallback: `/thumb/${img.id}?v=${version}`,
     version,
   };
-}
-
-async function decodeCurrentThumbnail(
-  image: HTMLImageElement,
-  expectedSrc: string,
-  isCurrent: () => boolean,
-): Promise<ThumbnailDecodeResult> {
-  try {
-    await image.decode();
-  } catch {
-    return isCurrent() && image.currentSrc === expectedSrc ? 'failed' : 'stale';
-  }
-  if (!isCurrent() || image.currentSrc !== expectedSrc) return 'stale';
-  return image.complete && image.naturalWidth > 0 ? 'ready' : 'failed';
 }
 
 function bindDiagnosticCardRef(image: HTMLImageElement, ref: DiagnosticCardRef | null): void {
@@ -2189,7 +1592,7 @@ function makeCard(
     primaryState = 'failed';
     galleryDiagnostics.primaryFailed(diagnosticCardRef(ph));
     if (ph.dataset.fallbackSrc && ph.dataset.primarySrc) {
-      registerMissingThumbnail(ph);
+      thumbnailLifecycles.registerMissing(ph);
       return;
     }
     ph.classList.add('loaded');
@@ -2238,220 +1641,6 @@ function updateCardForImage(img: ImageItem): void {
   if (tags) tags.innerHTML = renderTagChips(img);
 }
 
-function currentThumbLifecycle(lifecycle: ThumbLifecycle): boolean {
-  return thumbLifecycles.get(lifecycle.imageId) === lifecycle
-    && lifecycle.image.isConnected
-    && lifecycle.image.dataset.thumbLifecycleGeneration === String(lifecycle.generation)
-    && !terminalThumbIds.has(lifecycle.imageId);
-}
-
-function cancelThumbLifecycle(imageId: string): void {
-  const lifecycle = thumbLifecycles.get(imageId);
-  if (!lifecycle) return;
-  if (lifecycle.timer) clearTimeout(lifecycle.timer);
-  lifecycle.timer = null;
-  lifecycle.controller?.abort();
-  lifecycle.controller = null;
-  thumbLifecycles.delete(imageId);
-}
-
-function registerMissingThumbnail(image: HTMLImageElement): void {
-  const imageId = String(image.dataset.imageId || image.closest<HTMLElement>('.card[data-id]')?.dataset.id || '');
-  const primaryUrl = String(image.dataset.primarySrc || '');
-  const admissionUrl = String(image.dataset.fallbackSrc || '');
-  const version = Number(image.dataset.thumbVersion || 0);
-  if (!imageId || !primaryUrl || !admissionUrl || terminalThumbIds.has(imageId)) return;
-  const existing = thumbLifecycles.get(imageId);
-  if (existing?.image === image && existing.version === version) return;
-  cancelThumbLifecycle(imageId);
-  const lifecycle: ThumbLifecycle = {
-    imageId,
-    version,
-    image,
-    primaryUrl,
-    admissionUrl,
-    state: 'missing',
-    generation: ++thumbLifecycleGeneration,
-    startedAt: 0,
-    pollAttempts: 0,
-    timer: null,
-    controller: null,
-  };
-  image.dataset.thumbLifecycleGeneration = String(lifecycle.generation);
-  thumbLifecycles.set(imageId, lifecycle);
-  scheduleThumbnailAdmissionEvaluation();
-}
-
-function setThumbnailFromBlob(lifecycle: ThumbLifecycle, blob: Blob): void {
-  if (!currentThumbLifecycle(lifecycle)) return;
-  const image = lifecycle.image;
-  const diagnosticRef = diagnosticCardRef(image);
-  const objectUrl = URL.createObjectURL(blob);
-  image.dataset.objectUrl = objectUrl;
-  const releaseObjectUrl = () => {
-    URL.revokeObjectURL(objectUrl);
-    if (image.dataset.objectUrl === objectUrl) delete image.dataset.objectUrl;
-  };
-  const handleFallbackLoad = () => {
-    const expectedSrc = image.currentSrc;
-    void decodeCurrentThumbnail(
-      image,
-      expectedSrc,
-      () => currentThumbLifecycle(lifecycle)
-        && image.onload === handleFallbackLoad
-        && image.dataset.objectUrl === objectUrl,
-    ).then(result => {
-      if (result === 'stale') {
-        releaseObjectUrl();
-        return;
-      }
-      if (result === 'failed') {
-        galleryDiagnostics.fallbackImageFailed(diagnosticRef);
-        failThumbLifecycle(lifecycle, 'fallback_decode_error');
-        releaseObjectUrl();
-        return;
-      }
-      galleryDiagnostics.fallbackImageLoaded(diagnosticRef, true);
-      image.classList.add('loaded');
-      releaseObjectUrl();
-      thumbLifecycles.delete(lifecycle.imageId);
-      scheduleThumbnailAdmissionEvaluation();
-    });
-  };
-  image.onload = handleFallbackLoad;
-  image.onerror = () => {
-    galleryDiagnostics.fallbackImageFailed(diagnosticRef);
-    failThumbLifecycle(lifecycle, 'fallback_decode_error');
-    releaseObjectUrl();
-  };
-  image.src = objectUrl;
-}
-
-function failThumbLifecycle(lifecycle: ThumbLifecycle, reason: string): void {
-  if (!currentThumbLifecycle(lifecycle)) return;
-  const image = lifecycle.image;
-  galleryDiagnostics.terminalThumbnailError(diagnosticCardRef(image), reason);
-  cancelThumbLifecycle(lifecycle.imageId);
-  image.classList.add('loaded');
-  image.alt = 'Ошибка загрузки';
-  scheduleThumbnailAdmissionEvaluation();
-}
-
-function unavailableThumbLifecycle(lifecycle: ThumbLifecycle): void {
-  if (!currentThumbLifecycle(lifecycle)) return;
-  galleryDiagnostics.terminalThumbnailUnavailable(diagnosticCardRef(lifecycle.image));
-  handleTerminalImageUnavailable(lifecycle.imageId);
-}
-
-function thumbAdmissionRequestUrl(lifecycle: ThumbLifecycle, admissionClass: ThumbAdmissionClass): string {
-  const url = new URL(lifecycle.admissionUrl, window.location.href);
-  url.searchParams.set('class', admissionClass);
-  return `${url.pathname}${url.search}`;
-}
-
-async function admitMissingThumbnail(
-  lifecycle: ThumbLifecycle,
-  admissionClass: ThumbAdmissionClass,
-): Promise<void> {
-  if (!currentThumbLifecycle(lifecycle) || lifecycle.state !== 'missing') return;
-  lifecycle.state = 'admitting';
-  lifecycle.startedAt = performance.now();
-  const controller = new AbortController();
-  lifecycle.controller = controller;
-  const diagnosticRef = diagnosticCardRef(lifecycle.image);
-  const diagnosticStartedAt = galleryDiagnostics.fallbackAttemptStarted(diagnosticRef);
-  const url = thumbAdmissionRequestUrl(lifecycle, admissionClass);
-  try {
-    const response = await fetch(url, {cache: 'no-store', signal: controller.signal});
-    galleryDiagnostics.fallbackResponse(diagnosticRef, response.status, diagnosticStartedAt);
-    if (!currentThumbLifecycle(lifecycle)) return;
-    if (response.status === 200) {
-      setThumbnailFromBlob(lifecycle, await response.blob());
-      return;
-    }
-    if (response.status === 202) {
-      let initialDelay = THUMB_POLL_INITIAL_DELAY_MS;
-      try {
-        const payload = await readJsonRecord(response);
-        initialDelay = Math.max(initialDelay, Number(payload.retry_after_ms || 0));
-      } catch {}
-      lifecycle.state = 'polling';
-      scheduleThumbFilePoll(lifecycle, Math.min(initialDelay, THUMB_POLL_MAX_INTERVAL_MS));
-      return;
-    }
-    if (response.status === 422) {
-      const payload = await readJsonRecord(response).catch((): JsonRecord => ({}));
-      if (payload.error === 'image_unavailable') {
-        unavailableThumbLifecycle(lifecycle);
-        return;
-      }
-    }
-    console.warn('Thumbnail admission failed', {url, status: response.status, admissionClass});
-    failThumbLifecycle(lifecycle, `fallback_http_${response.status}`);
-  } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') return;
-    galleryDiagnostics.fallbackNetworkError(diagnosticRef);
-    console.warn('Thumbnail admission failed', {url, admissionClass, error});
-    failThumbLifecycle(lifecycle, 'fallback_network_error');
-  } finally {
-    if (lifecycle.controller === controller) lifecycle.controller = null;
-  }
-}
-
-function scheduleThumbFilePoll(lifecycle: ThumbLifecycle, delay?: number): void {
-  if (!currentThumbLifecycle(lifecycle) || lifecycle.state !== 'polling') return;
-  const elapsed = performance.now() - lifecycle.startedAt;
-  if (lifecycle.pollAttempts >= THUMB_POLL_MAX_ATTEMPTS || elapsed >= THUMB_POLL_MAX_LIFETIME_MS) {
-    failThumbLifecycle(lifecycle, 'thumb_file_poll_exhausted');
-    return;
-  }
-  const nextDelay = delay ?? Math.min(
-    THUMB_POLL_MAX_INTERVAL_MS,
-    THUMB_POLL_INITIAL_DELAY_MS * THUMB_POLL_BACKOFF ** lifecycle.pollAttempts,
-  );
-  lifecycle.timer = setTimeout(() => {
-    lifecycle.timer = null;
-    void pollThumbFile(lifecycle);
-  }, nextDelay);
-}
-
-async function pollThumbFile(lifecycle: ThumbLifecycle): Promise<void> {
-  if (!currentThumbLifecycle(lifecycle) || lifecycle.state !== 'polling') return;
-  lifecycle.pollAttempts += 1;
-  const controller = new AbortController();
-  lifecycle.controller = controller;
-  const diagnosticRef = diagnosticCardRef(lifecycle.image);
-  const diagnosticStartedAt = galleryDiagnostics.fallbackAttemptStarted(diagnosticRef);
-  try {
-    const response = await fetch(lifecycle.primaryUrl, {cache: 'no-store', signal: controller.signal});
-    galleryDiagnostics.fallbackResponse(diagnosticRef, response.status, diagnosticStartedAt);
-    if (!currentThumbLifecycle(lifecycle)) return;
-    if (response.status === 200) {
-      setThumbnailFromBlob(lifecycle, await response.blob());
-      return;
-    }
-    if (response.status === 404) {
-      scheduleThumbFilePoll(lifecycle);
-      return;
-    }
-    if (response.status === 422) {
-      const payload = await readJsonRecord(response).catch((): JsonRecord => ({}));
-      if (payload.error === 'image_unavailable') {
-        unavailableThumbLifecycle(lifecycle);
-        return;
-      }
-    }
-    console.warn('Thumbnail cache poll failed', {url: lifecycle.primaryUrl, status: response.status});
-    failThumbLifecycle(lifecycle, `thumb_file_http_${response.status}`);
-  } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') return;
-    galleryDiagnostics.fallbackNetworkError(diagnosticRef);
-    if (currentThumbLifecycle(lifecycle)) scheduleThumbFilePoll(lifecycle);
-  } finally {
-    if (lifecycle.controller === controller) lifecycle.controller = null;
-  }
-}
-
 function acceptActiveImage(imageId: string): void {
   terminalThumbIds.delete(imageId);
 }
@@ -2461,7 +1650,7 @@ function handleTerminalImageUnavailable(imageId: string): void {
   terminalThumbIds.add(imageId);
   selectedImageIds.delete(imageId);
   updateImageSelectionUi();
-  cancelThumbLifecycle(imageId);
+  thumbnailLifecycles.cancel(imageId);
   if (previewCurrentImageId === imageId) {
     previewRequestToken += 1;
     closePreview(true, false);
@@ -4304,40 +3493,17 @@ function initPreview(): void {
   previewModal = new PreviewModal({}, handlePreviewClosed);
 }
 
-function aspectCss(img: ImageItem): string {
-  const w = Number(img.width || 0);
-  const h = Number(img.height || 0);
-  if (w > 0 && h > 0) return `${w} / ${h}`;
-  const ratio = Number(img.aspect_ratio || 1);
-  return `${Math.max(1, Math.round(ratio * 1000))} / 1000`;
-}
-
-function imageAspectRatio(img: ImageItem): number {
-  const width = Number(img.width || 0);
-  const height = Number(img.height || 0);
-  if (width > 0 && height > 0) return width / height;
-  const ratio = Number(img.aspect_ratio || 1);
-  return Number.isFinite(ratio) && ratio > 0 ? ratio : 1;
-}
-
-function computeGalleryGeometry(): GalleryGeometry {
+function readGalleryGeometry(): GalleryGeometry {
   const gallery = requiredHtml('gallery');
-  const width = Math.max(1, gallery.clientWidth || window.innerWidth || MASONRY_COL_MIN);
   const styles = getComputedStyle(gallery);
   const gap = Number.parseFloat(styles.columnGap || styles.gap || '') || 10;
-  const laneCount = width < 720
-    ? 1
-    : Math.max(1, Math.floor((width + gap) / (MASONRY_COL_MIN + gap)));
-  const laneWidth = (width - gap * (laneCount - 1)) / laneCount;
   const scrollMargin = gallery.getBoundingClientRect().top + window.scrollY;
-  return {width, gap, laneCount, laneWidth, borderWidth: CARD_BORDER_WIDTH, scrollMargin};
-}
-
-function estimateVirtualCardSize(index: number, geometry: GalleryGeometry): number {
-  const image = visibleImages[index];
-  if (!image) return MASONRY_COL_MIN;
-  const contentWidth = Math.max(1, geometry.laneWidth - geometry.borderWidth * 2);
-  return contentWidth / imageAspectRatio(image) + geometry.borderWidth * 2;
+  return computeGalleryGeometry({
+    galleryWidth: gallery.clientWidth,
+    viewportWidth: window.innerWidth,
+    gap,
+    scrollMargin,
+  });
 }
 
 function updateThumbnailScrollState(
@@ -4410,50 +3576,32 @@ function updateThumbnailScrollState(
   thumbnailScrollState.sampledAt = now;
 }
 
-function virtualItemIsNear(
-  item: VirtualItem,
-  geometry: GalleryGeometry,
-  direction: GalleryScrollDirection,
-): boolean {
-  const viewportStart = window.scrollY - geometry.scrollMargin;
-  const viewportEnd = viewportStart + window.innerHeight;
-  const itemStart = item.start - geometry.scrollMargin;
-  const itemEnd = item.end - geometry.scrollMargin;
-  const distance = Math.max(
-    THUMB_NEAR_LOOKAHEAD_MIN_PX,
-    window.innerHeight * THUMB_NEAR_LOOKAHEAD_VIEWPORTS,
-  );
-  if (direction === 'backward') {
-    return itemEnd < viewportStart && viewportStart - itemEnd <= distance;
-  }
-  return itemStart > viewportEnd && itemStart - viewportEnd <= distance;
-}
-
 function reevaluateThumbnailAdmissions(
   instance: Virtualizer<Window, HTMLDivElement> | null = galleryVirtualizer,
 ): void {
   if (!instance || !galleryGeometry || thumbnailScrollState.fast) return;
   const visible: ThumbLifecycle[] = [];
   const near: ThumbLifecycle[] = [];
+  const viewport = {scrollY: window.scrollY, height: window.innerHeight};
   for (const item of instance.getVirtualItems()) {
     const image = visibleImages[item.index];
     if (!image) continue;
-    const lifecycle = thumbLifecycles.get(image.id);
-    if (!lifecycle || !currentThumbLifecycle(lifecycle)) continue;
-    if (virtualItemIsVisible(item, galleryGeometry)) {
+    const lifecycle = thumbnailLifecycles.get(image.id);
+    if (!lifecycle || !thumbnailLifecycles.isCurrent(lifecycle)) continue;
+    if (virtualItemIsVisible(item, galleryGeometry, viewport)) {
       visible.push(lifecycle);
     } else if (
       lifecycle.state === 'missing'
-      && virtualItemIsNear(item, galleryGeometry, thumbnailScrollState.direction)
+      && virtualItemIsNear(item, galleryGeometry, thumbnailScrollState.direction, viewport)
     ) {
       near.push(lifecycle);
     }
   }
   for (const lifecycle of visible) {
-    if (lifecycle.state === 'missing') void admitMissingThumbnail(lifecycle, 'visible');
+    if (lifecycle.state === 'missing') void thumbnailLifecycles.admit(lifecycle, 'visible');
   }
   if (visible.length > 0 || thumbnailScrollState.scrolling) return;
-  for (const lifecycle of near) void admitMissingThumbnail(lifecycle, 'near');
+  for (const lifecycle of near) void thumbnailLifecycles.admit(lifecycle, 'near');
 }
 
 function scheduleThumbnailAdmissionEvaluation(): void {
@@ -4468,7 +3616,7 @@ function galleryVirtualizerOptions(geometry: GalleryGeometry): VirtualizerOption
   return {
     count: visibleImages.length,
     getScrollElement: () => window,
-    estimateSize: index => estimateVirtualCardSize(index, geometry),
+    estimateSize: index => estimateVirtualCardSize(visibleImages[index], geometry),
     getItemKey: index => visibleImages[index]?.id || `missing-${index}`,
     scrollToFn: windowScroll,
     observeElementRect: observeWindowRect,
@@ -4504,39 +3652,19 @@ function cardRenderSignature(image: ImageItem): string {
   ]);
 }
 
-function clearThumbLifecycle(imageId: string, card: HTMLElement): void {
-  cancelThumbLifecycle(imageId);
-  const image = card.querySelector('img');
-  if (image instanceof HTMLImageElement) {
-    image.onload = null;
-    image.onerror = null;
-    const objectUrl = image.dataset.objectUrl;
-    if (objectUrl) URL.revokeObjectURL(objectUrl);
-    delete image.dataset.objectUrl;
-    delete image.dataset.thumbLifecycleGeneration;
-  }
-}
-
 function unmountVirtualCard(imageId: string): void {
   const mounted = mountedGalleryCards.get(imageId);
   if (!mounted) return;
   galleryDiagnostics.cardUnmounted(
     diagnosticCardRef(mounted.card.querySelector<HTMLImageElement>('img')),
   );
-  clearThumbLifecycle(imageId, mounted.card);
+  thumbnailLifecycles.clear(imageId, mounted.card);
   mounted.slot.remove();
   mountedGalleryCards.delete(imageId);
 }
 
 function clearMountedGalleryCards(): void {
   [...mountedGalleryCards.keys()].forEach(unmountVirtualCard);
-}
-
-function virtualItemIsVisible(item: VirtualItem, geometry: GalleryGeometry): boolean {
-  const viewportStart = window.scrollY - geometry.scrollMargin;
-  const viewportEnd = viewportStart + window.innerHeight;
-  const itemStart = item.start - geometry.scrollMargin;
-  return item.end - geometry.scrollMargin >= viewportStart && itemStart <= viewportEnd;
 }
 
 function mountVirtualCard(
@@ -4558,13 +3686,12 @@ function mountVirtualCard(
 }
 
 function positionVirtualCard(mounted: MountedGalleryCard, item: VirtualItem, geometry: GalleryGeometry): void {
-  const x = item.lane * (geometry.laneWidth + geometry.gap);
-  const y = item.start - geometry.scrollMargin;
-  mounted.slot.dataset.index = String(item.index);
-  mounted.slot.dataset.lane = String(item.lane);
-  mounted.slot.style.width = `${geometry.laneWidth}px`;
-  mounted.slot.style.height = `${item.size}px`;
-  mounted.slot.style.transform = `translate(${x}px, ${y}px)`;
+  const layout = calculateVirtualCardLayout(item, geometry);
+  mounted.slot.dataset.index = String(layout.index);
+  mounted.slot.dataset.lane = String(layout.lane);
+  mounted.slot.style.width = `${layout.width}px`;
+  mounted.slot.style.height = `${layout.height}px`;
+  mounted.slot.style.transform = `translate(${layout.x}px, ${layout.y}px)`;
 }
 
 function renderVirtualGalleryRange(instance = galleryVirtualizer): void {
@@ -4573,6 +3700,7 @@ function renderVirtualGalleryRange(instance = galleryVirtualizer): void {
   const diagnosticStartedAt = diagnosticsRecording ? performance.now() : 0;
   const gallery = requiredHtml('gallery');
   const virtualItems = instance.getVirtualItems();
+  const viewport = {scrollY: window.scrollY, height: window.innerHeight};
   const desiredIds = new Set<string>();
   let maximumMountedIndex = -1;
   let maximumVisibleIndex = -1;
@@ -4585,7 +3713,7 @@ function renderVirtualGalleryRange(instance = galleryVirtualizer): void {
     const signature = cardRenderSignature(image);
     let mounted = mountedGalleryCards.get(image.id);
     const visible = diagnosticsRecording || !mounted || mounted.signature !== signature
-      ? virtualItemIsVisible(item, galleryGeometry)
+      ? virtualItemIsVisible(item, galleryGeometry, viewport)
       : false;
     if (diagnosticsRecording) {
       maximumMountedIndex = Math.max(maximumMountedIndex, item.index);
@@ -4597,7 +3725,7 @@ function renderVirtualGalleryRange(instance = galleryVirtualizer): void {
       galleryDiagnostics.cardUnmounted(
         diagnosticCardRef(mounted.card.querySelector<HTMLImageElement>('img')),
       );
-      clearThumbLifecycle(image.id, mounted.card);
+      thumbnailLifecycles.clear(image.id, mounted.card);
       const diagnosticRef = galleryDiagnostics.cardMounted(image.id, item.index);
       const card = makeCard(image, visible, diagnosticRef);
       mounted.slot.replaceChildren(card);
@@ -4634,7 +3762,7 @@ function renderVirtualGalleryRange(instance = galleryVirtualizer): void {
 }
 
 function ensureGalleryVirtualizer(): Virtualizer<Window, HTMLDivElement> {
-  galleryGeometry = computeGalleryGeometry();
+  galleryGeometry = readGalleryGeometry();
   if (!galleryVirtualizer) {
     galleryVirtualizer = new Virtualizer<Window, HTMLDivElement>(galleryVirtualizerOptions(galleryGeometry));
     galleryVirtualizerCleanup = galleryVirtualizer._didMount();
@@ -4776,7 +3904,7 @@ function scheduleGalleryResize(anchor: {imageId: string; viewportTop: number} | 
   if (galleryResizeFrame !== null) cancelAnimationFrame(galleryResizeFrame);
   galleryResizeFrame = requestAnimationFrame(() => {
     galleryResizeFrame = null;
-    galleryGeometry = computeGalleryGeometry();
+    galleryGeometry = readGalleryGeometry();
     const instance = ensureGalleryVirtualizer();
     instance.measure();
     renderVirtualGalleryRange(instance);

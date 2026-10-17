@@ -34,6 +34,11 @@ type FilmstripSnapshot = {
   activeTitle: string | null;
 };
 
+type PreviewGeometry = {
+  stage: {x: number; y: number; width: number; height: number};
+  viewport: {x: number; y: number; width: number; height: number};
+};
+
 type PaginatedPreviewFixture = {
   cursorRequests: string[];
   sessionWrites: Array<{last_image_id?: string | null}>;
@@ -268,6 +273,39 @@ function expectFilledFilmstrip(snapshot: FilmstripSnapshot): void {
   expect(snapshot.remaining).toBeLessThan(snapshot.pitch + 1);
   expect(Math.abs(snapshot.itemWidth - 52)).toBeLessThanOrEqual(1);
   expect(Math.abs(snapshot.itemHeight - 50)).toBeLessThanOrEqual(1);
+}
+
+async function previewGeometry(page: Page): Promise<PreviewGeometry> {
+  const [stage, viewport] = await Promise.all([
+    page.locator('#preview-image-stage').boundingBox(),
+    page.locator('#preview-stage-viewport').boundingBox(),
+  ]);
+  expect(stage, 'preview image stage').toBeTruthy();
+  expect(viewport, 'preview viewport').toBeTruthy();
+  return {stage: stage!, viewport: viewport!};
+}
+
+function expectTrueFit(
+  geometry: PreviewGeometry,
+  imageWidth: number,
+  imageHeight: number,
+  tolerance = 2,
+): void {
+  const {stage, viewport} = geometry;
+  expect(stage.width).toBeLessThanOrEqual(viewport.width + tolerance);
+  expect(stage.height).toBeLessThanOrEqual(viewport.height + tolerance);
+  expect(Math.min(
+    Math.abs(stage.width - viewport.width),
+    Math.abs(stage.height - viewport.height),
+  )).toBeLessThanOrEqual(tolerance);
+  expect(stage.width / stage.height).toBeCloseTo(imageWidth / imageHeight, 2);
+
+  const leftGap = stage.x - viewport.x;
+  const rightGap = viewport.x + viewport.width - stage.x - stage.width;
+  const topGap = stage.y - viewport.y;
+  const bottomGap = viewport.y + viewport.height - stage.y - stage.height;
+  expect(Math.abs(leftGap - rightGap)).toBeLessThanOrEqual(tolerance);
+  expect(Math.abs(topGap - bottomGap)).toBeLessThanOrEqual(tolerance);
 }
 
 test('Nearby filmstrip fills visible width from the first image after opening', async ({page}) => {
@@ -604,8 +642,84 @@ test('closing during original load releases media and late completion cannot mut
   await expect(page.locator('#preview-modal')).not.toHaveAttribute('data-image-id', /.+/);
 });
 
+test('FIT uses the full limiting axis for a portrait image in Focus mode', async ({page}) => {
+  await installPreviewFixture(page, {width: 1080, height: 1920});
+  await page.setViewportSize({width: 1366, height: 768});
+  await openFixture(page);
+
+  await page.locator('.card[data-id="preview-a"]').click();
+  await expect(page.locator('#preview-modal-image')).toHaveAttribute('data-state', 'loading');
+  await page.keyboard.press('Tab');
+  await expect(page.locator('#preview-modal')).toHaveClass(/preview-focus-mode/);
+  await expect(page.locator('#zoom-level')).toHaveText('FIT');
+
+  const geometry = await previewGeometry(page);
+  expectTrueFit(geometry, 1080, 1920);
+  expect(Math.abs(geometry.stage.height - 768)).toBeLessThanOrEqual(2);
+  expect(geometry.stage.width).toBeLessThan(geometry.viewport.width);
+});
+
+test('FIT follows landscape Viewer geometry through Inspector, resize, and Focus changes', async ({page}) => {
+  await installPreviewFixture(page, {width: 1920, height: 1080});
+  await page.setViewportSize({width: 1366, height: 768});
+  await openFixture(page);
+
+  await page.locator('.card[data-id="preview-a"]').click();
+  await expect(page.locator('#preview-modal-image')).toHaveAttribute('data-state', 'loading');
+  expectTrueFit(await previewGeometry(page), 1920, 1080);
+
+  await page.keyboard.press('Control+b');
+  await expect(page.locator('#preview-inspector')).not.toBeVisible();
+  expectTrueFit(await previewGeometry(page), 1920, 1080);
+
+  await page.setViewportSize({width: 1600, height: 900});
+  expectTrueFit(await previewGeometry(page), 1920, 1080);
+
+  await page.keyboard.press('Tab');
+  await expect(page.locator('#preview-modal')).toHaveClass(/preview-focus-mode/);
+  const focusGeometry = await previewGeometry(page);
+  expectTrueFit(focusGeometry, 1920, 1080);
+  expect(Math.abs(focusGeometry.stage.width - focusGeometry.viewport.width)).toBeLessThanOrEqual(2);
+  expect(Math.abs(focusGeometry.stage.height - focusGeometry.viewport.height)).toBeLessThanOrEqual(2);
+});
+
+test('small-image FIT upscales while 1:1 and manual zoom remain distinct', async ({page}) => {
+  await installPreviewFixture(page, {width: 400, height: 300});
+  await page.setViewportSize({width: 1366, height: 768});
+  await openFixture(page);
+
+  await page.locator('.card[data-id="preview-a"]').click();
+  await expect(page.locator('#preview-modal-image')).toHaveAttribute('data-state', 'loading');
+  const fitGeometry = await previewGeometry(page);
+  expectTrueFit(fitGeometry, 400, 300);
+  expect(fitGeometry.stage.width).toBeGreaterThan(400);
+  expect(fitGeometry.stage.height).toBeGreaterThan(300);
+  await expect(page.locator('#zoom-level')).toHaveText('FIT');
+
+  await page.keyboard.press('1');
+  await expect(page.locator('#zoom-level')).toHaveText('100%');
+  const oneToOneGeometry = await previewGeometry(page);
+  expect(Math.abs(oneToOneGeometry.stage.width - 400)).toBeLessThanOrEqual(1);
+  expect(Math.abs(oneToOneGeometry.stage.height - 300)).toBeLessThanOrEqual(1);
+
+  await page.keyboard.press('f');
+  await expect(page.locator('#zoom-level')).toHaveText('FIT');
+  const restoredFit = await previewGeometry(page);
+  expectTrueFit(restoredFit, 400, 300);
+
+  await page.keyboard.press('i');
+  await expect(page.locator('#zoom-level')).toHaveText(/%$/);
+  const zoomedGeometry = await previewGeometry(page);
+  expect(zoomedGeometry.stage.width).toBeGreaterThan(restoredFit.stage.width);
+  expect(zoomedGeometry.stage.height).toBeGreaterThan(restoredFit.stage.height);
+
+  await page.keyboard.press('f');
+  await expect(page.locator('#zoom-level')).toHaveText('FIT');
+  expectTrueFit(await previewGeometry(page), 400, 300);
+});
+
 test('viewer Focus and Inspector controls preserve layout state through navigation', async ({page}) => {
-  const fixture = await installPreviewFixture(page);
+  const fixture = await installPreviewFixture(page, {width: 1600, height: 1200});
   await openFixture(page);
 
   await page.locator('.card[data-id="preview-a"]').click();
@@ -645,9 +759,11 @@ test('viewer Focus and Inspector controls preserve layout state through navigati
   await page.keyboard.press('f');
   await expect(page.locator('#zoom-level')).toHaveText('FIT');
   await page.keyboard.press('i');
-  await expect(page.locator('#zoom-level')).toHaveText('120%');
+  await expect(page.locator('#zoom-level')).toHaveText(/^\d+%$/);
+  const zoomedInFromFit = Number.parseInt(await page.locator('#zoom-level').innerText(), 10);
   await page.keyboard.press('o');
-  await expect(page.locator('#zoom-level')).toHaveText('100%');
+  await expect(page.locator('#zoom-level')).toHaveText(/^\d+%$/);
+  expect(Number.parseInt(await page.locator('#zoom-level').innerText(), 10)).toBeLessThan(zoomedInFromFit);
   await page.keyboard.press('Shift+f');
   await expect(page.locator('#zoom-level')).toHaveText('FIT');
   await expect(modal).not.toHaveClass(/preview-focus-mode/);
