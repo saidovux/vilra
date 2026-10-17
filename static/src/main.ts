@@ -45,7 +45,6 @@ import {
 } from './gallery/image-query';
 import {
   aspectCss,
-  calculateVirtualCardLayout,
   computeGalleryGeometry,
   estimateVirtualCardSize,
   virtualItemIsNear,
@@ -58,6 +57,7 @@ import {
   ThumbnailLifecycleManager,
   type ThumbLifecycle,
 } from './gallery/thumbnail-lifecycle';
+import {VirtualGalleryView} from './gallery/virtual-gallery-view';
 import {PreviewModal} from './viewer/preview-modal';
 
 type SettingsTab = 'general' | 'tags' | 'graph' | 'problems';
@@ -124,12 +124,6 @@ interface StatusResponse {
   done?: number;
   total?: number;
   error?: string;
-}
-
-interface MountedGalleryCard {
-  slot: HTMLDivElement;
-  card: HTMLElement;
-  signature: string;
 }
 
 interface ThumbnailScrollState {
@@ -362,7 +356,6 @@ let galleryResizeFrame: number | null = null;
 let paginationPrefetchFrame: number | null = null;
 let pendingGalleryScrollTop: number | null = null;
 let activePageLoad: {requestId: number; promise: Promise<void>} | null = null;
-const mountedGalleryCards = new Map<string, MountedGalleryCard>();
 let previewModal: PreviewModal | null = null;
 type PreviewSourceMode = 'gallery' | 'fixed';
 let previewSourceMode: PreviewSourceMode = 'gallery';
@@ -450,6 +443,13 @@ const thumbnailLifecycles = new ThumbnailLifecycleManager({
   onTerminalUnavailable: handleTerminalImageUnavailable,
   scheduleAdmissionEvaluation: scheduleThumbnailAdmissionEvaluation,
   diagnosticRef: diagnosticCardRef,
+  diagnostics: galleryDiagnostics,
+});
+const virtualGalleryView = new VirtualGalleryView({
+  getContainer: () => requiredHtml('gallery'),
+  makeCard,
+  clearThumbnailLifecycle: (imageId, card) => thumbnailLifecycles.clear(imageId, card),
+  diagnosticCardRef,
   diagnostics: galleryDiagnostics,
 });
 
@@ -1486,9 +1486,9 @@ function updateImageSelectionUi(): void {
   optionalHtml('selection-tray')?.classList.toggle('open', selectedImageIds.size > 0);
   const count = optionalHtml('selection-count');
   if (count) count.textContent = String(selectedImageIds.size);
-  for (const [imageId, mounted] of mountedGalleryCards) {
+  virtualGalleryView.forEachMounted((mounted, imageId) => {
     mounted.card.classList.toggle('selected', selectedImageIds.has(imageId));
-  }
+  });
 }
 
 function toggleImageSelection(imageId: string): void {
@@ -1634,7 +1634,7 @@ function renderTagChips(img: ImageItem): string {
 }
 
 function updateCardForImage(img: ImageItem): void {
-  const mounted = mountedGalleryCards.get(img.id);
+  const mounted = virtualGalleryView.getMounted(img.id);
   const card = mounted?.card;
   if (!card) return;
   const tags = card.querySelector('.card-tags');
@@ -3640,125 +3640,9 @@ function galleryVirtualizerOptions(geometry: GalleryGeometry): VirtualizerOption
   };
 }
 
-function cardRenderSignature(image: ImageItem): string {
-  return JSON.stringify([
-    image.path,
-    image.thumb_url || '',
-    Number(image.mtime || 0),
-    Number(image.width || 0),
-    Number(image.height || 0),
-    image.auto_tags || image.folder_tags || [],
-    image.user_tags || [],
-  ]);
-}
-
-function unmountVirtualCard(imageId: string): void {
-  const mounted = mountedGalleryCards.get(imageId);
-  if (!mounted) return;
-  galleryDiagnostics.cardUnmounted(
-    diagnosticCardRef(mounted.card.querySelector<HTMLImageElement>('img')),
-  );
-  thumbnailLifecycles.clear(imageId, mounted.card);
-  mounted.slot.remove();
-  mountedGalleryCards.delete(imageId);
-}
-
-function clearMountedGalleryCards(): void {
-  [...mountedGalleryCards.keys()].forEach(unmountVirtualCard);
-}
-
-function mountVirtualCard(
-  item: VirtualItem,
-  image: ImageItem,
-  geometry: GalleryGeometry,
-  visible: boolean,
-): MountedGalleryCard {
-  const slot = document.createElement('div');
-  slot.className = 'virtual-card-slot';
-  slot.dataset.id = image.id;
-  const diagnosticRef = galleryDiagnostics.cardMounted(image.id, item.index);
-  const card = makeCard(image, visible, diagnosticRef);
-  slot.appendChild(card);
-  requiredHtml('gallery').appendChild(slot);
-  const mounted = {slot, card, signature: cardRenderSignature(image)};
-  mountedGalleryCards.set(image.id, mounted);
-  return mounted;
-}
-
-function positionVirtualCard(mounted: MountedGalleryCard, item: VirtualItem, geometry: GalleryGeometry): void {
-  const layout = calculateVirtualCardLayout(item, geometry);
-  mounted.slot.dataset.index = String(layout.index);
-  mounted.slot.dataset.lane = String(layout.lane);
-  mounted.slot.style.width = `${layout.width}px`;
-  mounted.slot.style.height = `${layout.height}px`;
-  mounted.slot.style.transform = `translate(${layout.x}px, ${layout.y}px)`;
-}
-
 function renderVirtualGalleryRange(instance = galleryVirtualizer): void {
   if (!instance || !galleryGeometry) return;
-  const diagnosticsRecording = galleryDiagnostics.recording;
-  const diagnosticStartedAt = diagnosticsRecording ? performance.now() : 0;
-  const gallery = requiredHtml('gallery');
-  const virtualItems = instance.getVirtualItems();
-  const viewport = {scrollY: window.scrollY, height: window.innerHeight};
-  const desiredIds = new Set<string>();
-  let maximumMountedIndex = -1;
-  let maximumVisibleIndex = -1;
-  gallery.style.height = `${Math.max(0, instance.getTotalSize())}px`;
-
-  for (const item of virtualItems) {
-    const image = visibleImages[item.index];
-    if (!image) continue;
-    desiredIds.add(image.id);
-    const signature = cardRenderSignature(image);
-    let mounted = mountedGalleryCards.get(image.id);
-    const visible = diagnosticsRecording || !mounted || mounted.signature !== signature
-      ? virtualItemIsVisible(item, galleryGeometry, viewport)
-      : false;
-    if (diagnosticsRecording) {
-      maximumMountedIndex = Math.max(maximumMountedIndex, item.index);
-      if (visible) maximumVisibleIndex = Math.max(maximumVisibleIndex, item.index);
-    }
-    if (!mounted) {
-      mounted = mountVirtualCard(item, image, galleryGeometry, visible);
-    } else if (mounted.signature !== signature) {
-      galleryDiagnostics.cardUnmounted(
-        diagnosticCardRef(mounted.card.querySelector<HTMLImageElement>('img')),
-      );
-      thumbnailLifecycles.clear(image.id, mounted.card);
-      const diagnosticRef = galleryDiagnostics.cardMounted(image.id, item.index);
-      const card = makeCard(image, visible, diagnosticRef);
-      mounted.slot.replaceChildren(card);
-      mounted.card = card;
-      mounted.signature = signature;
-    }
-    positionVirtualCard(mounted, item, galleryGeometry);
-    const cardImage = diagnosticsRecording
-      ? mounted.card.querySelector<HTMLImageElement>('img')
-      : null;
-    if (diagnosticsRecording && visible) {
-      galleryDiagnostics.cardVisible(
-        diagnosticCardRef(cardImage),
-        item.index,
-        Boolean(cardImage?.complete && cardImage.naturalWidth > 0),
-      );
-    }
-  }
-
-  for (const imageId of [...mountedGalleryCards.keys()]) {
-    if (!desiredIds.has(imageId)) unmountVirtualCard(imageId);
-  }
-  if (diagnosticsRecording) {
-    galleryDiagnostics.virtualRange(
-      maximumMountedIndex,
-      maximumVisibleIndex,
-      mountedGalleryCards.size,
-    );
-  }
-  instance._willUpdate();
-  if (diagnosticsRecording) {
-    galleryDiagnostics.measureRenderRange(performance.now() - diagnosticStartedAt);
-  }
+  virtualGalleryView.render(instance, galleryGeometry, visibleImages);
 }
 
 function ensureGalleryVirtualizer(): Virtualizer<Window, HTMLDivElement> {
@@ -3774,8 +3658,11 @@ function ensureGalleryVirtualizer(): Virtualizer<Window, HTMLDivElement> {
 }
 
 function captureGalleryAnchor(): {imageId: string; viewportTop: number} | null {
-  const candidates = [...mountedGalleryCards.entries()]
-    .map(([imageId, mounted]) => ({imageId, rect: mounted.slot.getBoundingClientRect()}))
+  const mountedCards: Array<{imageId: string; rect: DOMRect}> = [];
+  virtualGalleryView.forEachMounted((mounted, imageId) => {
+    mountedCards.push({imageId, rect: mounted.slot.getBoundingClientRect()});
+  });
+  const candidates = mountedCards
     .filter(item => item.rect.bottom > 0 && item.rect.top < window.innerHeight)
     .sort((left, right) => Math.abs(left.rect.top) - Math.abs(right.rect.top));
   const anchor = candidates[0];
@@ -3790,7 +3677,7 @@ function restoreGalleryAnchor(anchor: {imageId: string; viewportTop: number} | n
   if (!item) return;
   galleryVirtualizer.scrollToOffset(Math.max(0, item.start - anchor.viewportTop), {behavior: 'instant'});
   requestAnimationFrame(() => {
-    const mounted = mountedGalleryCards.get(anchor.imageId);
+    const mounted = virtualGalleryView.getMounted(anchor.imageId);
     if (!mounted) return;
     const delta = mounted.slot.getBoundingClientRect().top - anchor.viewportTop;
     if (Math.abs(delta) > 0.5) window.scrollTo(0, Math.max(0, window.scrollY + delta));
@@ -3816,7 +3703,7 @@ function restorePendingGalleryAnchor(imageId: string, frame: number): void {
   const instance = ensureGalleryVirtualizer();
   if (frame === 0) instance.scrollToIndex(index, {align: 'center', behavior: 'instant'});
   renderVirtualGalleryRange(instance);
-  const mounted = mountedGalleryCards.get(imageId);
+  const mounted = virtualGalleryView.getMounted(imageId);
   if (!mounted && frame < 2) {
     requestAnimationFrame(() => restorePendingGalleryAnchor(imageId, frame + 1));
     return;
@@ -3836,7 +3723,7 @@ function restorePendingGalleryAnchor(imageId: string, frame: number): void {
 
 function invalidateVirtualGallery(options: {preserveAnchor: boolean; resetCards: boolean}): void {
   const anchor = options.preserveAnchor ? captureGalleryAnchor() : null;
-  if (options.resetCards) clearMountedGalleryCards();
+  if (options.resetCards) virtualGalleryView.clear();
   const instance = ensureGalleryVirtualizer();
   instance.measure();
   renderVirtualGalleryRange(instance);
@@ -3857,17 +3744,17 @@ function updateVirtualGalleryCount(): void {
 
 function captureMountedCardsForDiagnostics(): void {
   galleryDiagnostics.setLoadedMetadataCount(allImages.length);
-  for (const [imageId, mounted] of mountedGalleryCards) {
+  virtualGalleryView.forEachMounted((mounted, imageId) => {
     const image = mounted.card.querySelector<HTMLImageElement>('img');
     const index = Number(mounted.slot.dataset.index);
-    if (!image || !Number.isInteger(index)) continue;
+    if (!image || !Number.isInteger(index)) return;
     const reference = galleryDiagnostics.cardMounted(
       imageId,
       index,
       image.complete && image.naturalWidth > 0,
     );
     bindDiagnosticCardRef(image, reference);
-  }
+  });
   if (galleryVirtualizer) renderVirtualGalleryRange(galleryVirtualizer);
 }
 
