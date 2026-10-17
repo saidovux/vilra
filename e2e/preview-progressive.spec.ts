@@ -1018,7 +1018,7 @@ test('Viewer T reveals the inspector, focuses repeat tagging, and preserves Focu
   await expect(input).toBeFocused();
 });
 
-test('Q closes Viewer, Settings, and Graph as an Escape alias', async ({page}) => {
+test('Q closes Viewer and Settings as an Escape alias', async ({page}) => {
   await installPreviewFixture(page);
   await openFixture(page);
 
@@ -1027,15 +1027,62 @@ test('Q closes Viewer, Settings, and Graph as an Escape alias', async ({page}) =
   await page.keyboard.press('q');
   await expect(page.locator('#settings-panel')).not.toBeVisible();
 
-  await page.locator('#filter-bar [data-action="open-graph"]').click();
-  await expect(page.locator('#graph-overlay')).toBeVisible();
-  await page.keyboard.press('q');
-  await expect(page.locator('#graph-overlay')).not.toBeVisible();
-
   await page.locator('.card[data-id="preview-a"]').click();
   await expect(page.locator('#preview-modal')).toBeVisible();
   await page.keyboard.press('q');
   await expect(page.locator('#preview-modal')).not.toBeVisible();
+});
+
+test('removing Graph preserves Settings, gallery controls, and responsive filter geometry', async ({page}) => {
+  const pageErrors: Error[] = [];
+  const imageRequests: string[] = [];
+  page.on('pageerror', error => pageErrors.push(error));
+  page.on('request', request => {
+    if (new URL(request.url()).pathname === '/api/images') imageRequests.push(request.url());
+  });
+
+  await installPreviewFixture(page);
+  await page.setViewportSize({width: 1366, height: 768});
+  await openFixture(page);
+
+  await expect(page.locator('[data-action="open-graph"]')).toHaveCount(0);
+  await expect(page.locator('[data-settings-tab="graph"]')).toHaveCount(0);
+  await expect(page.locator('#graph-overlay, #graph-canvas')).toHaveCount(0);
+
+  const filterLayout = async () => page.locator('#filter-bar .filter-head').evaluate(element => {
+    const container = element.getBoundingClientRect();
+    const children = [...element.children].map(child => child.getBoundingClientRect());
+    return {
+      childCount: children.length,
+      columnCount: getComputedStyle(element).gridTemplateColumns.split(' ').length,
+      rowCount: new Set(children.map(rect => Math.round(rect.top))).size,
+      overflows: element.scrollWidth > element.clientWidth + 1
+        || children.some(rect => rect.left < container.left - 1 || rect.right > container.right + 1),
+    };
+  });
+  expect(await filterLayout()).toEqual({childCount: 4, columnCount: 4, rowCount: 1, overflows: false});
+
+  await page.locator('#settings-toggle').click();
+  await expect(page.locator('#settings-panel')).toBeVisible();
+  await expect(page.locator('.settings-tab')).toHaveText(['Общее', 'Теги', /Проблемы/]);
+  await page.keyboard.press('q');
+  await expect(page.locator('#settings-panel')).not.toBeVisible();
+
+  await page.locator('#sort-select').selectOption('path_asc');
+  await expect.poll(() => imageRequests.some(url => new URL(url).searchParams.get('sort') === 'path_asc')).toBe(true);
+  await page.locator('#filter-tag-input').fill('hiking');
+  await page.locator('#filter-tag-input').press('Enter');
+  await expect(page.locator('#selected-filter-tags')).toContainText('hiking');
+  await expect.poll(() => imageRequests.some(url => new URL(url).searchParams.get('include_tags') === 'hiking')).toBe(true);
+
+  await page.locator('.card[data-id="preview-a"]').click();
+  await expect(page.locator('#preview-modal')).toHaveAttribute('data-image-id', 'preview-a');
+  await page.keyboard.press('q');
+  await expect(page.locator('#preview-modal')).not.toBeVisible();
+
+  await page.setViewportSize({width: 720, height: 900});
+  await expect.poll(filterLayout).toEqual({childCount: 4, columnCount: 2, rowCount: 3, overflows: false});
+  expect(pageErrors).toEqual([]);
 });
 
 test('application tab shortcuts create close and select tabs even from text input', async ({page}) => {

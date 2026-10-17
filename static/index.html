@@ -85,7 +85,6 @@
         <nav class="settings-tabs" aria-label="Разделы настроек">
           <button class="settings-tab active" type="button" data-action="set-settings-tab" data-settings-tab="general">Общее</button>
           <button class="settings-tab" type="button" data-action="set-settings-tab" data-settings-tab="tags">Теги</button>
-          <button class="settings-tab" type="button" data-action="set-settings-tab" data-settings-tab="graph">Граф</button>
           <button class="settings-tab" type="button" data-action="set-settings-tab" data-settings-tab="problems">
             <span>Проблемы</span>
             <span id="problems-badge" class="problems-badge muted">0</span>
@@ -158,20 +157,6 @@
               <div id="tag-admin-list"></div>
             </div>
           </section>
-          <section class="settings-panel-page" data-settings-panel="graph">
-            <div class="settings-section">
-              <div class="settings-section-head">
-                <h3>Граф</h3>
-                <button class="btn btn-primary btn-sm" type="button" data-action="open-graph">Открыть граф</button>
-              </div>
-              <div class="settings-graph-controls">
-                <label class="radio-line"><input type="radio" name="settings-graph-scope" value="current" checked data-action="set-graph-scope"> Текущая выборка</label>
-                <label class="radio-line"><input type="radio" name="settings-graph-scope" value="all" data-action="set-graph-scope"> Все фото</label>
-                <button class="btn btn-ghost btn-sm" type="button" data-action="reset-graph-layout">Сбросить раскладку</button>
-              </div>
-              <div class="settings-note">Теги показаны ромбами. Фото показаны маленькими кругами без превью и имен.</div>
-            </div>
-          </section>
           <section id="problems-wrap" class="settings-panel-page" data-settings-panel="problems" aria-hidden="true">
             <header class="problems-head">
               <div>
@@ -205,7 +190,6 @@
           <button id="match-all" type="button" data-action="set-match-mode" data-mode="all">Все</button>
         </div>
         <button class="btn btn-ghost btn-sm" data-action="clear-active-filters">Сбросить</button>
-        <button class="btn btn-ghost btn-sm" data-action="open-graph">Граф</button>
         <div class="filter-input-wrap">
           <div class="fish-field">
             <div id="filter-tag-ghost" class="fish-ghost"></div>
@@ -377,28 +361,6 @@
   <button type="button" data-quick-action="Reveal in folder">Reveal in folder</button>
   <button type="button" data-quick-action="Original">Original</button>
   <button type="button" data-quick-action="Delete">Delete</button>
-</div>
-
-<div id="graph-overlay" aria-hidden="true">
-  <section id="graph-panel" role="dialog" aria-modal="true" aria-label="Граф тегов">
-    <header class="graph-head">
-      <div>
-        <div class="settings-kicker">Graph</div>
-        <h2>Связи тегов и фото</h2>
-      </div>
-      <button class="btn btn-ghost icon-btn" type="button" data-action="close-graph" title="Закрыть">×</button>
-    </header>
-    <div class="graph-toolbar">
-      <div class="match-toggle">
-        <button id="graph-scope-current" type="button" data-action="set-graph-scope" data-scope="current">Текущая выборка</button>
-        <button id="graph-scope-all" type="button" data-action="set-graph-scope" data-scope="all">Все фото</button>
-      </div>
-      <input id="graph-search" type="text" placeholder="Найти тег" autocomplete="off">
-      <button class="btn btn-ghost btn-sm" type="button" data-action="reset-graph-layout">Сбросить</button>
-    </div>
-    <div id="graph-notice"></div>
-    <canvas id="graph-canvas"></canvas>
-  </section>
 </div>
 
 <script defer src="/static/dist/app.js"></script>

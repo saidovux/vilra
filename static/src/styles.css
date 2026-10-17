@@ -1012,7 +1012,7 @@ body.modal-open { overflow: hidden; }
 }
 #filter-bar .filter-head {
   display: grid;
-  grid-template-columns: auto auto auto minmax(220px, 1fr) 150px;
+  grid-template-columns: auto auto minmax(220px, 1fr) 150px;
   align-items: center;
   justify-content: stretch;
   gap: 8px;
@@ -1648,7 +1648,7 @@ body.modal-open { overflow: hidden; }
   .settings-danger-row .btn { justify-self: start; }
 }
 
-/* Neutral workspace, settings and graph overrides */
+/* Neutral workspace and settings overrides */
 :root {
   --accent: #E5E5E5;
   --accent-strong: #FFFFFF;
@@ -1675,7 +1675,7 @@ body.modal-open { overflow: hidden; }
 }
 
 #filter-bar .filter-head {
-  grid-template-columns: auto auto auto minmax(220px, 1fr) 150px;
+  grid-template-columns: auto auto minmax(220px, 1fr) 150px;
 }
 
 #settings-panel {
@@ -1706,8 +1706,7 @@ body.modal-open { overflow: hidden; }
   background: #050505;
   overflow: hidden;
 }
-.settings-head,
-.graph-head {
+.settings-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1718,8 +1717,7 @@ body.modal-open { overflow: hidden; }
 }
 .settings-head { grid-column: 1 / -1; grid-row: 1; }
 .settings-back { min-width: 96px; }
-.settings-head h2,
-.graph-head h2 {
+.settings-head h2 {
   margin: 0;
   font-size: 18px;
   letter-spacing: 0;
@@ -1808,8 +1806,7 @@ body.modal-open { overflow: hidden; }
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
 }
 .settings-tag-actions,
-.tag-admin-toolbar,
-.settings-graph-controls {
+.tag-admin-toolbar {
   display: flex;
   gap: 8px;
   align-items: center;
@@ -1937,57 +1934,6 @@ body.modal-open { overflow: hidden; }
   color: var(--text);
 }
 
-#graph-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 1250;
-  display: none;
-  align-items: center;
-  justify-content: center;
-  padding: 22px;
-  background: rgba(0,0,0,.72);
-  backdrop-filter: blur(18px);
-}
-#graph-overlay.open { display: flex; }
-#graph-panel {
-  width: min(1180px, 100%);
-  height: min(780px, calc(100vh - 44px));
-  display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: rgba(5,5,5,.94);
-  box-shadow: 0 28px 100px rgba(0,0,0,.82);
-  overflow: hidden;
-}
-.graph-toolbar {
-  display: grid;
-  grid-template-columns: auto minmax(180px, 1fr) auto;
-  gap: 8px;
-  align-items: center;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
-}
-#graph-notice {
-  display: none;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 12px;
-}
-#graph-notice.open { display: block; }
-#graph-canvas {
-  width: 100%;
-  height: 100%;
-  display: block;
-  background:
-    radial-gradient(circle at 50% 50%, rgba(255,255,255,.04), transparent 32%),
-    #000;
-  cursor: grab;
-}
-#graph-canvas.dragging { cursor: grabbing; }
-
 @media (max-width: 900px) {
   #filter-bar .filter-head {
     grid-template-columns: 1fr 1fr;
@@ -1997,12 +1943,9 @@ body.modal-open { overflow: hidden; }
     grid-column: 1 / -1;
   }
   .sort-select { width: 100%; }
-  #graph-overlay { padding: 8px; }
   .settings-workspace { grid-template-columns: 164px minmax(0, 1fr); }
-  #graph-panel { height: calc(100vh - 16px); }
   .settings-grid,
-  .tag-admin-toolbar,
-  .graph-toolbar {
+  .tag-admin-toolbar {
     grid-template-columns: 1fr;
   }
   .tag-admin-row {
@@ -2114,7 +2057,7 @@ body { background: #000; font-size: 12px; }
 }
 @media (min-width: 901px) {
   #filter-bar .filter-head {
-    grid-template-columns: auto auto auto minmax(220px, 1fr) 150px;
+    grid-template-columns: auto auto minmax(220px, 1fr) 150px;
   }
 }
 #filter-bar .match-toggle { height: 30px; padding: 2px; border-radius: 4px; background: #080808; }

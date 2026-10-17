@@ -56,9 +56,9 @@ import {VirtualGalleryView} from './gallery/virtual-gallery-view';
 import {GalleryVirtualizerController} from './gallery/virtualizer-controller';
 import {PreviewModal} from './viewer/preview-modal';
 
-type SettingsTab = 'general' | 'tags' | 'graph' | 'problems';
+type SettingsTab = 'general' | 'tags' | 'problems';
 type AppWorkspace = 'gallery' | 'settings';
-type ShortcutContext = 'gallery' | 'viewer' | 'settings' | 'graph' | 'blocked';
+type ShortcutContext = 'gallery' | 'viewer' | 'settings' | 'blocked';
 type AppCommand =
   | 'ui.consumeShortcut'
   | 'ui.toggleFocus'
@@ -81,9 +81,7 @@ type AppCommand =
   | 'viewer.quickMenu'
   | 'viewer.focusTagInput'
   | 'viewer.close'
-  | 'settings.close'
-  | 'graph.close';
-type GraphScope = 'current' | 'all';
+  | 'settings.close';
 type TagAdminSort = 'name' | 'image_count' | 'user_count' | 'auto_count';
 type TagKind = 'include' | 'exclude';
 interface TagMeta {
@@ -169,65 +167,6 @@ interface LiveEventEnvelope {
 interface TagInputParse {
   prefix: string;
   value: string;
-}
-
-interface GraphBaseNode {
-  id: string;
-  type: 'tag' | 'image';
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  r: number;
-}
-
-interface GraphTagNode extends GraphBaseNode {
-  type: 'tag';
-  tag: string;
-  label: string;
-}
-
-interface GraphImageNode extends GraphBaseNode {
-  type: 'image';
-  imageId: string;
-  image: ImageItem;
-  tags: string[];
-}
-
-type GraphNode = GraphTagNode | GraphImageNode;
-
-interface GraphEdge {
-  source: string;
-  target: string;
-}
-
-interface GraphPoint {
-  screenX: number;
-  screenY: number;
-  x: number;
-  y: number;
-}
-
-interface GraphState {
-  open: boolean;
-  scope: GraphScope;
-  nodes: GraphNode[];
-  edges: GraphEdge[];
-  scale: number;
-  panX: number;
-  panY: number;
-  dragNode: GraphNode | null;
-  isPanning: boolean;
-  pointerMoved: boolean;
-  lastX: number;
-  lastY: number;
-  tick: number;
-  raf: number | null;
-  needsRebuild: boolean;
-  query: string;
-  nodeLimit: number;
-  canvas: HTMLCanvasElement;
-  ctx: CanvasRenderingContext2D;
 }
 
 interface FishController {
@@ -380,7 +319,6 @@ let latestStatus: StatusResponse | null = null;
 let filterSuggestionOpen = false;
 let settingsActiveTab: SettingsTab = 'general';
 let tagAdminSort: TagAdminSort = 'name';
-let graphState: GraphState | null = null;
 let liveEventSource: EventSource | null = null;
 let lastLiveSequence = 0;
 let liveRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -659,7 +597,6 @@ function toggleSettings(force?: boolean): void {
     saveActiveScroll();
     suppressedPreviewRestoreId = activeTab().lastImageId;
     closePreview(false);
-    closeGraph();
   }
   activeWorkspace = open ? 'settings' : 'gallery';
   requiredHtml('gallery-screen').classList.toggle('settings-active', open);
@@ -721,7 +658,7 @@ async function deleteAllAutoTags(): Promise<void> {
 }
 
 function setSettingsTab(tab: SettingsTab | string | undefined): void {
-  settingsActiveTab = tab === 'tags' || tab === 'graph' || tab === 'problems' || tab === 'general' ? tab : 'general';
+  settingsActiveTab = tab === 'tags' || tab === 'problems' || tab === 'general' ? tab : 'general';
   document.querySelectorAll<HTMLElement>('.settings-tab').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.settingsTab === settingsActiveTab);
   });
@@ -953,7 +890,6 @@ function renderLiveGalleryState(): void {
   updateImageCounter();
   refreshPreviewSourceUi();
   requiredHtml('empty-state').style.display = visibleImages.length ? 'none' : 'flex';
-  requestGraphRebuild();
 }
 
 function updateLivePreviewImage(image: ImageItem): void {
@@ -1366,7 +1302,6 @@ function applyFilter(clear = true): void {
   renderFilterControls();
   invalidateVirtualGallery({preserveAnchor: !clear, resetCards: clear});
   requiredHtml('empty-state').style.display = visibleImages.length ? 'none' : 'flex';
-  requestGraphRebuild();
 }
 
 function loadNextImagesPage(): Promise<void> {
@@ -2123,429 +2058,6 @@ function updateScrollTopButton(): void {
   btn.classList.toggle('visible', window.scrollY > 320);
 }
 
-function ensureGraphState(): GraphState {
-  if (graphState) return graphState;
-  const canvas = requireElement('graph-canvas', HTMLCanvasElement, "Graph canvas is missing");
-  const ctx = canvas.getContext('2d');
-  if (!ctx) throw new Error('Graph canvas 2D context is unavailable.');
-  graphState = {
-    open: false,
-    scope: 'current',
-    nodes: [],
-    edges: [],
-    scale: 1,
-    panX: 0,
-    panY: 0,
-    dragNode: null,
-    isPanning: false,
-    pointerMoved: false,
-    lastX: 0,
-    lastY: 0,
-    tick: 0,
-    raf: null,
-    needsRebuild: false,
-    query: '',
-    nodeLimit: 1000,
-    canvas,
-    ctx
-  };
-  const state = graphState;
-  canvas.addEventListener('wheel', handleGraphWheel, {passive: false});
-  canvas.addEventListener('mousedown', handleGraphMouseDown);
-  window.addEventListener('mousemove', handleGraphMouseMove);
-  window.addEventListener('mouseup', handleGraphMouseUp);
-  canvas.addEventListener('dblclick', resetGraphLayout);
-  requiredInput('graph-search').addEventListener('input', e => {
-    const input = e.target as HTMLInputElement;
-    state.query = normalizeTag(input.value);
-    renderGraph();
-  });
-  return state;
-}
-
-function openGraph(scope: GraphScope | null = null): void {
-  const state = ensureGraphState();
-  state.open = true;
-  if (scope) state.scope = scope;
-  requiredHtml('graph-overlay').classList.add('open');
-  requiredHtml('graph-overlay').setAttribute('aria-hidden', 'false');
-  document.body.classList.add('modal-open');
-  updateGraphScopeButtons();
-  rebuildGraph();
-}
-
-function closeGraph(): void {
-  if (!graphState) return;
-  graphState.open = false;
-  if (graphState.raf) cancelAnimationFrame(graphState.raf);
-  graphState.raf = null;
-  requiredHtml('graph-overlay').classList.remove('open');
-  requiredHtml('graph-overlay').setAttribute('aria-hidden', 'true');
-  document.body.classList.remove('modal-open');
-}
-
-function setGraphScope(scope: string | undefined): void {
-  const state = ensureGraphState();
-  state.scope = scope === 'all' ? 'all' : 'current';
-  document.querySelectorAll<HTMLInputElement>('input[name="settings-graph-scope"]').forEach(input => {
-    input.checked = input.value === state.scope;
-  });
-  updateGraphScopeButtons();
-  if (state.open) rebuildGraph();
-}
-
-function updateGraphScopeButtons(): void {
-  const state = ensureGraphState();
-  requiredHtml('graph-scope-current').classList.toggle('active', state.scope !== 'all');
-  requiredHtml('graph-scope-all').classList.toggle('active', state.scope === 'all');
-}
-
-function requestGraphRebuild(): void {
-  if (!graphState || !graphState.open) return;
-  graphState.needsRebuild = true;
-  requestAnimationFrame(() => {
-    if (graphState && graphState.open && graphState.needsRebuild) rebuildGraph();
-  });
-}
-
-function graphImages(): ImageItem[] {
-  const state = ensureGraphState();
-  return state.scope === 'all' ? allImages : visibleImages;
-}
-
-function rebuildGraph(): void {
-  const state = ensureGraphState();
-  state.needsRebuild = false;
-  resizeGraphCanvas();
-  const images = graphImages();
-  const tagMap = new Map<string, GraphTagNode>();
-  const imageNodes: GraphImageNode[] = [];
-  const edges: GraphEdge[] = [];
-
-  images.forEach(img => {
-    const tags = dedupeDisplayTags(img.tags || []);
-    if (!tags.length) return;
-    const imageNode: GraphImageNode = {
-      id: `img:${img.id}`,
-      type: 'image',
-      imageId: img.id,
-      image: img,
-      tags,
-      x: 0,
-      y: 0,
-      vx: 0,
-      vy: 0,
-      r: 3.6
-    };
-    imageNodes.push(imageNode);
-    tags.forEach(tag => {
-      const norm = normalizeTag(tag);
-      if (!tagMap.has(norm)) {
-        tagMap.set(norm, {
-          id: `tag:${norm}`,
-          type: 'tag',
-          tag,
-          label: tag,
-          x: 0,
-          y: 0,
-          vx: 0,
-          vy: 0,
-          r: 10
-        });
-      }
-      edges.push({source: imageNode.id, target: `tag:${norm}`});
-    });
-  });
-
-  const tagNodes = Array.from(tagMap.values());
-  const totalNodes = tagNodes.length + imageNodes.length;
-  const notice = requiredHtml('graph-notice');
-  if (totalNodes > state.nodeLimit) {
-    state.nodes = [];
-    state.edges = [];
-    notice.textContent = `Граф скрыт: ${totalNodes} узлов. Сузьте фильтр или переключитесь на текущую выборку.`;
-    notice.classList.add('open');
-    renderGraph();
-    return;
-  }
-  notice.classList.remove('open');
-  notice.textContent = '';
-
-  const radius = Math.min(state.canvas.width, state.canvas.height) * 0.34;
-  tagNodes.forEach((node, i) => {
-    const angle = (Math.PI * 2 * i) / Math.max(1, tagNodes.length);
-    node.x = Math.cos(angle) * radius;
-    node.y = Math.sin(angle) * radius;
-  });
-  const tagById = new Map(tagNodes.map(node => [node.id, node]));
-  imageNodes.forEach((node, i) => {
-    const linked = node.tags
-      .map(tag => tagById.get(`tag:${normalizeTag(tag)}`))
-      .filter((tag): tag is GraphTagNode => Boolean(tag));
-    const baseX = linked.reduce((sum, tag) => sum + tag.x, 0) / Math.max(1, linked.length);
-    const baseY = linked.reduce((sum, tag) => sum + tag.y, 0) / Math.max(1, linked.length);
-    const jitter = 18 + (i % 23);
-    node.x = baseX + Math.cos(i * 2.399) * jitter;
-    node.y = baseY + Math.sin(i * 2.399) * jitter;
-  });
-  state.nodes = [...tagNodes, ...imageNodes];
-  state.edges = edges;
-  state.tick = 0;
-  if (!state.panX && !state.panY) {
-    state.panX = state.canvas.width / 2;
-    state.panY = state.canvas.height / 2;
-  }
-  startGraphAnimation();
-}
-
-function resizeGraphCanvas(): void {
-  const state = ensureGraphState();
-  const rect = state.canvas.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  const width = Math.max(1, Math.floor(rect.width * dpr));
-  const height = Math.max(1, Math.floor(rect.height * dpr));
-  if (state.canvas.width !== width || state.canvas.height !== height) {
-    state.canvas.width = width;
-    state.canvas.height = height;
-    state.ctx.setTransform(1, 0, 0, 1, 0, 0);
-    state.panX = width / 2;
-    state.panY = height / 2;
-  }
-}
-
-function startGraphAnimation(): void {
-  const state = ensureGraphState();
-  if (state.raf) cancelAnimationFrame(state.raf);
-  const step = () => {
-    if (!state.open) return;
-    if (state.tick < 180 && !state.dragNode) {
-      simulateGraphTick();
-      state.tick += 1;
-      renderGraph();
-      state.raf = requestAnimationFrame(step);
-    } else {
-      state.raf = null;
-      renderGraph();
-    }
-  };
-  state.raf = requestAnimationFrame(step);
-}
-
-function simulateGraphTick(): void {
-  const state = ensureGraphState();
-  const nodeById = new Map(state.nodes.map(node => [node.id, node]));
-  const tagNodes = state.nodes.filter(node => node.type === 'tag');
-  const imageNodes = state.nodes.filter(node => node.type === 'image');
-  const alpha = Math.max(0.02, 0.16 * (1 - state.tick / 190));
-
-  state.edges.forEach(edge => {
-    const source = nodeById.get(edge.source);
-    const target = nodeById.get(edge.target);
-    if (!source || !target) return;
-    const dx = target.x - source.x;
-    const dy = target.y - source.y;
-    source.vx += dx * 0.0024 * alpha;
-    source.vy += dy * 0.0024 * alpha;
-    target.vx -= dx * 0.0007 * alpha;
-    target.vy -= dy * 0.0007 * alpha;
-  });
-
-  for (let i = 0; i < tagNodes.length; i++) {
-    for (let j = i + 1; j < tagNodes.length; j++) {
-      const a = tagNodes[i];
-      const b = tagNodes[j];
-      const dx = b.x - a.x || 0.1;
-      const dy = b.y - a.y || 0.1;
-      const distSq = dx * dx + dy * dy;
-      const force = Math.min(1.8, 1700 / Math.max(80, distSq)) * alpha;
-      a.vx -= dx * force * 0.002;
-      a.vy -= dy * force * 0.002;
-      b.vx += dx * force * 0.002;
-      b.vy += dy * force * 0.002;
-    }
-  }
-
-  imageNodes.forEach(node => {
-    node.vx += -node.x * 0.00002;
-    node.vy += -node.y * 0.00002;
-  });
-  state.nodes.forEach(node => {
-    node.vx *= 0.82;
-    node.vy *= 0.82;
-    node.x += node.vx;
-    node.y += node.vy;
-  });
-}
-
-function renderGraph(): void {
-  const state = ensureGraphState();
-  const ctx = state.ctx;
-  resizeGraphCanvas();
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, state.canvas.width, state.canvas.height);
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, state.canvas.width, state.canvas.height);
-  ctx.save();
-  ctx.translate(state.panX, state.panY);
-  ctx.scale(state.scale, state.scale);
-
-  const nodeById = new Map(state.nodes.map(node => [node.id, node]));
-  ctx.lineWidth = 1 / state.scale;
-  ctx.strokeStyle = 'rgba(180,180,180,.16)';
-  state.edges.forEach(edge => {
-    const a = nodeById.get(edge.source);
-    const b = nodeById.get(edge.target);
-    if (!a || !b) return;
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y);
-    ctx.lineTo(b.x, b.y);
-    ctx.stroke();
-  });
-
-  const activeIncludes = new Set((activeTab().includeTags || []).map(normalizeTag));
-  state.nodes.forEach(node => {
-    if (node.type === 'image') {
-      ctx.beginPath();
-      ctx.fillStyle = 'rgba(210,210,210,.55)';
-      ctx.arc(node.x, node.y, node.r, 0, Math.PI * 2);
-      ctx.fill();
-      return;
-    }
-    const norm = normalizeTag(node.tag);
-    const highlighted = state.query && norm.includes(state.query);
-    const active = activeIncludes.has(norm);
-    const size = highlighted || active ? 13 : 10;
-    ctx.save();
-    ctx.translate(node.x, node.y);
-    ctx.rotate(Math.PI / 4);
-    ctx.fillStyle = active ? '#FFFFFF' : highlighted ? '#CFCFCF' : '#111111';
-    ctx.strokeStyle = active ? '#FFFFFF' : '#D4D4D4';
-    ctx.lineWidth = (active || highlighted ? 1.8 : 1.1) / state.scale;
-    ctx.beginPath();
-    ctx.rect(-size, -size, size * 2, size * 2);
-    ctx.fill();
-    ctx.stroke();
-    ctx.restore();
-    ctx.font = `${11 / state.scale}px ui-monospace, SFMono-Regular, Consolas, monospace`;
-    ctx.fillStyle = active ? '#FFFFFF' : '#D4D4D4';
-    ctx.textAlign = 'center';
-    ctx.fillText(node.label, node.x, node.y - 17);
-  });
-  ctx.restore();
-}
-
-function graphPoint(event: MouseEvent | WheelEvent): GraphPoint {
-  const state = ensureGraphState();
-  const rect = state.canvas.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  const x = (event.clientX - rect.left) * dpr;
-  const y = (event.clientY - rect.top) * dpr;
-  return {
-    screenX: x,
-    screenY: y,
-    x: (x - state.panX) / state.scale,
-    y: (y - state.panY) / state.scale
-  };
-}
-
-function findGraphNode(point: GraphPoint): GraphNode | null {
-  const state = ensureGraphState();
-  for (let i = state.nodes.length - 1; i >= 0; i--) {
-    const node = state.nodes[i];
-    const size = node.type === 'tag' ? 14 : 7;
-    if (Math.abs(point.x - node.x) <= size && Math.abs(point.y - node.y) <= size) return node;
-  }
-  return null;
-}
-
-function handleGraphWheel(event: WheelEvent): void {
-  const state = ensureGraphState();
-  if (!state.open) return;
-  event.preventDefault();
-  const point = graphPoint(event);
-  const factor = event.deltaY > 0 ? 0.9 : 1.1;
-  const nextScale = Math.max(0.22, Math.min(4, state.scale * factor));
-  state.panX = point.screenX - point.x * nextScale;
-  state.panY = point.screenY - point.y * nextScale;
-  state.scale = nextScale;
-  renderGraph();
-}
-
-function handleGraphMouseDown(event: MouseEvent): void {
-  const state = ensureGraphState();
-  if (!state.open || event.button !== 0) return;
-  const point = graphPoint(event);
-  state.pointerMoved = false;
-  state.lastX = point.screenX;
-  state.lastY = point.screenY;
-  state.dragNode = findGraphNode(point);
-  state.isPanning = !state.dragNode;
-  state.canvas.classList.add('dragging');
-}
-
-function handleGraphMouseMove(event: MouseEvent): void {
-  const state = ensureGraphState();
-  if (!state.open || (!state.dragNode && !state.isPanning)) return;
-  const point = graphPoint(event);
-  const dx = point.screenX - state.lastX;
-  const dy = point.screenY - state.lastY;
-  if (Math.abs(dx) + Math.abs(dy) > 2) state.pointerMoved = true;
-  if (state.dragNode) {
-    state.dragNode.x = point.x;
-    state.dragNode.y = point.y;
-    state.dragNode.vx = 0;
-    state.dragNode.vy = 0;
-  } else {
-    state.panX += dx;
-    state.panY += dy;
-  }
-  state.lastX = point.screenX;
-  state.lastY = point.screenY;
-  renderGraph();
-}
-
-function handleGraphMouseUp(event: MouseEvent): void {
-  const state = ensureGraphState();
-  if (!state.open) return;
-  const clickedNode = state.dragNode;
-  state.canvas.classList.remove('dragging');
-  state.dragNode = null;
-  state.isPanning = false;
-  if (!clickedNode || state.pointerMoved) return;
-  if (clickedNode.type === 'tag') {
-    toggleGraphTagFilter(clickedNode.tag);
-  } else {
-    openGraphImage(clickedNode.imageId);
-  }
-}
-
-function toggleGraphTagFilter(tag: string): void {
-  const tab = activeTab();
-  const norm = normalizeTag(tag);
-  if ((tab.includeTags || []).some(item => normalizeTag(item) === norm)) {
-    removeFilterTag('include', tag);
-  } else {
-    addFilterTag('include', tag, false);
-  }
-  renderGraph();
-}
-
-function openGraphImage(imageId: string): void {
-  const source = graphImages();
-  const idx = source.findIndex(img => img.id === imageId);
-  if (idx < 0) return;
-  closeGraph();
-  openLightbox(idx, true, source, 'fixed');
-}
-
-function resetGraphLayout(): void {
-  if (!graphState) return;
-  graphState.scale = 1;
-  graphState.panX = 0;
-  graphState.panY = 0;
-  if (graphState.open) rebuildGraph();
-}
-
 function initFishInput(
   inputId: string,
   ghostId: string,
@@ -3227,7 +2739,6 @@ function forwardGalleryArrowKeyUp(code: string): void {
 }
 
 function resolveShortcutContext(): ShortcutContext {
-  if (graphState?.open) return 'graph';
   if (activeWorkspace === 'settings') return 'settings';
   if (previewModal?.isOpen) return 'viewer';
   return activeWorkspace === 'gallery' ? 'gallery' : 'blocked';
@@ -3253,7 +2764,6 @@ function resolveShortcut(event: KeyboardEvent, context: ShortcutContext): AppCom
   if (event.key === 'Escape' || isPlainCode(event, 'KeyQ')) {
     if (context === 'viewer') return 'viewer.close';
     if (context === 'settings') return 'settings.close';
-    if (context === 'graph') return 'graph.close';
     return null;
   }
 
@@ -3359,9 +2869,6 @@ function dispatchCommand(command: AppCommand, context: ShortcutContext, event: K
     case 'settings.close':
       toggleSettings(false);
       break;
-    case 'graph.close':
-      closeGraph();
-      break;
   }
 }
 
@@ -3377,7 +2884,7 @@ document.addEventListener('keydown', event => {
     return;
   }
   const command = resolveShortcut(event, context);
-  const preserveContextEscape = event.key === 'Escape' && (context === 'settings' || context === 'graph');
+  const preserveContextEscape = event.key === 'Escape' && context === 'settings';
   const applicationCommand = command === 'gallery.newTab'
     || command === 'gallery.closeTab'
     || command === 'gallery.focusTagSearch'
@@ -4020,9 +3527,6 @@ function runAction(actionEl: HTMLElement): void {
     case 'close-preview':
       closePreview();
       break;
-    case 'close-graph':
-      closeGraph();
-      break;
     case 'create-tag-from-settings':
       createTagFromSettings();
       break;
@@ -4031,9 +3535,6 @@ function runAction(actionEl: HTMLElement): void {
       break;
     case 'open-folder':
       openFolder();
-      break;
-    case 'open-graph':
-      openGraph();
       break;
     case 'open-gallery-diagnostics':
       galleryDiagnostics.openPanel();
@@ -4077,14 +3578,8 @@ function runAction(actionEl: HTMLElement): void {
     case 'preview-nav':
       previewNav(Number(actionEl.dataset.dir || 0));
       break;
-    case 'reset-graph-layout':
-      resetGraphLayout();
-      break;
     case 'scroll-to-top':
       scrollToTop();
-      break;
-    case 'set-graph-scope':
-      setGraphScope(actionEl.dataset.scope || actionValue(actionEl));
       break;
     case 'set-match-mode':
       setMatchMode(actionEl.dataset.mode);
@@ -4129,16 +3624,11 @@ function initActionBindings(): void {
     if (!actionEl) return;
     if (actionEl.dataset.action === 'set-sort-mode') setSortMode(actionValue(actionEl));
     else if (actionEl.dataset.action === 'set-tag-admin-sort') setTagAdminSort(actionValue(actionEl));
-    else if (actionEl.dataset.action === 'set-graph-scope') setGraphScope(actionEl.dataset.scope || actionValue(actionEl));
     else if (actionEl.dataset.action === 'toggle-folder-tag-sync' && actionEl instanceof HTMLInputElement) {
       void setFolderTagSync(actionEl.checked);
     }
   });
 }
-
-requiredHtml('graph-overlay').addEventListener('click', e => {
-  if (e.target === requiredHtml('graph-overlay')) closeGraph();
-});
 
 document.addEventListener('click', e => {
   const targetNode = e.target instanceof Node ? e.target : null;
@@ -4166,7 +3656,6 @@ requiredInput('tag-admin-create').addEventListener('keydown', e => {
 window.addEventListener('scroll', updateScrollTopButton, {passive: true});
 window.addEventListener('resize', () => {
   handleGalleryResize();
-  if (graphState && graphState.open) rebuildGraph();
   if (previewModal?.isOpen) schedulePreviewFilmstripLayoutRefresh();
 });
 document.addEventListener('visibilitychange', () => {
@@ -4180,7 +3669,6 @@ galleryDiagnostics.install({
   captureMountedCards: captureMountedCardsForDiagnostics,
   isGalleryActive: () => activeWorkspace === 'gallery'
     && !previewModal?.isOpen
-    && !graphState?.open
 });
 initFilterInput();
 initFishInputs();

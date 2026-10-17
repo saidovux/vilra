@@ -454,7 +454,7 @@ test('Settings workspace contains Problems and rechecks one stored path', async 
     await expect(page.locator('#filter-bar')).not.toBeVisible();
     await expect(page.locator('#problems-nav')).toHaveCount(0);
     await expect(page.locator('.settings-tabs')).toHaveCSS('flex-direction', 'column');
-    await expect(page.locator('.settings-tab')).toHaveText(['Общее', 'Теги', 'Граф', /Проблемы/]);
+    await expect(page.locator('.settings-tab')).toHaveText(['Общее', 'Теги', /Проблемы/]);
     const workspaceBox = await page.locator('#settings-panel').boundingBox();
     expect(workspaceBox).toBeTruthy();
     expect(Math.abs(workspaceBox!.x)).toBeLessThanOrEqual(1);
