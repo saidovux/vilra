@@ -70,7 +70,7 @@ export function updateTabTitle(tab: GalleryTab): void {
 }
 
 export function serializeGallerySession(
-  tabs: GalleryTab[],
+  tabs: readonly GalleryTab[],
   activeTabId: string | null,
   activeTab: GalleryTab,
 ) {

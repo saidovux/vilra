@@ -42,13 +42,12 @@ import {buildImageQueryParams} from './gallery/image-query';
 import {
   DEFAULT_SORT_MODE,
   isSortMode,
-  makeDefaultTab,
   normalizeTabs,
   serializeGallerySession,
-  SORT_MODES,
   updateTabTitle,
   type GalleryTab,
 } from './gallery/gallery-tab-model';
+import {GalleryTabsState} from './gallery/gallery-tabs-state';
 import {
   aspectCss,
   computeGalleryGeometry,
@@ -218,8 +217,7 @@ let allTagPool: string[] = [];
 let allTagMeta: Map<string, TagMeta> = new Map();
 let scannedRoots: string[] = [];
 let folderTagSync = true;
-let tabs: GalleryTab[] = [];
-let activeTabId: string | null = null;
+const galleryTabs = new GalleryTabsState();
 let lbIndex = -1;
 let statusInterval: ReturnType<typeof setInterval> | null = null;
 let sessionSaveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -318,21 +316,7 @@ const galleryVirtualizerController = new GalleryVirtualizerController({
 });
 
 function activeTab(): GalleryTab {
-  if (!tabs.length) {
-    const tab = makeDefaultTab();
-    tabs = [tab];
-    activeTabId = tab.id;
-  }
-  let tab = tabs.find(item => item.id === activeTabId);
-  if (!tab) {
-    tab = tabs[0];
-    activeTabId = tab.id;
-  }
-  tab.includeTags = Array.isArray(tab.includeTags) ? tab.includeTags : [];
-  tab.excludeTags = Array.isArray(tab.excludeTags) ? tab.excludeTags : [];
-  tab.matchMode = tab.matchMode === "all" ? "all" : "any";
-  tab.sortMode = SORT_MODES.includes(tab.sortMode) ? tab.sortMode : DEFAULT_SORT_MODE;
-  return tab;
+  return galleryTabs.current();
 }
 
 function setFolderInputValues(path: string): void {
@@ -1272,9 +1256,7 @@ async function refreshTagPool() {
 function addTab() {
   clearImageSelection();
   saveActiveScroll();
-  const tab = makeDefaultTab();
-  tabs.push(tab);
-  activeTabId = tab.id;
+  galleryTabs.add();
   closePreview(false);
   refreshImages(true);
   window.scrollTo({top: 0});
@@ -1282,10 +1264,10 @@ function addTab() {
 }
 
 function switchTab(id: string): void {
-  if (id === activeTabId) return;
+  if (id === galleryTabs.activeId) return;
   clearImageSelection();
   saveActiveScroll();
-  activeTabId = id;
+  galleryTabs.select(id);
   closePreview(false);
   const tab = activeTab();
   pendingGalleryScrollTop = tab.scrollTop || 0;
@@ -1295,31 +1277,21 @@ function switchTab(id: string): void {
 
 function closeTab(id: string): void {
   clearImageSelection();
-  if (tabs.length <= 1) {
-    tabs = [makeDefaultTab()];
-    activeTabId = tabs[0].id;
-  } else {
-    const idx = tabs.findIndex(tab => tab.id === id);
-    tabs = tabs.filter(tab => tab.id !== id);
-    if (activeTabId === id) {
-      const next = tabs[Math.max(0, idx - 1)] || tabs[0];
-      activeTabId = next.id;
-    }
-  }
+  galleryTabs.close(id);
   closePreview(false);
   refreshImages(true);
   saveSessionSoon();
 }
 
 function switchTabByVisibleIndex(index: number): void {
-  const tab = tabs[index];
+  const tab = galleryTabs.list[index];
   if (tab) switchTab(tab.id);
 }
 
 function renderTabs(): void {
   const el = requiredHtml('tabs');
-  el.innerHTML = tabs.map(tab => `
-    <button class="tab ${tab.id === activeTabId ? 'active' : ''}" data-tab="${escAttr(tab.id)}" title="${escAttr(tab.title)}">
+  el.innerHTML = galleryTabs.list.map(tab => `
+    <button class="tab ${tab.id === galleryTabs.activeId ? 'active' : ''}" data-tab="${escAttr(tab.id)}" title="${escAttr(tab.title)}">
       <span class="tab-title">${escHtml(tab.title)}</span>
       <span class="tab-close" data-close="${escAttr(tab.id)}">×</span>
     </button>
@@ -1341,7 +1313,7 @@ function renderTabs(): void {
 }
 
 function saveActiveScroll(): void {
-  if (!tabs.length || activeWorkspace !== 'gallery') return;
+  if (!galleryTabs.list.length || activeWorkspace !== 'gallery') return;
   activeTab().scrollTop = window.scrollY || document.documentElement.scrollTop || 0;
 }
 
@@ -1930,7 +1902,7 @@ function handlePreviewClosed(): void {
   previewCurrentImageId = null;
   previewSourceMode = 'gallery';
   lbIndex = -1;
-  if (!suppressPreviewCloseClear && tabs.length && activeTab().lastImageId) {
+  if (!suppressPreviewCloseClear && galleryTabs.list.length && activeTab().lastImageId) {
     activeTab().lastImageId = null;
     saveSessionSoon();
   }
@@ -2553,7 +2525,7 @@ function saveSessionSoon(): void {
 async function saveSession(): Promise<void> {
   saveActiveScroll();
   const tab = activeTab();
-  const body = serializeGallerySession(tabs, activeTabId, tab);
+  const body = serializeGallerySession(galleryTabs.list, galleryTabs.activeId, tab);
   try {
     await fetch('/api/session', {
       method: 'PATCH',
@@ -2570,9 +2542,9 @@ async function loadSession(): Promise<void> {
     const s = await readJsonRecord(r);
     folderTagSync = s.folder_tag_sync !== false;
     renderFolderTagSyncSetting();
-    tabs = normalizeTabs(s.tabs, s, dedupeDisplayTags);
+    const restoredTabs = normalizeTabs(s.tabs, s, dedupeDisplayTags);
     const activeId = typeof s.active_tab_id === 'string' ? s.active_tab_id : null;
-    activeTabId = activeId && tabs.some(tab => tab.id === activeId) ? activeId : tabs[0].id;
+    galleryTabs.restore(restoredTabs, activeId);
     renderTabs();
     renderFilterControls();
     const rootPath = typeof s.root_path === 'string' ? s.root_path : '';
@@ -2591,8 +2563,7 @@ async function loadSession(): Promise<void> {
       pollStatus();
     }
   } catch (e) {
-    tabs = [makeDefaultTab()];
-    activeTabId = tabs[0].id;
+    galleryTabs.reset();
     renderTabs();
     renderFilterControls();
     showSetup();
@@ -2976,7 +2947,7 @@ function renderSidebarTags(): void {
   const userTarget = optionalHtml('sidebar-user-tags');
   if (!autoTarget || !userTarget) return;
   const query = normalizeTag(optionalInput('sidebar-tag-search')?.value || '');
-  const tab = tabs.length ? activeTab() : null;
+  const tab = galleryTabs.list.length ? activeTab() : null;
   const included = new Set((tab?.includeTags || []).map(normalizeTag));
   const excluded = new Set((tab?.excludeTags || []).map(normalizeTag));
   const tags = Array.from(allTagMeta.values())
