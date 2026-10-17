@@ -1,10 +1,6 @@
 import {
-  Virtualizer,
-  observeWindowOffset,
-  observeWindowRect,
-  windowScroll,
   type VirtualItem,
-  type VirtualizerOptions,
+  type Virtualizer,
 } from '@tanstack/virtual-core';
 import {
   galleryDiagnostics,
@@ -46,7 +42,6 @@ import {
 import {
   aspectCss,
   computeGalleryGeometry,
-  estimateVirtualCardSize,
   virtualItemIsNear,
   virtualItemIsVisible,
   type GalleryGeometry,
@@ -58,6 +53,7 @@ import {
   type ThumbLifecycle,
 } from './gallery/thumbnail-lifecycle';
 import {VirtualGalleryView} from './gallery/virtual-gallery-view';
+import {GalleryVirtualizerController} from './gallery/virtualizer-controller';
 import {PreviewModal} from './viewer/preview-modal';
 
 type SettingsTab = 'general' | 'tags' | 'graph' | 'problems';
@@ -349,8 +345,6 @@ let nextCursor: string | null = null;
 let hasMorePages = false;
 let isLoadingPage = false;
 let activeImagesRequest = 0;
-let galleryVirtualizer: Virtualizer<Window, HTMLDivElement> | null = null;
-let galleryVirtualizerCleanup: (() => void) | null = null;
 let galleryGeometry: GalleryGeometry | null = null;
 let galleryResizeFrame: number | null = null;
 let paginationPrefetchFrame: number | null = null;
@@ -426,7 +420,6 @@ let thumbnailScrollSettleTimer: ReturnType<typeof setTimeout> | null = null;
 let terminalGalleryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 const forwardedGalleryArrowDirections = new Set<GalleryArrowDirection>();
 const PAGE = 48;
-const GALLERY_OVERSCAN = 20;
 const GALLERY_BROWSER_ARROW_STEP = 96;
 const VIEWER_KEYBOARD_PAN_STEP = 80;
 const THUMB_VELOCITY_EMA_ALPHA = 0.35;
@@ -451,6 +444,10 @@ const virtualGalleryView = new VirtualGalleryView({
   clearThumbnailLifecycle: (imageId, card) => thumbnailLifecycles.clear(imageId, card),
   diagnosticCardRef,
   diagnostics: galleryDiagnostics,
+});
+const galleryVirtualizerController = new GalleryVirtualizerController({
+  getImages: () => visibleImages,
+  onChange: handleGalleryVirtualizerChange,
 });
 
 function isSortMode(mode: string | undefined): mode is SortMode {
@@ -1444,7 +1441,8 @@ function loadNextImagesPage(): Promise<void> {
       if (activePageLoad === load) {
         isLoadingPage = false;
         activePageLoad = null;
-        if (galleryVirtualizer) schedulePaginationPrefetch(galleryVirtualizer);
+        const instance = galleryVirtualizerController.current;
+        if (instance) schedulePaginationPrefetch(instance);
       }
     }
   })();
@@ -3577,7 +3575,7 @@ function updateThumbnailScrollState(
 }
 
 function reevaluateThumbnailAdmissions(
-  instance: Virtualizer<Window, HTMLDivElement> | null = galleryVirtualizer,
+  instance: Virtualizer<Window, HTMLDivElement> | null = galleryVirtualizerController.current,
 ): void {
   if (!instance || !galleryGeometry || thumbnailScrollState.fast) return;
   const visible: ThumbLifecycle[] = [];
@@ -3612,49 +3610,29 @@ function scheduleThumbnailAdmissionEvaluation(): void {
   });
 }
 
-function galleryVirtualizerOptions(geometry: GalleryGeometry): VirtualizerOptions<Window, HTMLDivElement> {
-  return {
-    count: visibleImages.length,
-    getScrollElement: () => window,
-    estimateSize: index => estimateVirtualCardSize(visibleImages[index], geometry),
-    getItemKey: index => visibleImages[index]?.id || `missing-${index}`,
-    scrollToFn: windowScroll,
-    observeElementRect: observeWindowRect,
-    observeElementOffset: observeWindowOffset,
-    onChange: (instance, sync) => {
-      updateThumbnailScrollState(instance, sync);
-      galleryDiagnostics.virtualizerChanged(
-        sync,
-        Number.isFinite(instance.scrollOffset) ? Number(instance.scrollOffset) : null,
-        instance.scrollDirection,
-      );
-      renderVirtualGalleryRange(instance);
-      reevaluateThumbnailAdmissions(instance);
-      schedulePaginationPrefetch(instance);
-    },
-    lanes: geometry.laneCount,
-    laneAssignmentMode: 'estimate',
-    gap: geometry.gap,
-    overscan: GALLERY_OVERSCAN,
-    scrollMargin: geometry.scrollMargin,
-  };
+function handleGalleryVirtualizerChange(
+  instance: Virtualizer<Window, HTMLDivElement>,
+  sync: boolean,
+): void {
+  updateThumbnailScrollState(instance, sync);
+  galleryDiagnostics.virtualizerChanged(
+    sync,
+    Number.isFinite(instance.scrollOffset) ? Number(instance.scrollOffset) : null,
+    instance.scrollDirection,
+  );
+  renderVirtualGalleryRange(instance);
+  reevaluateThumbnailAdmissions(instance);
+  schedulePaginationPrefetch(instance);
 }
 
-function renderVirtualGalleryRange(instance = galleryVirtualizer): void {
+function renderVirtualGalleryRange(instance = galleryVirtualizerController.current): void {
   if (!instance || !galleryGeometry) return;
   virtualGalleryView.render(instance, galleryGeometry, visibleImages);
 }
 
 function ensureGalleryVirtualizer(): Virtualizer<Window, HTMLDivElement> {
   galleryGeometry = readGalleryGeometry();
-  if (!galleryVirtualizer) {
-    galleryVirtualizer = new Virtualizer<Window, HTMLDivElement>(galleryVirtualizerOptions(galleryGeometry));
-    galleryVirtualizerCleanup = galleryVirtualizer._didMount();
-  } else {
-    galleryVirtualizer.setOptions(galleryVirtualizerOptions(galleryGeometry));
-  }
-  galleryVirtualizer._willUpdate();
-  return galleryVirtualizer;
+  return galleryVirtualizerController.ensure(galleryGeometry);
 }
 
 function captureGalleryAnchor(): {imageId: string; viewportTop: number} | null {
@@ -3670,12 +3648,13 @@ function captureGalleryAnchor(): {imageId: string; viewportTop: number} | null {
 }
 
 function restoreGalleryAnchor(anchor: {imageId: string; viewportTop: number} | null): void {
-  if (!anchor || !galleryVirtualizer) return;
+  const instance = galleryVirtualizerController.current;
+  if (!anchor || !instance) return;
   const index = visibleImages.findIndex(image => image.id === anchor.imageId);
   if (index < 0) return;
-  const item = galleryVirtualizer.measurementsCache[index];
+  const item = instance.measurementsCache[index];
   if (!item) return;
-  galleryVirtualizer.scrollToOffset(Math.max(0, item.start - anchor.viewportTop), {behavior: 'instant'});
+  instance.scrollToOffset(Math.max(0, item.start - anchor.viewportTop), {behavior: 'instant'});
   requestAnimationFrame(() => {
     const mounted = virtualGalleryView.getMounted(anchor.imageId);
     if (!mounted) return;
@@ -3733,8 +3712,8 @@ function invalidateVirtualGallery(options: {preserveAnchor: boolean; resetCards:
 function updateVirtualGalleryCount(): void {
   const diagnosticStartedAt = galleryDiagnostics.recording ? performance.now() : 0;
   const instance = ensureGalleryVirtualizer();
-  instance.setOptions(galleryVirtualizerOptions(galleryGeometry!));
-  instance._willUpdate();
+  galleryVirtualizerController.setOptions(galleryGeometry!);
+  galleryVirtualizerController.willUpdate();
   renderVirtualGalleryRange(instance);
   schedulePaginationPrefetch(instance);
   if (galleryDiagnostics.recording) {
@@ -3755,7 +3734,8 @@ function captureMountedCardsForDiagnostics(): void {
     );
     bindDiagnosticCardRef(image, reference);
   });
-  if (galleryVirtualizer) renderVirtualGalleryRange(galleryVirtualizer);
+  const instance = galleryVirtualizerController.current;
+  if (instance) renderVirtualGalleryRange(instance);
 }
 
 function schedulePaginationPrefetch(instance: Virtualizer<Window, HTMLDivElement>): void {
@@ -3770,8 +3750,9 @@ function schedulePaginationPrefetch(instance: Virtualizer<Window, HTMLDivElement
 }
 
 function galleryContentBottom(): number {
-  if (!galleryVirtualizer || !galleryGeometry) return 0;
-  return galleryGeometry.scrollMargin + galleryVirtualizer.getTotalSize();
+  const instance = galleryVirtualizerController.current;
+  if (!instance || !galleryGeometry) return 0;
+  return galleryGeometry.scrollMargin + instance.getTotalSize();
 }
 
 async function restorePendingGalleryScroll(): Promise<void> {
@@ -3784,7 +3765,7 @@ async function restorePendingGalleryScroll(): Promise<void> {
     if (visibleImages.length <= previousCount) break;
   }
   await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
-  galleryVirtualizer?.scrollToOffset(target, {behavior: 'instant'});
+  galleryVirtualizerController.current?.scrollToOffset(target, {behavior: 'instant'});
 }
 
 function scheduleGalleryResize(anchor: {imageId: string; viewportTop: number} | null): void {
