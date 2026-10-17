@@ -8,6 +8,31 @@ export function clamp(value: number, min: number, max: number): number {
   return value;
 }
 
+export function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export function escHtml(value: unknown): string {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+export function fileName(path: unknown): string {
+  return String(path || '').split(/[/\\]/).pop() || '';
+}
+
+export function fmtSize(bytes: unknown): string {
+  const value = Number(bytes);
+  if (!Number.isFinite(value)) return '';
+  if (value < 1024) return value + ' B';
+  if (value < 1048576) return (value / 1024).toFixed(1) + ' KB';
+  return (value / 1048576).toFixed(1) + ' MB';
+}
+
 export function requireElement<T extends Element>(
   id: string,
   expected: ElementConstructor<T>,
@@ -48,4 +73,13 @@ export function optionalNumber(value: unknown): number | undefined {
 export async function readJsonRecord(response: Response): Promise<JsonRecord> {
   const value: unknown = await response.json();
   return isRecord(value) ? value : {};
+}
+
+export async function readError(response: Response): Promise<string> {
+  try {
+    const data = await readJsonRecord(response);
+    return String(data.detail || data.error || response.statusText);
+  } catch {
+    return response.statusText;
+  }
 }

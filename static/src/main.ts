@@ -11,15 +11,19 @@ import {
   type GalleryArrowDirection,
   isDesktopRuntime,
   pickFolderNative,
-  revealFileNative,
   sendGalleryArrowInputNative,
 } from './desktop-runtime';
 import {
   clamp,
+  errorMessage,
+  escHtml,
+  fileName,
+  fmtSize,
   isRecord,
   optionalNumber,
   optionalElement,
   optionalHtml,
+  readError,
   readJsonRecord,
   requireElement,
   stringArray,
@@ -54,6 +58,7 @@ import {
 } from './gallery/thumbnail-lifecycle';
 import {VirtualGalleryView} from './gallery/virtual-gallery-view';
 import {GalleryVirtualizerController} from './gallery/virtualizer-controller';
+import {ProblemsWorkspace} from './problems/problems-workspace';
 import {PreviewModal} from './viewer/preview-modal';
 
 type SettingsTab = 'general' | 'tags' | 'problems';
@@ -131,33 +136,6 @@ interface ThumbnailScrollState {
   slowSamples: number;
 }
 
-type ProblemSeverity = 'all' | 'error' | 'warning';
-
-interface ProblemSummary {
-  total: number;
-  errors: number;
-  warnings: number;
-  latestUpdatedAt: string | null;
-}
-
-interface ProblemItem {
-  id: number;
-  imageId: string | null;
-  rootPath: string;
-  path: string;
-  absolutePath: string;
-  fileName: string;
-  severity: 'error' | 'warning';
-  kind: string;
-  expectedFormat: string | null;
-  detectedFormat: string | null;
-  size: number;
-  mtimeNs: number;
-  technicalDetail: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
 interface LiveEventEnvelope {
   sequence?: number;
   type: string;
@@ -199,10 +177,6 @@ function requiredAnchor(id: string): HTMLAnchorElement {
   return requireElement(id, HTMLAnchorElement, "Required link is missing");
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 function statusResponse(value: JsonRecord): StatusResponse {
   return {
     db_ready: Boolean(value.db_ready),
@@ -214,30 +188,6 @@ function statusResponse(value: JsonRecord): StatusResponse {
     done: optionalNumber(value.done),
     total: optionalNumber(value.total),
     error: typeof value.error === 'string' ? value.error : undefined
-  };
-}
-
-function normalizeProblemItem(value: unknown): ProblemItem | null {
-  if (!isRecord(value)) return null;
-  const id = Number(value.id);
-  const severity = value.severity === 'warning' ? 'warning' : value.severity === 'error' ? 'error' : null;
-  if (!Number.isInteger(id) || !severity) return null;
-  return {
-    id,
-    imageId: typeof value.image_id === 'string' ? value.image_id : null,
-    rootPath: String(value.root_path || ''),
-    path: String(value.path || ''),
-    absolutePath: String(value.absolute_path || ''),
-    fileName: String(value.file_name || fileName(value.path)),
-    severity,
-    kind: String(value.kind || ''),
-    expectedFormat: typeof value.expected_format === 'string' ? value.expected_format : null,
-    detectedFormat: typeof value.detected_format === 'string' ? value.detected_format : null,
-    size: Number(value.size || 0),
-    mtimeNs: Number(value.mtime_ns || 0),
-    technicalDetail: typeof value.technical_detail === 'string' ? value.technical_detail : null,
-    createdAt: String(value.created_at || ''),
-    updatedAt: String(value.updated_at || '')
   };
 }
 
@@ -325,23 +275,9 @@ let liveRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
 let liveFolderRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let liveTagRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let activeWorkspace: AppWorkspace = 'gallery';
-let problemsSummary: ProblemSummary = {total: 0, errors: 0, warnings: 0, latestUpdatedAt: null};
-let problemsSeverity: ProblemSeverity = 'all';
-let problemsItems: ProblemItem[] = [];
-let problemsTotal = 0;
-let problemsLoading = false;
-let problemsLoadError = '';
-let problemsNotice = '';
-let problemsNoticeIsError = false;
-let problemsRecheckAllRunning = false;
-let problemsRefreshRunning = false;
-let problemsRefreshQueued = false;
-let problemsListRefreshQueued = false;
-let problemsSearchTimer: ReturnType<typeof setTimeout> | null = null;
-let problemsRequestToken = 0;
-let problemsListReloadQueued = false;
-let problemsPollTimer: ReturnType<typeof setInterval> | null = null;
-const problemRowRechecks = new Set<number>();
+const problemsWorkspace = new ProblemsWorkspace({
+  isProblemsActive: () => activeWorkspace === 'settings' && settingsActiveTab === 'problems',
+});
 const terminalThumbIds = new Set<string>();
 const thumbnailScrollState: ThumbnailScrollState = {
   offset: null,
@@ -668,7 +604,7 @@ function setSettingsTab(tab: SettingsTab | string | undefined): void {
     panel.setAttribute('aria-hidden', active ? 'false' : 'true');
   });
   if (settingsActiveTab === 'tags') renderTagAdmin();
-  if (settingsActiveTab === 'problems' && activeWorkspace === 'settings') scheduleProblemsRefresh();
+  if (settingsActiveTab === 'problems' && activeWorkspace === 'settings') problemsWorkspace.scheduleRefresh();
 }
 
 function showGallery(): void {
@@ -812,16 +748,10 @@ function handleLiveEvent(event: LiveEventEnvelope): void {
       void pollStatus();
       break;
     case 'problems_changed':
-      scheduleProblemsRefresh();
+      problemsWorkspace.handleProblemsChanged();
       break;
     case 'problems_recheck_finished':
-      problemsRecheckAllRunning = false;
-      problemsNotice = Number(event.data.failed || 0) > 0
-        ? `Проверка завершена, ошибок выполнения: ${Number(event.data.failed || 0)}.`
-        : 'Проверка завершена.';
-      problemsNoticeIsError = Number(event.data.failed || 0) > 0;
-      renderProblems();
-      scheduleProblemsRefresh();
+      problemsWorkspace.handleRecheckFinished(event.data);
       break;
     case 'resync_required':
       scheduleLiveRecovery(String(event.data.reason || 'backend_requested'));
@@ -944,166 +874,6 @@ function setDbStatus(ok: boolean, text: string): void {
   db.classList.toggle('bad', !ok);
 }
 
-function problemHumanMessage(problem: ProblemItem): string {
-  switch (problem.kind) {
-    case 'decode_error': return 'Файл не удаётся прочитать. Возможно, он повреждён или обрезан.';
-    case 'format_mismatch':
-      if (problem.expectedFormat && problem.detectedFormat) {
-        return `Содержимое: ${formatDisplayName(problem.detectedFormat)} · расширение: ${formatDisplayName(problem.expectedFormat)}`;
-      }
-      return 'Расширение файла не соответствует его содержимому.';
-    case 'unsupported_content': return 'Содержимое файла имеет формат, который Vilra не поддерживает.';
-    case 'unreadable': return 'Vilra не может прочитать этот файл.';
-    default: return 'Файл требует проверки.';
-  }
-}
-
-function formatDisplayName(format: string | null): string {
-  switch (String(format || '').toLowerCase()) {
-    case 'jpeg':
-    case 'jpg': return 'JPEG';
-    case 'png': return 'PNG';
-    case 'webp': return 'WebP';
-    default: return format || 'не определён';
-  }
-}
-
-function renderProblemsSummary(): void {
-  requiredHtml('problems-total').textContent = String(problemsSummary.total);
-  requiredHtml('problems-errors').textContent = String(problemsSummary.errors);
-  requiredHtml('problems-warnings').textContent = String(problemsSummary.warnings);
-  const badge = requiredHtml('problems-badge');
-  badge.textContent = String(problemsSummary.errors);
-  badge.classList.toggle('muted', problemsSummary.errors === 0);
-}
-
-function renderProblems(): void {
-  document.querySelectorAll<HTMLElement>('.problems-filter').forEach(button => {
-    button.classList.toggle('active', button.dataset.severity === problemsSeverity);
-  });
-  const list = requiredHtml('problems-list');
-  list.innerHTML = problemsItems.map(problem => `
-    <article class="problem-row" data-problem-id="${problem.id}">
-      <span class="problem-severity ${problem.severity}">${problem.severity === 'error' ? 'Ошибка' : 'Внимание'}</span>
-      <div>
-        <div class="problem-file">${escHtml(problem.fileName)}</div>
-        <div class="problem-path">${escHtml(problem.path)}</div>
-        <div class="problem-message">${escHtml(problemHumanMessage(problem))}</div>
-        <div class="problem-meta">${escHtml(fmtSize(problem.size))} · расширение: ${escHtml(formatDisplayName(problem.expectedFormat))} · содержимое: ${escHtml(formatDisplayName(problem.detectedFormat))}</div>
-        ${problem.technicalDetail ? `<details class="problem-detail"><summary>Технические детали</summary>${escHtml(problem.technicalDetail)}</details>` : ''}
-        <div class="problem-inline-error" data-problem-error="${problem.id}"></div>
-      </div>
-      <div class="problem-actions">
-        <button class="btn btn-ghost btn-sm" type="button" data-action="reveal-problem" data-problem-id="${problem.id}">${isDesktopRuntime() ? 'Показать в папке' : 'Копировать путь'}</button>
-        <button class="btn btn-ghost btn-sm" type="button" data-action="recheck-problem" data-problem-id="${problem.id}" ${problemRowRechecks.has(problem.id) ? 'disabled' : ''}>${problemRowRechecks.has(problem.id) ? 'Проверка…' : 'Проверить'}</button>
-      </div>
-    </article>
-  `).join('');
-  const feedback = requiredHtml('problems-feedback');
-  feedback.classList.toggle('error', Boolean(problemsLoadError || (problemsNotice && problemsNoticeIsError)));
-  if (problemsLoadError) feedback.innerHTML = `${escHtml(problemsLoadError)} <button class="btn btn-ghost btn-sm" type="button" data-action="retry-problems">Повторить</button>`;
-  else if (problemsNotice) feedback.textContent = problemsNotice;
-  else if (problemsLoading && !problemsItems.length) feedback.textContent = 'Загрузка…';
-  else if (!problemsItems.length) feedback.textContent = 'Проблем не найдено.';
-  else feedback.textContent = `Показано ${problemsItems.length} из ${problemsTotal}`;
-  const more = requireElement('problems-load-more', HTMLButtonElement, 'Problems load button is missing');
-  more.hidden = problemsItems.length >= problemsTotal;
-  more.disabled = problemsLoading;
-  const all = requireElement('problems-recheck-all', HTMLButtonElement, 'Problems recheck button is missing');
-  all.disabled = problemsRecheckAllRunning || problemsSummary.total === 0;
-  all.textContent = problemsRecheckAllRunning ? 'Проверка…' : 'Проверить все';
-}
-
-async function refreshProblemsSummary(): Promise<boolean> {
-  const previous = problemsSummary;
-  const response = await fetch('/api/problems/summary');
-  if (!response.ok) throw new Error(await readError(response));
-  const data = await readJsonRecord(response);
-  const next: ProblemSummary = {
-    total: Number(data.total || 0),
-    errors: Number(data.errors || 0),
-    warnings: Number(data.warnings || 0),
-    latestUpdatedAt: typeof data.latest_updated_at === 'string' ? data.latest_updated_at : null
-  };
-  const changed = previous.total !== next.total
-    || previous.errors !== next.errors
-    || previous.warnings !== next.warnings
-    || previous.latestUpdatedAt !== next.latestUpdatedAt;
-  problemsSummary = next;
-  renderProblemsSummary();
-  return changed;
-}
-
-async function loadProblems(reset = true): Promise<void> {
-  if (problemsLoading) {
-    problemsListReloadQueued ||= reset;
-    return;
-  }
-  const token = ++problemsRequestToken;
-  const offset = reset ? 0 : problemsItems.length;
-  const search = requiredInput('problems-search').value.trim();
-  problemsLoading = true;
-  problemsLoadError = '';
-  renderProblems();
-  const params = new URLSearchParams({
-    severity: problemsSeverity,
-    search,
-    limit: '100',
-    offset: String(offset)
-  });
-  try {
-    const response = await fetch(`/api/problems?${params}`);
-    if (!response.ok) throw new Error(await readError(response));
-    const data = await readJsonRecord(response);
-    if (token !== problemsRequestToken) return;
-    const items = Array.isArray(data.items)
-      ? data.items.map(normalizeProblemItem).filter((item): item is ProblemItem => Boolean(item))
-      : [];
-    problemsItems = reset ? items : [...problemsItems, ...items];
-    const page = isRecord(data.page) ? data.page : {};
-    problemsTotal = Number(page.total || problemsItems.length);
-  } catch (error) {
-    if (token !== problemsRequestToken) return;
-    problemsLoadError = errorMessage(error);
-  } finally {
-    if (token === problemsRequestToken) {
-      problemsLoading = false;
-      renderProblems();
-      if (problemsListReloadQueued) {
-        problemsListReloadQueued = false;
-        void loadProblems(true);
-      }
-    }
-  }
-}
-
-function scheduleProblemsRefresh(includeList = true): void {
-  if (problemsRefreshRunning) {
-    problemsRefreshQueued = true;
-    problemsListRefreshQueued ||= includeList;
-    return;
-  }
-  problemsRefreshRunning = true;
-  problemsListRefreshQueued = includeList;
-  void (async () => {
-    do {
-      problemsRefreshQueued = false;
-      const refreshList = problemsListRefreshQueued;
-      problemsListRefreshQueued = false;
-      let summaryChanged = false;
-      try {
-        summaryChanged = await refreshProblemsSummary();
-      } catch (error) {
-        console.warn('Problems summary refresh failed', error);
-      }
-      if ((refreshList || summaryChanged) && activeWorkspace === 'settings' && settingsActiveTab === 'problems') {
-        await loadProblems(true);
-      }
-    } while (problemsRefreshQueued);
-    problemsRefreshRunning = false;
-  })();
-}
-
 function showProblemsView(): void {
   toggleSettings(true);
   setSettingsTab('problems');
@@ -1111,101 +881,6 @@ function showProblemsView(): void {
 
 function showGalleryView(): void {
   toggleSettings(false);
-}
-
-function setProblemsFilter(value: string | undefined): void {
-  problemsSeverity = value === 'error' || value === 'warning' ? value : 'all';
-  void loadProblems(true);
-}
-
-async function recheckProblem(issueId: number): Promise<void> {
-  if (!Number.isInteger(issueId) || problemRowRechecks.has(issueId)) return;
-  problemRowRechecks.add(issueId);
-  renderProblems();
-  try {
-    const response = await fetch(`/api/problems/${issueId}/recheck`, {method: 'POST'});
-    if (!response.ok) throw new Error(await readError(response));
-    const result = await readJsonRecord(response);
-    applyProblemRecheckResult(issueId, result);
-    scheduleProblemsRefresh();
-  } catch (error) {
-    problemsNotice = errorMessage(error);
-    problemsNoticeIsError = true;
-  } finally {
-    problemRowRechecks.delete(issueId);
-    renderProblems();
-  }
-}
-
-function applyProblemRecheckResult(issueId: number, result: JsonRecord): void {
-  const existingIndex = problemsItems.findIndex(problem => problem.id === issueId);
-  const issue = normalizeProblemItem(result.issue);
-  const status = String(result.status || '');
-  const keep = issue
-    && status !== 'resolved'
-    && (problemsSeverity === 'all' || issue.severity === problemsSeverity);
-  if (keep) {
-    if (existingIndex >= 0) problemsItems[existingIndex] = issue;
-    else problemsItems.push(issue);
-  } else if (existingIndex >= 0) {
-    problemsItems.splice(existingIndex, 1);
-    problemsTotal = Math.max(0, problemsTotal - 1);
-  }
-  problemsNotice = status === 'resolved'
-    ? 'Проблема устранена.'
-    : status === 'warning'
-      ? 'Файл доступен, предупреждение обновлено.'
-      : '';
-  problemsNoticeIsError = false;
-}
-
-async function recheckAllProblems(): Promise<void> {
-  if (problemsRecheckAllRunning) return;
-  problemsRecheckAllRunning = true;
-  problemsNotice = '';
-  problemsNoticeIsError = false;
-  renderProblems();
-  try {
-    const response = await fetch('/api/problems/recheck-all', {method: 'POST'});
-    if (response.status === 409) {
-      problemsRecheckAllRunning = false;
-      problemsNotice = 'Проверка уже выполняется.';
-      problemsNoticeIsError = false;
-      renderProblems();
-      return;
-    }
-    if (!response.ok) throw new Error(await readError(response));
-  } catch (error) {
-    problemsRecheckAllRunning = false;
-    problemsNotice = errorMessage(error);
-    problemsNoticeIsError = true;
-    renderProblems();
-  }
-}
-
-async function revealProblem(issueId: number): Promise<void> {
-  const problem = problemsItems.find(item => item.id === issueId);
-  if (!problem) return;
-  const errorTarget = document.querySelector<HTMLElement>(`[data-problem-error="${issueId}"]`);
-  if (errorTarget) errorTarget.textContent = '';
-  try {
-    if (isDesktopRuntime()) {
-      await revealFileNative(problem.absolutePath);
-    } else {
-      await navigator.clipboard.writeText(problem.absolutePath);
-      if (errorTarget) errorTarget.textContent = 'Путь скопирован.';
-    }
-  } catch (error) {
-    if (errorTarget) errorTarget.textContent = errorMessage(error);
-  }
-}
-
-function startProblemsPolling(): void {
-  scheduleProblemsRefresh(false);
-  if (problemsPollTimer) clearInterval(problemsPollTimer);
-  problemsPollTimer = setInterval(() => {
-    if (document.visibilityState === 'visible') scheduleProblemsRefresh(false);
-  }, 10_000);
 }
 
 function setServerTotalFromPage(page: ImagePage | null | undefined, fallbackCount: number, resetKnown: boolean): void {
@@ -1589,7 +1264,7 @@ function handleTerminalImageUnavailable(imageId: string): void {
     closePreview(true, false);
   }
   removeLiveImage(imageId, null);
-  scheduleProblemsRefresh();
+  problemsWorkspace.scheduleRefresh();
   if (!terminalGalleryRefreshTimer) {
     terminalGalleryRefreshTimer = setTimeout(() => {
       terminalGalleryRefreshTimer = null;
@@ -3472,38 +3147,8 @@ function cssEscape(value: unknown): string {
   return text.replace(/"/g, '\\"');
 }
 
-function escHtml(s: unknown): string {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
 function escAttr(s: unknown): string {
   return escHtml(s);
-}
-
-function fileName(path: unknown): string {
-  return String(path || '').split(/[/\\]/).pop() || '';
-}
-
-function fmtSize(bytes: unknown): string {
-  const value = Number(bytes);
-  if (!Number.isFinite(value)) return '';
-  if (value < 1024) return value + ' B';
-  if (value < 1048576) return (value / 1024).toFixed(1) + ' KB';
-  return (value / 1048576).toFixed(1) + ' MB';
-}
-
-async function readError(response: Response): Promise<string> {
-  try {
-    const data = await readJsonRecord(response);
-    return String(data.detail || data.error || response.statusText);
-  } catch {
-    return response.statusText;
-  }
 }
 
 function runAction(actionEl: HTMLElement): void {
@@ -3546,22 +3191,22 @@ function runAction(actionEl: HTMLElement): void {
       showProblemsView();
       break;
     case 'set-problems-filter':
-      setProblemsFilter(actionEl.dataset.severity);
+      problemsWorkspace.setFilter(actionEl.dataset.severity);
       break;
     case 'load-more-problems':
-      void loadProblems(false);
+      void problemsWorkspace.load(false);
       break;
     case 'retry-problems':
-      scheduleProblemsRefresh();
+      problemsWorkspace.scheduleRefresh();
       break;
     case 'recheck-problem':
-      void recheckProblem(Number(actionEl.dataset.problemId));
+      void problemsWorkspace.recheck(Number(actionEl.dataset.problemId));
       break;
     case 'recheck-all-problems':
-      void recheckAllProblems();
+      void problemsWorkspace.recheckAll();
       break;
     case 'reveal-problem':
-      void revealProblem(Number(actionEl.dataset.problemId));
+      void problemsWorkspace.reveal(Number(actionEl.dataset.problemId));
       break;
     case 'pick-folder':
       pickFolder();
@@ -3643,13 +3288,7 @@ document.addEventListener('click', e => {
 
 requiredInput('tag-admin-search').addEventListener('input', renderTagAdmin);
 requiredInput('sidebar-tag-search').addEventListener('input', renderSidebarTags);
-requiredInput('problems-search').addEventListener('input', () => {
-  if (problemsSearchTimer) clearTimeout(problemsSearchTimer);
-  problemsSearchTimer = setTimeout(() => {
-    problemsSearchTimer = null;
-    void loadProblems(true);
-  }, 250);
-});
+requiredInput('problems-search').addEventListener('input', () => problemsWorkspace.handleSearchInput());
 requiredInput('tag-admin-create').addEventListener('keydown', e => {
   if (e.key === 'Enter') createTagFromSettings();
 });
@@ -3658,9 +3297,7 @@ window.addEventListener('resize', () => {
   handleGalleryResize();
   if (previewModal?.isOpen) schedulePreviewFilmstripLayoutRefresh();
 });
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') scheduleProblemsRefresh(false);
-});
+document.addEventListener('visibilitychange', () => problemsWorkspace.handleVisibilityChange());
 
 initActionBindings();
 initPreview();
@@ -3673,7 +3310,7 @@ galleryDiagnostics.install({
 initFilterInput();
 initFishInputs();
 startLiveEvents();
-startProblemsPolling();
+problemsWorkspace.startPolling();
 updateScrollTopButton();
 renderGalleryUiState();
 renderPreviewUiState();
