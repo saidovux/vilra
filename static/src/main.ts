@@ -227,6 +227,7 @@ let nextCursor: string | null = null;
 let hasMorePages = false;
 let isLoadingPage = false;
 let activeImagesRequest = 0;
+let gallerySnapshotRequest = -1;
 let galleryGeometry: GalleryGeometry | null = null;
 let galleryResizeFrame: number | null = null;
 let paginationPrefetchFrame: number | null = null;
@@ -267,6 +268,11 @@ let lastLiveSequence = 0;
 let liveRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
 let liveFolderRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let liveTagRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let liveTotalTimer: ReturnType<typeof setTimeout> | null = null;
+let liveTotalRevision = 0;
+let liveTotalRequestRunning = false;
+let liveTotalReconcilePending = false;
+const liveImageMembership = new Map<string, {requestId: number; matches: boolean}>();
 let activeWorkspace: AppWorkspace = 'gallery';
 const problemsWorkspace = new ProblemsWorkspace({
   isProblemsActive: () => activeWorkspace === 'settings' && settingsActiveTab === 'problems',
@@ -296,6 +302,7 @@ const THUMB_FAST_ENTER_SAMPLES = 2;
 const THUMB_FAST_EXIT_SAMPLES = 2;
 const THUMB_SCROLL_SAMPLE_MAX_MS = 250;
 const THUMB_SCROLL_SETTLE_FALLBACK_MS = 180;
+const LIVE_TOTAL_DEBOUNCE_MS = 50;
 const thumbnailLifecycles = new ThumbnailLifecycleManager({
   isTerminal: imageId => terminalThumbIds.has(imageId),
   onTerminalUnavailable: handleTerminalImageUnavailable,
@@ -679,14 +686,14 @@ function handleLiveEvent(event: LiveEventEnvelope): void {
   const image = normalizeImageItem(event.data.image);
   switch (event.type) {
     case 'image_created':
-      if (image) applyLiveImage(image, 'created');
+      if (image) applyLiveImage(image);
       break;
     case 'image_updated':
     case 'image_renamed':
-      if (image) applyLiveImage(image, 'updated');
+      if (image) applyLiveImage(image);
       break;
     case 'image_removed':
-      removeLiveImage(String(event.data.image_id || ''), image);
+      removeLiveImage(String(event.data.image_id || ''));
       break;
     case 'directory_created':
     case 'directory_removed':
@@ -751,32 +758,99 @@ function compareLiveImages(left: ImageItem, right: ImageItem): number {
   }
 }
 
-function applyLiveImage(image: ImageItem, operation: 'created' | 'updated'): void {
+function knownLiveMembership(imageId: string, existingIndex: number): boolean | null {
+  const cached = liveImageMembership.get(imageId);
+  if (cached?.requestId === activeImagesRequest) return cached.matches;
+  if (gallerySnapshotRequest === activeImagesRequest && existingIndex >= 0) return true;
+  return null;
+}
+
+function recordLiveMembership(imageId: string, matches: boolean): void {
+  liveImageMembership.set(imageId, {requestId: activeImagesRequest, matches});
+}
+
+function buildLiveTotalQueryParams(): URLSearchParams {
+  const tab = activeTab();
+  return buildImageQueryParams({
+    includeTags: tab.includeTags || [],
+    excludeTags: tab.excludeTags || [],
+    matchMode: tab.matchMode === 'all' ? 'all' : 'any',
+    limit: 1,
+    sortMode: tab.sortMode || DEFAULT_SORT_MODE,
+    includeTotal: true,
+  });
+}
+
+function armLiveTotalReconciliation(): void {
+  if (liveTotalTimer || liveTotalRequestRunning || !liveTotalReconcilePending) return;
+  liveTotalTimer = setTimeout(() => {
+    liveTotalTimer = null;
+    void reconcileLiveTotal();
+  }, LIVE_TOTAL_DEBOUNCE_MS);
+}
+
+function scheduleLiveTotalReconciliation(): void {
+  liveTotalRevision += 1;
+  liveTotalReconcilePending = true;
+  armLiveTotalReconciliation();
+}
+
+async function reconcileLiveTotal(): Promise<void> {
+  if (liveTotalRequestRunning || !liveTotalReconcilePending) return;
+  liveTotalReconcilePending = false;
+  liveTotalRequestRunning = true;
+  const revision = liveTotalRevision;
+  const requestId = activeImagesRequest;
+  const params = buildLiveTotalQueryParams();
+  const querySignature = params.toString();
+  try {
+    const response = await fetch('/api/images?' + querySignature);
+    if (!response.ok) return;
+    const data = await readJsonRecord(response);
+    const total = pageTotalValue(imagePage(data.page));
+    if (total === null) return;
+    if (revision !== liveTotalRevision || requestId !== activeImagesRequest) return;
+    if (querySignature !== buildLiveTotalQueryParams().toString()) return;
+    serverTotalKnown = true;
+    serverTotal = total;
+    updateImageCounter();
+  } catch (error) {
+    console.warn('Unable to reconcile live gallery total', error);
+  } finally {
+    liveTotalRequestRunning = false;
+    armLiveTotalReconciliation();
+  }
+}
+
+function reconcileLiveMembership(previous: boolean | null, next: boolean): void {
+  if (previous === null || previous !== next) scheduleLiveTotalReconciliation();
+}
+
+function applyLiveImage(image: ImageItem): void {
   acceptActiveImage(image.id);
   const existingIndex = allImages.findIndex(item => item.id === image.id);
-  const existingWasVisible = existingIndex >= 0;
+  const previousMembership = knownLiveMembership(image.id, existingIndex);
+  const nextMembership = imageMatchesActiveTab(image);
   if (existingIndex >= 0) allImages.splice(existingIndex, 1);
-  if (imageMatchesActiveTab(image)) allImages.push(image);
+  if (nextMembership) allImages.push(image);
   allImages.sort(compareLiveImages);
   visibleImages = allImages.slice();
-  if (serverTotalKnown && operation === 'created' && !existingWasVisible && imageMatchesActiveTab(image)) {
-    serverTotal += 1;
-  }
+  recordLiveMembership(image.id, nextMembership);
+  reconcileLiveMembership(previousMembership, nextMembership);
   renderLiveGalleryState();
   scheduleLiveFolderRefresh();
   scheduleLiveTagRefresh();
   updateLivePreviewImage(image);
 }
 
-function removeLiveImage(imageId: string, removedImage: ImageItem | null): void {
+function removeLiveImage(imageId: string): void {
   if (!imageId) return;
   const existingIndex = allImages.findIndex(item => item.id === imageId);
-  const wasVisible = existingIndex >= 0;
+  const previousMembership = knownLiveMembership(imageId, existingIndex);
   if (existingIndex >= 0) allImages.splice(existingIndex, 1);
   visibleImages = allImages.slice();
-  if (serverTotalKnown && (wasVisible || (removedImage && imageMatchesActiveTab(removedImage)))) {
-    serverTotal = Math.max(0, serverTotal - 1);
-  }
+  recordLiveMembership(imageId, false);
+  reconcileLiveMembership(previousMembership, false);
   if (previewCurrentImageId === imageId) closePreview(true, false);
   renderLiveGalleryState();
   scheduleLiveFolderRefresh();
@@ -870,6 +944,8 @@ function updateImageCounter(): void {
 
 async function refreshImages(clear = true): Promise<void> {
   const requestId = ++activeImagesRequest;
+  const liveRevisionAtStart = liveTotalRevision;
+  liveImageMembership.clear();
   const diagnosticPage = galleryDiagnostics.beginPage('refresh', allImages.length);
   activePageLoad = null;
   isLoadingPage = true;
@@ -907,11 +983,15 @@ async function refreshImages(clear = true): Promise<void> {
     allImages = clear
       ? refreshedPage
       : mergeRefreshedPageIntoLoadedImages(allImages, refreshedPage);
+    const liveEventsDuringRequest = liveRevisionAtStart !== liveTotalRevision;
+    gallerySnapshotRequest = liveEventsDuringRequest ? -1 : requestId;
+    if (!liveEventsDuringRequest) liveImageMembership.clear();
     galleryDiagnostics.pageStage(diagnosticPage, 'deduped');
     visibleImages = allImages.slice();
     galleryDiagnostics.pageStage(diagnosticPage, 'arrays');
     const page = imagePage(d.page);
     setServerTotalFromPage(page, visibleImages.length, true);
+    if (liveEventsDuringRequest) scheduleLiveTotalReconciliation();
     nextCursor = page ? page.next_cursor || null : null;
     hasMorePages = Boolean(page && page.has_more);
     isLoadingPage = false;
@@ -1231,7 +1311,7 @@ function handleTerminalImageUnavailable(imageId: string): void {
     previewRequestToken += 1;
     closePreview(true, false);
   }
-  removeLiveImage(imageId, null);
+  removeLiveImage(imageId);
   problemsWorkspace.scheduleRefresh();
   if (!terminalGalleryRefreshTimer) {
     terminalGalleryRefreshTimer = setTimeout(() => {
