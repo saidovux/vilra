@@ -635,31 +635,75 @@ test('format mismatch is a warning, stays in gallery, and does not increment err
 });
 
 test('pending thumbnail 202 admits once and polls only the cache resource', async ({ page }) => {
-  await waitForGallery(page);
-  const card = page.locator('.card[data-id]').first();
-  const imageId = String(await card.getAttribute('data-id'));
+  const [target] = await imageItems(page, 1);
+  expect(target?.id).toBeTruthy();
+  const imageId = target.id;
   const thumbnail = fs.readFileSync(path.join(fixtureRoot(), 'batch-a', 'fixture-001.png'));
+  const requestOrder: string[] = [];
+  let initialPrimaryRequests = 0;
   let admissionRequests = 0;
+  let admissionResponses202 = 0;
+  let admitted = false;
   let cachePolls = 0;
+  let cachePoll404s = 0;
+  let cachePoll200s = 0;
   await page.route(`**/thumb-file/${imageId}.jpg*`, route => {
+    if (!admitted) {
+      initialPrimaryRequests += 1;
+      requestOrder.push('initial:404');
+      return route.fulfill({
+        status: 404,
+        headers: {'cache-control': 'no-store'},
+        json: {detail: 'Not found'},
+      });
+    }
     cachePolls += 1;
-    if (cachePolls < 2) return route.fulfill({status: 404, json: {detail: 'Not found'}});
+    if (cachePolls === 1) {
+      cachePoll404s += 1;
+      requestOrder.push('cache:404');
+      return route.fulfill({
+        status: 404,
+        headers: {'cache-control': 'no-store'},
+        json: {detail: 'Not found'},
+      });
+    }
+    cachePoll200s += 1;
+    requestOrder.push('cache:200');
     return route.fulfill({status: 200, contentType: 'image/png', body: thumbnail});
   });
   await page.route(`**/thumb/${imageId}*`, route => {
     admissionRequests += 1;
+    admissionResponses202 += 1;
+    admitted = true;
+    requestOrder.push('admission:202');
     return route.fulfill({status: 202, json: {retry_after_ms: 10}});
   });
 
+  await waitForGallery(page);
+  const card = page.locator(`.card[data-id="${imageId}"]`);
+  await expect(card).toBeAttached();
+  await card.scrollIntoViewIfNeeded();
   const image = card.locator('img');
-  await image.evaluate(element => {
-    element.classList.remove('loaded');
-    element.dispatchEvent(new Event('error'));
-  });
+  await expect.poll(() => initialPrimaryRequests).toBeGreaterThanOrEqual(1);
   await expect.poll(() => admissionRequests).toBe(1);
   await expect.poll(() => cachePolls).toBeGreaterThanOrEqual(2);
   await expect(image).toHaveClass(/loaded/);
-  await page.waitForTimeout(400);
+  await expect.poll(() => image.evaluate(element => element.naturalWidth)).toBeGreaterThan(0);
+
+  expect(admissionResponses202).toBe(1);
+  expect(cachePoll404s).toBe(1);
+  expect(cachePoll200s).toBeGreaterThanOrEqual(1);
+  expect(requestOrder.indexOf('initial:404')).toBeLessThan(requestOrder.indexOf('admission:202'));
+  expect(requestOrder.indexOf('admission:202')).toBeLessThan(requestOrder.indexOf('cache:404'));
+  expect(requestOrder.indexOf('cache:404')).toBeLessThan(requestOrder.indexOf('cache:200'));
+
+  const refreshed = page.waitForResponse(response => response.url().includes('/api/images?'));
+  await page.locator('#sort-select').dispatchEvent('change');
+  await refreshed;
+  const refreshedImage = page.locator(`.card[data-id="${imageId}"] img`);
+  await expect(refreshedImage).toBeVisible();
+  await expect(refreshedImage).toHaveClass(/loaded/);
+  await expect.poll(() => refreshedImage.evaluate(element => element.naturalWidth)).toBeGreaterThan(0);
   expect(admissionRequests).toBe(1);
 });
 

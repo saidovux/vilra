@@ -64,6 +64,7 @@ import {
 import {VirtualGalleryView} from './gallery/virtual-gallery-view';
 import {GalleryVirtualizerController} from './gallery/virtualizer-controller';
 import {ProblemsWorkspace} from './problems/problems-workspace';
+import {ViewerCoordinator} from './viewer/preview-coordinator';
 import {PreviewModal} from './viewer/preview-modal';
 
 type SettingsTab = 'general' | 'tags' | 'problems';
@@ -218,7 +219,6 @@ let allTagMeta: Map<string, TagMeta> = new Map();
 let scannedRoots: string[] = [];
 let folderTagSync = true;
 const galleryTabs = new GalleryTabsState();
-let lbIndex = -1;
 let statusInterval: ReturnType<typeof setInterval> | null = null;
 let sessionSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let serverTotal = 0;
@@ -234,13 +234,7 @@ let paginationPrefetchFrame: number | null = null;
 let pendingGalleryScrollTop: number | null = null;
 let activePageLoad: {requestId: number; promise: Promise<void>} | null = null;
 let previewModal: PreviewModal | null = null;
-type PreviewSourceMode = 'gallery' | 'fixed';
-let previewSourceMode: PreviewSourceMode = 'gallery';
-let previewCurrentImageId: string | null = null;
-let lightboxImages: ImageItem[] = [];
-let previewPageNavigationBusy = false;
-let previewPendingDirection: -1 | 1 | null = null;
-let previewNavigationGeneration = 0;
+let viewerCoordinator: ViewerCoordinator;
 let pendingGalleryAnchorImageId: string | null = null;
 let previewFilmMode: 'nearby' | 'tag' | 'folder' = 'nearby';
 const PREVIEW_FILM_NEARBY_FALLBACK_CAPACITY = 15;
@@ -255,10 +249,6 @@ let gallerySidebarVisible = true;
 let gallerySidebarBeforeFocus = true;
 let gallerySidebarChangedDuringFocus = false;
 const selectedImageIds = new Set<string>();
-let previewRequestToken = 0;
-let suppressPreviewCloseClear = false;
-let suppressPreviewGalleryReturn = false;
-let suppressedPreviewRestoreId: string | null = null;
 let latestStatus: StatusResponse | null = null;
 let filterSuggestionOpen = false;
 let settingsActiveTab: SettingsTab = 'general';
@@ -506,8 +496,8 @@ function toggleSettings(force?: boolean): void {
   if (open === (activeWorkspace === 'settings')) return;
   if (open) {
     saveActiveScroll();
-    suppressedPreviewRestoreId = activeTab().lastImageId;
-    closePreview(false);
+    viewerCoordinator.suppressRestoreFromActiveTab();
+    viewerCoordinator.close(false);
   }
   activeWorkspace = open ? 'settings' : 'gallery';
   requiredHtml('gallery-screen').classList.toggle('settings-active', open);
@@ -851,7 +841,7 @@ function removeLiveImage(imageId: string): void {
   visibleImages = allImages.slice();
   recordLiveMembership(imageId, false);
   reconcileLiveMembership(previousMembership, false);
-  if (previewCurrentImageId === imageId) closePreview(true, false);
+  if (viewerCoordinator.currentImageId === imageId) viewerCoordinator.close(true, false);
   renderLiveGalleryState();
   scheduleLiveFolderRefresh();
   scheduleLiveTagRefresh();
@@ -860,17 +850,14 @@ function removeLiveImage(imageId: string): void {
 function renderLiveGalleryState(): void {
   invalidateVirtualGallery({preserveAnchor: true, resetCards: false});
   updateImageCounter();
-  refreshPreviewSourceUi();
+  viewerCoordinator.refreshGallerySource();
   requiredHtml('empty-state').style.display = visibleImages.length ? 'none' : 'flex';
 }
 
 function updateLivePreviewImage(image: ImageItem): void {
-  if (previewSourceMode === 'fixed') {
-    const index = lightboxImages.findIndex(item => item.id === image.id);
-    if (index >= 0) lightboxImages[index] = image;
-  }
-  if (previewModal?.isOpen && previewCurrentImageId === image.id) {
-    renderPreviewMeta(currentPreviewImage() || image, false);
+  viewerCoordinator.updateFixedImage(image);
+  if (viewerCoordinator.isOpen && viewerCoordinator.currentImageId === image.id) {
+    renderPreviewMeta(viewerCoordinator.currentImage || image, false);
   }
 }
 
@@ -998,11 +985,11 @@ async function refreshImages(clear = true): Promise<void> {
     await refreshTagPool();
     galleryDiagnostics.pageStage(diagnosticPage, 'pre_virtualizer_wait');
     applyFilter(clear);
-    refreshPreviewSourceUi();
+    viewerCoordinator.refreshGallerySource();
     galleryDiagnostics.pageStage(diagnosticPage, 'virtualizer');
     galleryDiagnostics.finishPage(diagnosticPage, 'success', allImages.length);
     await restorePendingGalleryScroll();
-    restorePreviewIfNeeded();
+    viewerCoordinator.restoreIfNeeded();
   } catch (e) {
     if (diagnosticPage && !diagnosticPage.finished) {
       const outcome: DiagnosticPageOutcome = e instanceof DOMException && e.name === 'AbortError'
@@ -1240,7 +1227,7 @@ function makeCard(
       toggleImageSelection(img.id);
       return;
     }
-    openLightboxById(img.id);
+    viewerCoordinator.openById(img.id);
   });
   let primaryState: 'loading' | 'decoding' | 'ready' | 'failed' = 'loading';
   const failPrimary = () => {
@@ -1307,9 +1294,9 @@ function handleTerminalImageUnavailable(imageId: string): void {
   selectedImageIds.delete(imageId);
   updateImageSelectionUi();
   thumbnailLifecycles.cancel(imageId);
-  if (previewCurrentImageId === imageId) {
-    previewRequestToken += 1;
-    closePreview(true, false);
+  if (viewerCoordinator.currentImageId === imageId) {
+    viewerCoordinator.invalidateOriginalRequest();
+    viewerCoordinator.close(true, false);
   }
   removeLiveImage(imageId);
   problemsWorkspace.scheduleRefresh();
@@ -1337,7 +1324,7 @@ function addTab() {
   clearImageSelection();
   saveActiveScroll();
   galleryTabs.add();
-  closePreview(false);
+  viewerCoordinator.close(false);
   refreshImages(true);
   window.scrollTo({top: 0});
   saveSessionSoon();
@@ -1348,7 +1335,7 @@ function switchTab(id: string): void {
   clearImageSelection();
   saveActiveScroll();
   galleryTabs.select(id);
-  closePreview(false);
+  viewerCoordinator.close(false);
   const tab = activeTab();
   pendingGalleryScrollTop = tab.scrollTop || 0;
   void refreshImages(true);
@@ -1358,7 +1345,7 @@ function switchTab(id: string): void {
 function closeTab(id: string): void {
   clearImageSelection();
   galleryTabs.close(id);
-  closePreview(false);
+  viewerCoordinator.close(false);
   refreshImages(true);
   saveSessionSoon();
 }
@@ -1630,7 +1617,7 @@ function renderAllTagSurfaces(): void {
   renderFilterControls();
   renderTagAdmin();
   visibleImages.forEach(updateCardForImage);
-  const previewImage = currentPreviewImage();
+  const previewImage = viewerCoordinator.currentImage;
   if (previewImage) renderPreviewTags(previewImage);
 }
 
@@ -1808,7 +1795,7 @@ let fishControllers: FishController[] = [];
 function initFishInputs(): void {
   fishControllers = [
     initFishInput('preview-tag-input', 'preview-tag-ghost', () => {
-      const img = currentPreviewImage();
+      const img = viewerCoordinator.currentImage;
       return img ? img.tags || [] : [];
     }, tag => addTagToPreview(tag))
   ];
@@ -1818,122 +1805,16 @@ function updateFishGhosts(): void {
   fishControllers.forEach(controller => controller.update && controller.update());
 }
 
-function openLightboxById(imageId: string, persist = true): void {
-  const sourceList = visibleImages.find(img => img.id === imageId) ? visibleImages : allImages;
-  const idx = sourceList.findIndex(img => img.id === imageId);
-  if (idx < 0) {
-    console.warn('openLightboxById: image not found in current gallery state', {
-      imageId,
-      visibleCount: visibleImages.length,
-      allCount: allImages.length,
-      renderedCardCount: document.querySelectorAll('.card[data-id]').length
-    });
-    return;
-  }
-  openLightbox(idx, persist, sourceList, 'gallery');
-}
-
-function previewSource(): ImageItem[] {
-  return previewSourceMode === 'gallery' ? visibleImages : lightboxImages;
-}
-
-function previewCurrentIndex(): number {
-  if (!previewCurrentImageId) return -1;
-  return previewSource().findIndex(image => image.id === previewCurrentImageId);
-}
-
-function currentPreviewImage(): ImageItem | null {
-  const source = previewSource();
-  const index = previewCurrentIndex();
-  return index >= 0 ? source[index] : null;
-}
-
-function invalidatePreviewNavigation(): void {
-  previewNavigationGeneration += 1;
-  previewPageNavigationBusy = false;
-  previewPendingDirection = null;
-}
-
-function openLightbox(
-  idx: number,
-  persist = true,
-  sourceList: ImageItem[] = visibleImages,
-  sourceMode: PreviewSourceMode = 'gallery',
-): void {
-  const nextSource = Array.isArray(sourceList) && sourceList.length ? sourceList : visibleImages;
-  if (!Number.isInteger(idx) || idx < 0 || idx >= nextSource.length) {
-    console.warn('openLightbox: invalid image index', {
-      idx,
-      sourceLength: nextSource.length
-    });
-    return;
-  }
-  const nextImageId = nextSource[idx].id;
-  const activeSource = sourceMode === 'gallery' ? visibleImages : nextSource;
-  const currentIndex = activeSource.findIndex(image => image.id === nextImageId);
-  if (currentIndex < 0) {
-    console.warn('openLightbox: image is missing from active preview source', {
-      imageId: nextImageId,
-      sourceMode,
-      sourceLength: activeSource.length,
-    });
-    return;
-  }
-  const navigatingOpenViewer = Boolean(previewModal?.isOpen);
-  if (!navigatingOpenViewer || previewSourceMode !== sourceMode) invalidatePreviewNavigation();
-  if (!navigatingOpenViewer) {
-    pendingGalleryAnchorImageId = null;
-    resetPreviewUiState();
-    previewFilmNearbyCapacity = PREVIEW_FILM_NEARBY_FALLBACK_CAPACITY;
-  }
-  previewSourceMode = sourceMode;
-  lightboxImages = sourceMode === 'fixed' ? nextSource : [];
-  previewCurrentImageId = nextImageId;
-  if (persist) suppressedPreviewRestoreId = null;
-  togglePreviewTagDropdown(false);
-  closePreviewQuickMenu();
-  previewFilmMode = 'nearby';
-  lbIndex = currentIndex;
-  const img = previewSource()[lbIndex];
-  activeTab().lastImageId = img.id;
-  renderPreviewMeta(img, true);
-  document.body.style.overflow = 'hidden';
-  const token = ++previewRequestToken;
-  if (!previewModal) return;
-  const sources = thumbnailUrls(img);
-  previewModal.open({
-    imageId: img.id,
-    thumbnailUrl: sources.primary,
-    thumbnailFallbackUrl: sources.fallback,
-    originalUrl: `/file/${img.id}`,
-    width: Number(img.width || 1),
-    height: Number(img.height || 1),
-    alt: fileName(img.path),
-    onOriginalReady: () => {
-      if (!isCurrentPreviewRequest(img.id, token)) return;
-      renderPreviewMeta(img, false);
-    },
-    onOriginalError: () => {
-      if (isCurrentPreviewRequest(img.id, token)) void diagnosePreviewOriginalFailure(img, token);
-    },
-  });
-  schedulePreviewFilmstripLayoutRefresh();
-  if (persist) saveSessionSoon();
-}
-
-function isCurrentPreviewRequest(imageId: string, token: number): boolean {
-  return token === previewRequestToken
-    && Boolean(previewModal?.isOpen)
-    && previewModal?.modal.dataset.imageId === imageId
-    && previewCurrentImageId === imageId;
-}
-
-async function diagnosePreviewOriginalFailure(img: ImageItem, token: number): Promise<void> {
+async function diagnosePreviewOriginalFailure(
+  img: ImageItem,
+  isCurrent: () => boolean,
+): Promise<void> {
+  if (!isCurrent()) return;
   const originalUrl = `/file/${img.id}`;
   let message: string;
   try {
     const response = await fetch(originalUrl, {method: 'HEAD', cache: 'no-store'});
-    if (!isCurrentPreviewRequest(img.id, token)) return;
+    if (!isCurrent()) return;
     if (response.status === 422) {
       handleTerminalImageUnavailable(img.id);
       return;
@@ -1944,107 +1825,12 @@ async function diagnosePreviewOriginalFailure(img: ImageItem, token: number): Pr
         ? `Не удалось декодировать оригинал: ${img.path} (${originalUrl})`
         : `Не удалось загрузить оригинал (${response.status}): ${img.path} (${originalUrl})`;
   } catch (error) {
-    if (!isCurrentPreviewRequest(img.id, token)) return;
+    if (!isCurrent()) return;
     message = `Не удалось проверить оригинал: ${errorMessage(error)}`;
   }
   requiredHtml('preview-name').textContent = `Ошибка оригинала: ${fileName(img.path)}`;
   console.error(message);
   alert('Не удалось открыть изображение: ' + message);
-}
-
-function closePreview(clearLast = true, restoreGalleryAnchor = clearLast): void {
-  previewRequestToken += 1;
-  suppressPreviewCloseClear = !clearLast;
-  suppressPreviewGalleryReturn = !restoreGalleryAnchor;
-  if (previewModal && previewModal.isOpen) previewModal.close();
-  suppressPreviewCloseClear = false;
-  suppressPreviewGalleryReturn = false;
-  if (clearLast) {
-    activeTab().lastImageId = null;
-    saveSessionSoon();
-  }
-}
-
-function handlePreviewClosed(): void {
-  const closingImageId = previewCurrentImageId;
-  const shouldRestoreGallery = !suppressPreviewGalleryReturn
-    && previewSourceMode === 'gallery'
-    && Boolean(closingImageId);
-  previewRequestToken += 1;
-  invalidatePreviewNavigation();
-  if (previewFilmLayoutFrame !== null) cancelAnimationFrame(previewFilmLayoutFrame);
-  previewFilmLayoutFrame = null;
-  document.body.style.overflow = '';
-  togglePreviewTagDropdown(false);
-  closePreviewQuickMenu();
-  resetPreviewUiState();
-  lightboxImages = [];
-  previewCurrentImageId = null;
-  previewSourceMode = 'gallery';
-  lbIndex = -1;
-  if (!suppressPreviewCloseClear && galleryTabs.list.length && activeTab().lastImageId) {
-    activeTab().lastImageId = null;
-    saveSessionSoon();
-  }
-  if (shouldRestoreGallery && closingImageId) scheduleGalleryAnchorRestore(closingImageId);
-}
-
-function previewNav(dir: number): void {
-  const direction: -1 | 1 = dir < 0 ? -1 : 1;
-  if (previewPageNavigationBusy) {
-    previewPendingDirection = direction;
-    return;
-  }
-  const source = previewSource();
-  if (!source.length) return;
-  const currentIndex = previewCurrentIndex();
-  if (currentIndex < 0) return;
-  lbIndex = currentIndex;
-  if (previewSourceMode === 'fixed') {
-    openLightbox((currentIndex + direction + source.length) % source.length, true, source, 'fixed');
-    return;
-  }
-  const desiredIndex = currentIndex + direction;
-  if (desiredIndex >= 0 && desiredIndex < source.length) {
-    openLightbox(desiredIndex, true, source, 'gallery');
-    return;
-  }
-  if (direction < 0) {
-    if (!hasMorePages) openLightbox(source.length - 1, true, source, 'gallery');
-    return;
-  }
-  if (!hasMorePages) {
-    openLightbox(0, true, source, 'gallery');
-    return;
-  }
-  void navigatePreviewAcrossPageBoundary();
-}
-
-async function navigatePreviewAcrossPageBoundary(): Promise<void> {
-  if (previewPageNavigationBusy || previewSourceMode !== 'gallery' || !previewCurrentImageId) return;
-  previewPageNavigationBusy = true;
-  const generation = previewNavigationGeneration;
-  const currentImageId = previewCurrentImageId;
-  try {
-    await loadNextImagesPage();
-    if (
-      generation !== previewNavigationGeneration
-      || !previewModal?.isOpen
-      || previewSourceMode !== 'gallery'
-      || previewCurrentImageId !== currentImageId
-    ) return;
-    const source = previewSource();
-    const currentIndex = source.findIndex(image => image.id === currentImageId);
-    if (currentIndex >= 0 && currentIndex + 1 < source.length) {
-      openLightbox(currentIndex + 1, true, source, 'gallery');
-    }
-  } finally {
-    if (generation !== previewNavigationGeneration) return;
-    previewPageNavigationBusy = false;
-    const pendingDirection = previewPendingDirection;
-    previewPendingDirection = null;
-    if (pendingDirection && previewModal?.isOpen) previewNav(pendingDirection);
-  }
 }
 
 function imageFormat(path: string): string {
@@ -2060,7 +1846,7 @@ function imageParentPath(path: string): string {
 }
 
 function renderPreviewMeta(img: ImageItem, loading: boolean): void {
-  lbIndex = previewCurrentIndex();
+  const currentIndex = viewerCoordinator.currentIndex;
   const name = fileName(img.path);
   const resolution = `${img.width || '?'} × ${img.height || '?'}`;
   requiredHtml('preview-name').textContent = loading ? `Загрузка: ${name}` : name;
@@ -2076,25 +1862,24 @@ function renderPreviewMeta(img: ImageItem, loading: boolean): void {
   if (previewFormat) previewFormat.textContent = imageFormat(img.path);
   if (previewPath) previewPath.textContent = img.path;
   if (previewHudResolution) previewHudResolution.textContent = resolution;
-  if (previewIndex) previewIndex.textContent = `${lbIndex + 1} / ${previewSource().length}`;
+  if (previewIndex) previewIndex.textContent = `${currentIndex + 1} / ${viewerCoordinator.source().length}`;
   requiredAnchor('preview-open').href = `/file/${img.id}`;
   renderPreviewTags(img);
   renderPreviewFilmstrip();
 }
 
 function refreshPreviewSourceUi(): void {
-  if (!previewModal?.isOpen) return;
-  const currentIndex = previewCurrentIndex();
+  if (!viewerCoordinator.isOpen) return;
+  const currentIndex = viewerCoordinator.currentIndex;
   if (currentIndex < 0) return;
-  lbIndex = currentIndex;
   const previewIndex = optionalHtml('preview-index');
-  if (previewIndex) previewIndex.textContent = `${currentIndex + 1} / ${previewSource().length}`;
+  if (previewIndex) previewIndex.textContent = `${currentIndex + 1} / ${viewerCoordinator.source().length}`;
   renderPreviewFilmstrip();
 }
 
 function previewFilmCandidates(): ImageItem[] {
-  const source = previewSource();
-  const currentIndex = previewCurrentIndex();
+  const source = viewerCoordinator.source();
+  const currentIndex = viewerCoordinator.currentIndex;
   const current = currentIndex >= 0 ? source[currentIndex] : null;
   if (!current) return [];
   if (previewFilmMode === 'tag') {
@@ -2134,7 +1919,7 @@ function schedulePreviewFilmstripLayoutRefresh(): void {
   if (previewFilmLayoutFrame !== null) return;
   previewFilmLayoutFrame = requestAnimationFrame(() => {
     previewFilmLayoutFrame = null;
-    if (!previewModal?.isOpen || previewFocusMode) return;
+    if (!viewerCoordinator.isOpen || previewFocusMode) return;
     const measuredCapacity = measurePreviewFilmNearbyCapacity();
     if (measuredCapacity === null || measuredCapacity === previewFilmNearbyCapacity) return;
     previewFilmNearbyCapacity = measuredCapacity;
@@ -2151,7 +1936,7 @@ function renderPreviewFilmstrip(): void {
     button.classList.toggle('active', button.dataset.mode === previewFilmMode);
   });
   const items = previewFilmCandidates();
-  const current = currentPreviewImage();
+  const current = viewerCoordinator.currentImage;
   target.replaceChildren();
   for (const image of items) {
     const button = document.createElement('button');
@@ -2169,9 +1954,9 @@ function renderPreviewFilmstrip(): void {
     };
     button.appendChild(thumbnail);
     button.addEventListener('click', () => {
-      const source = previewSource();
+      const source = viewerCoordinator.source();
       const nextIndex = source.findIndex(item => item.id === image.id);
-      if (nextIndex >= 0) openLightbox(nextIndex, true, source, previewSourceMode);
+      if (nextIndex >= 0) viewerCoordinator.openAt(nextIndex, true, source, viewerCoordinator.sourceMode);
     });
     target.appendChild(button);
   }
@@ -2199,7 +1984,7 @@ function renderPreviewUiState(): void {
 }
 
 function refreshPreviewLayout(): void {
-  if (!previewModal?.isOpen) return;
+  if (!viewerCoordinator.isOpen) return;
   requestAnimationFrame(() => {
     previewModal?.refreshLayout();
     schedulePreviewFilmstripLayoutRefresh();
@@ -2234,7 +2019,7 @@ function togglePreviewInspector(): void {
 }
 
 function focusPreviewTagInput(): void {
-  if (!previewModal?.isOpen) return;
+  if (!viewerCoordinator.isOpen) return;
   closePreviewQuickMenu();
   if (!previewInspectorVisible) togglePreviewInspector();
   requiredInput('preview-tag-input').focus({preventScroll: true});
@@ -2249,9 +2034,9 @@ function resetPreviewUiState(): void {
 }
 
 function openPreviewQuickMenu(clientX: number, clientY: number): void {
-  if (!previewModal?.isOpen) return;
+  if (!viewerCoordinator.isOpen) return;
   const menu = requiredHtml('quickMenu');
-  const imageId = previewModal.modal.dataset.imageId;
+  const imageId = viewerCoordinator.currentImageId;
   if (!imageId) return;
   const maxLeft = window.innerWidth - 190;
   const maxTop = window.innerHeight - 260;
@@ -2273,7 +2058,7 @@ function closePreviewQuickMenu(): void {
 function runPreviewQuickAction(action: string | undefined): void {
   const menu = requiredHtml('quickMenu');
   const imageId = menu.dataset.imageId;
-  if (!imageId || imageId !== previewModal?.modal.dataset.imageId) {
+  if (!imageId || imageId !== viewerCoordinator.currentImageId) {
     closePreviewQuickMenu();
     return;
   }
@@ -2289,7 +2074,7 @@ function initPreviewQuickMenu(): void {
   const menu = requiredHtml('quickMenu');
   const modal = requiredHtml('preview-modal');
   modal.addEventListener('contextmenu', event => {
-    if (!previewModal?.isOpen) return;
+    if (!viewerCoordinator.isOpen) return;
     event.preventDefault();
     openPreviewQuickMenu(event.clientX, event.clientY);
   });
@@ -2336,7 +2121,7 @@ function togglePreviewTagDropdown(force?: boolean): void {
 function renderPreviewTagDropdown(): void {
   const dropdown = optionalHtml('preview-tag-dropdown');
   if (!dropdown) return;
-  const img = currentPreviewImage();
+  const img = viewerCoordinator.currentImage;
   const used = new Set((img ? img.tags || [] : []).map(normalizeTag));
   const tags = allTagPool.filter(tag => !used.has(normalizeTag(tag)));
   dropdown.innerHTML = tags.length
@@ -2361,7 +2146,7 @@ async function addTagFromPreviewInput(): Promise<void> {
 
 async function addTagToPreview(tag: string | undefined): Promise<void> {
   if (!tag) return;
-  const img = currentPreviewImage();
+  const img = viewerCoordinator.currentImage;
   if (!img) return;
   const newTags = dedupeDisplayTags([...(img.user_tags || []), findDisplayTag(tag)]);
   await saveTags(img.id, newTags);
@@ -2369,7 +2154,7 @@ async function addTagToPreview(tag: string | undefined): Promise<void> {
 
 async function removeTagFromPreview(tag: string | undefined): Promise<void> {
   if (!tag) return;
-  const img = currentPreviewImage();
+  const img = viewerCoordinator.currentImage;
   if (!img) return;
   const newTags = (img.user_tags || []).filter(t => normalizeTag(t) !== normalizeTag(tag));
   await saveTags(img.id, newTags);
@@ -2404,19 +2189,11 @@ function updateImageTags(id: string, updated: JsonRecord): void {
   }
   if (updatedImage) {
     setTagPool([...allTagPool, ...(updatedImage.tags || [])]);
-    const previewImage = currentPreviewImage();
+    const previewImage = viewerCoordinator.currentImage;
     if (previewImage && previewImage.id === id) renderPreviewTags(previewImage);
     updateCardForImage(updatedImage);
     updateFishGhosts();
   }
-}
-
-function restorePreviewIfNeeded(): void {
-  if (activeWorkspace !== 'gallery') return;
-  const tab = activeTab();
-  if (!tab.lastImageId) return;
-  if (tab.lastImageId === suppressedPreviewRestoreId) return;
-  if (previewModal && !previewModal.isOpen) openLightboxById(tab.lastImageId, false);
 }
 
 function forwardGalleryArrowKeyDown(direction: GalleryArrowDirection, repeat: boolean): void {
@@ -2438,7 +2215,7 @@ function forwardGalleryArrowKeyUp(code: string): void {
 
 function resolveShortcutContext(): ShortcutContext {
   if (activeWorkspace === 'settings') return 'settings';
-  if (previewModal?.isOpen) return 'viewer';
+  if (viewerCoordinator.isOpen) return 'viewer';
   return activeWorkspace === 'gallery' ? 'gallery' : 'blocked';
 }
 
@@ -2544,10 +2321,10 @@ function dispatchCommand(command: AppCommand, context: ShortcutContext, event: K
       previewModal?.zoomBy(1 / 1.2);
       break;
     case 'viewer.nextImage':
-      previewNav(1);
+      viewerCoordinator.navigate(1);
       break;
     case 'viewer.previousImage':
-      previewNav(-1);
+      viewerCoordinator.navigate(-1);
       break;
     case 'viewer.fit':
       previewModal?.fit();
@@ -2652,7 +2429,49 @@ async function loadSession(): Promise<void> {
 }
 
 function initPreview(): void {
-  previewModal = new PreviewModal({}, handlePreviewClosed);
+  let handleClosed: () => void = () => undefined;
+  previewModal = new PreviewModal({}, () => handleClosed());
+  viewerCoordinator = new ViewerCoordinator({
+    modal: previewModal,
+    gallery: {
+      getVisibleImages: () => visibleImages,
+      getAllImages: () => allImages,
+      hasMorePages: () => hasMorePages,
+      loadNextPage: loadNextImagesPage,
+      clearPendingAnchor: () => { pendingGalleryAnchorImageId = null; },
+      scheduleAnchorRestore: scheduleGalleryAnchorRestore,
+    },
+    session: {
+      getLastImageId: () => activeTab().lastImageId,
+      setLastImageId: imageId => { activeTab().lastImageId = imageId; },
+      hasTabs: () => galleryTabs.list.length > 0,
+      saveSessionSoon,
+      isGalleryActive: () => activeWorkspace === 'gallery',
+    },
+    ui: {
+      resetUiState: resetPreviewUiState,
+      resetNearbyCapacity: () => {
+        previewFilmNearbyCapacity = PREVIEW_FILM_NEARBY_FALLBACK_CAPACITY;
+      },
+      resetFilmMode: () => { previewFilmMode = 'nearby'; },
+      closeTransientUi: () => {
+        togglePreviewTagDropdown(false);
+        closePreviewQuickMenu();
+      },
+      cancelFilmstripLayoutRefresh: () => {
+        if (previewFilmLayoutFrame !== null) cancelAnimationFrame(previewFilmLayoutFrame);
+        previewFilmLayoutFrame = null;
+      },
+      renderImage: renderPreviewMeta,
+      refreshSourceUi: refreshPreviewSourceUi,
+      setBodyLocked: locked => { document.body.style.overflow = locked ? 'hidden' : ''; },
+      scheduleFilmstripLayoutRefresh: schedulePreviewFilmstripLayoutRefresh,
+      thumbnailUrls,
+      fileName,
+      diagnoseOriginalFailure: diagnosePreviewOriginalFailure,
+    },
+  });
+  handleClosed = () => viewerCoordinator.handleModalClosed();
 }
 
 function readGalleryGeometry(): GalleryGeometry {
@@ -2834,7 +2653,7 @@ function scheduleGalleryAnchorRestore(imageId: string): void {
 
 function restorePendingGalleryAnchor(imageId: string, frame: number): void {
   if (pendingGalleryAnchorImageId !== imageId) return;
-  if (previewModal?.isOpen || activeWorkspace !== 'gallery') {
+  if (viewerCoordinator.isOpen || activeWorkspace !== 'gallery') {
     pendingGalleryAnchorImageId = null;
     return;
   }
@@ -3152,7 +2971,7 @@ function runAction(actionEl: HTMLElement): void {
       clearImageSelection();
       break;
     case 'close-preview':
-      closePreview();
+      viewerCoordinator.close();
       break;
     case 'create-tag-from-settings':
       createTagFromSettings();
@@ -3203,7 +3022,7 @@ function runAction(actionEl: HTMLElement): void {
       previewModal?.zoomBy(Number(actionEl.dataset.factor || 1));
       break;
     case 'preview-nav':
-      previewNav(Number(actionEl.dataset.dir || 0));
+      viewerCoordinator.navigate(Number(actionEl.dataset.dir || 0));
       break;
     case 'scroll-to-top':
       scrollToTop();
@@ -3277,7 +3096,7 @@ requiredInput('tag-admin-create').addEventListener('keydown', e => {
 window.addEventListener('scroll', updateScrollTopButton, {passive: true});
 window.addEventListener('resize', () => {
   handleGalleryResize();
-  if (previewModal?.isOpen) schedulePreviewFilmstripLayoutRefresh();
+  if (viewerCoordinator.isOpen) schedulePreviewFilmstripLayoutRefresh();
 });
 document.addEventListener('visibilitychange', () => problemsWorkspace.handleVisibilityChange());
 
@@ -3287,7 +3106,7 @@ initPreviewQuickMenu();
 galleryDiagnostics.install({
   captureMountedCards: captureMountedCardsForDiagnostics,
   isGalleryActive: () => activeWorkspace === 'gallery'
-    && !previewModal?.isOpen
+    && !viewerCoordinator.isOpen
 });
 initFilterInput();
 initFishInputs();

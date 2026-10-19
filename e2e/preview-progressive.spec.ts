@@ -14,6 +14,7 @@ type PreviewFixture = {
   controls: Map<string, Deferred>;
   originalRequests: string[];
   tagRequests: Array<{id: string; tags: string[]}>;
+  sessionWrites: Array<{last_image_id?: string | null}>;
 };
 
 type PreviewFixtureOptions = {
@@ -77,10 +78,12 @@ async function installPreviewFixture(page: Page, options: PreviewFixtureOptions 
   const controls = new Map(ids.map(id => [id, deferred()]));
   const originalRequests: string[] = [];
   const tagRequests: Array<{id: string; tags: string[]}> = [];
+  const sessionWrites: Array<{last_image_id?: string | null}> = [];
 
   await page.route('**/api/events', route => route.abort());
   await page.route('**/api/session', async route => {
     if (route.request().method() !== 'GET') {
+      sessionWrites.push(route.request().postDataJSON() as {last_image_id?: string | null});
       await route.fulfill({status: 200, json: {ok: true}});
       return;
     }
@@ -137,7 +140,7 @@ async function installPreviewFixture(page: Page, options: PreviewFixtureOptions 
     await fulfillOriginal(route, control);
   });
 
-  return {controls, originalRequests, tagRequests};
+  return {controls, originalRequests, tagRequests, sessionWrites};
 }
 
 async function openFixture(page: Page): Promise<void> {
@@ -513,6 +516,53 @@ test('normal Viewer close returns Gallery to the final image and clears session 
   await expectGalleryCardInViewport(page, pagedImageId(64));
 });
 
+test('opening Settings preserves the active tab Viewer state without restoring the modal', async ({page}) => {
+  const fixture = await installPreviewFixture(page, {immediateOriginals: true});
+  await openFixture(page);
+
+  await page.locator('.card[data-id="preview-a"]').click();
+  await expect(page.locator('#preview-modal')).toHaveAttribute('data-image-id', 'preview-a');
+  await expect.poll(() => fixture.sessionWrites.at(-1)?.last_image_id).toBe('preview-a');
+
+  await page.locator('#settings-toggle').dispatchEvent('click');
+  await expect(page.locator('#settings-panel')).toBeVisible();
+  await expect(page.locator('#preview-modal')).not.toBeVisible();
+  expect(fixture.sessionWrites.at(-1)?.last_image_id).toBe('preview-a');
+
+  await page.keyboard.press('q');
+  await expect(page.locator('#settings-panel')).not.toBeVisible();
+  await expect(page.locator('#preview-modal')).not.toBeVisible();
+  expect(fixture.sessionWrites.at(-1)?.last_image_id).toBe('preview-a');
+});
+
+test('switching tabs closes Viewer without losing the previous tab image', async ({page}) => {
+  await installPreviewFixture(page, {immediateOriginals: true});
+  await openFixture(page);
+
+  await page.locator('.card[data-id="preview-b"]').click();
+  await expect(page.locator('#preview-modal')).toHaveAttribute('data-image-id', 'preview-b');
+
+  await page.keyboard.press('Control+t');
+  await expect(page.locator('#preview-modal')).not.toBeVisible();
+  await expect(page.locator('#tabs .tab[data-tab]')).toHaveCount(2);
+
+  await page.keyboard.press('Alt+Digit1');
+  await expect(page.locator('#preview-modal')).toHaveAttribute('data-image-id', 'preview-b');
+});
+
+test('direct PreviewModal backdrop close runs lifecycle cleanup and clears session state', async ({page}) => {
+  const fixture = await installPreviewFixture(page, {immediateOriginals: true});
+  await openFixture(page);
+
+  await page.locator('.card[data-id="preview-a"]').click();
+  await expect.poll(() => fixture.sessionWrites.at(-1)?.last_image_id).toBe('preview-a');
+  await page.locator('#preview-modal').dispatchEvent('click');
+
+  await expect(page.locator('#preview-modal')).not.toBeVisible();
+  await expect.poll(() => fixture.sessionWrites.at(-1)?.last_image_id).toBeNull();
+  await expectGalleryCardInViewport(page, 'preview-a');
+});
+
 test('Vilra selects disable native appearance and keep dark platform-independent styling', async ({page}) => {
   await installPreviewFixture(page);
   await openFixture(page);
@@ -623,6 +673,37 @@ test('late A and B completions cannot replace C during rapid navigation', async 
   await expect(page.locator('#preview-modal-image')).toHaveAttribute('src', /\/file\/preview-c$/);
   await expect(page.locator('#preview-name')).toHaveText('preview-c.png');
   expect([...new Set(fixture.originalRequests)].sort()).toEqual(['preview-a', 'preview-b', 'preview-c']);
+});
+
+test('delayed original HEAD result cannot mutate a newer Viewer image', async ({page}) => {
+  await installPreviewFixture(page);
+  const headGate = deferred();
+  const headStarted = deferred();
+  const dialogs: string[] = [];
+  page.on('dialog', dialog => {
+    dialogs.push(dialog.message());
+    void dialog.dismiss();
+  });
+  await page.route('**/file/preview-a', async route => {
+    if (route.request().method() === 'HEAD') {
+      headStarted.resolve();
+      await headGate.promise;
+      await route.fulfill({status: 404});
+      return;
+    }
+    await route.fulfill({status: 404});
+  });
+  await openFixture(page);
+
+  await page.locator('.card[data-id="preview-a"]').click();
+  await headStarted.promise;
+  await page.locator('#preview-next').click();
+  await expect(page.locator('#preview-modal')).toHaveAttribute('data-image-id', 'preview-b');
+  headGate.resolve();
+  await page.waitForTimeout(150);
+
+  await expect(page.locator('#preview-name')).toContainText('preview-b.png');
+  expect(dialogs).toEqual([]);
 });
 
 test('closing during original load releases media and late completion cannot mutate the modal', async ({page}) => {

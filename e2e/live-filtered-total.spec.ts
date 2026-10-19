@@ -248,6 +248,43 @@ test('repeated updates with stable loaded membership do not count or inflate tot
   await expect(page.locator('#count-text')).toHaveText('50 фото');
 });
 
+test('live update refreshes metadata for the image currently open in Viewer', async ({page}) => {
+  const state = await installLiveFilteredFixture(page);
+  await openFilteredGallery(page);
+  await page.locator('.card[data-id="live-000"]').click();
+  await expect(page.locator('#preview-modal')).toHaveAttribute('data-image-id', 'live-000');
+  await expect(page.locator('#preview-name')).toHaveText('image-000.jpg');
+
+  const current = state.images[0];
+  const updated = {
+    ...current,
+    path: 'library/live-updated-name.jpg',
+    width: 900,
+    height: 300,
+    mtime: current.mtime + 1,
+  };
+  state.images[0] = updated;
+  await emitLiveImage(page, state, 'image_updated', updated);
+
+  await expect(page.locator('#preview-name')).toHaveText('live-updated-name.jpg');
+  await expect(page.locator('#preview-resolution')).toHaveText('900 × 300');
+  await expect(page.locator('#preview-modal')).toHaveAttribute('data-image-id', 'live-000');
+});
+
+test('live removal of the current image closes Viewer without restoring its Gallery anchor', async ({page}) => {
+  const state = await installLiveFilteredFixture(page);
+  await openFilteredGallery(page);
+  const removed = state.images[0];
+  await page.locator('.card[data-id="live-000"]').click();
+  await expect(page.locator('#preview-modal')).toHaveAttribute('data-image-id', 'live-000');
+  state.images = state.images.filter(image => image.id !== removed.id);
+
+  await emitLiveImage(page, state, 'image_removed', removed);
+
+  await expect(page.locator('#preview-modal')).not.toBeVisible();
+  await expect(page.locator('.card[data-id="live-000"]')).toHaveCount(0);
+});
+
 test('removing an unloaded matching image uses canonical total instead of loaded membership', async ({page}) => {
   const state = await installLiveFilteredFixture(page);
   await openFilteredGallery(page);
