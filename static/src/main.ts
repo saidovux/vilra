@@ -14,7 +14,6 @@ import {
   sendGalleryArrowInputNative,
 } from './desktop-runtime';
 import {
-  clamp,
   errorMessage,
   escHtml,
   fileName,
@@ -236,14 +235,6 @@ let activePageLoad: {requestId: number; promise: Promise<void>} | null = null;
 let previewModal: PreviewModal | null = null;
 let viewerCoordinator: ViewerCoordinator;
 let pendingGalleryAnchorImageId: string | null = null;
-let previewFilmMode: 'nearby' | 'tag' | 'folder' = 'nearby';
-const PREVIEW_FILM_NEARBY_FALLBACK_CAPACITY = 15;
-let previewFilmNearbyCapacity = PREVIEW_FILM_NEARBY_FALLBACK_CAPACITY;
-let previewFilmLayoutFrame: number | null = null;
-let previewFocusMode = false;
-let previewInspectorVisible = true;
-let previewInspectorBeforeFocus = true;
-let previewInspectorChangedDuringFocus = false;
 let galleryFocusMode = false;
 let gallerySidebarVisible = true;
 let gallerySidebarBeforeFocus = true;
@@ -1839,12 +1830,6 @@ function imageFormat(path: string): string {
   return dot >= 0 ? name.slice(dot + 1).toUpperCase() : '—';
 }
 
-function imageParentPath(path: string): string {
-  const normalized = String(path || '').replace(/\\/g, '/');
-  const slash = normalized.lastIndexOf('/');
-  return slash >= 0 ? normalized.slice(0, slash + 1) : normalized;
-}
-
 function renderPreviewMeta(img: ImageItem, loading: boolean): void {
   const currentIndex = viewerCoordinator.currentIndex;
   const name = fileName(img.path);
@@ -1877,30 +1862,6 @@ function refreshPreviewSourceUi(): void {
   renderPreviewFilmstrip();
 }
 
-function previewFilmCandidates(): ImageItem[] {
-  const source = viewerCoordinator.source();
-  const currentIndex = viewerCoordinator.currentIndex;
-  const current = currentIndex >= 0 ? source[currentIndex] : null;
-  if (!current) return [];
-  if (previewFilmMode === 'tag') {
-    const tags = new Set((current.tags || []).map(normalizeTag));
-    if (!tags.size) return [current];
-    return source.filter(image => (image.tags || []).some(tag => tags.has(normalizeTag(tag))));
-  }
-  if (previewFilmMode === 'folder') {
-    const folder = imageParentPath(current.path);
-    return source.filter(image => imageParentPath(image.path) === folder);
-  }
-  const capacity = Math.min(Math.max(1, previewFilmNearbyCapacity), source.length);
-  const start = clamp(
-    currentIndex - Math.floor(capacity / 2),
-    0,
-    Math.max(0, source.length - capacity),
-  );
-  const end = Math.min(source.length, start + capacity);
-  return source.slice(start, end);
-}
-
 function measurePreviewFilmNearbyCapacity(): number | null {
   const target = optionalHtml('preview-film-items');
   if (!target || target.clientWidth <= 0) return null;
@@ -1915,27 +1876,15 @@ function measurePreviewFilmNearbyCapacity(): number | null {
   return Math.max(1, Math.floor((usableWidth + gap) / (itemWidth + gap)));
 }
 
-function schedulePreviewFilmstripLayoutRefresh(): void {
-  if (previewFilmLayoutFrame !== null) return;
-  previewFilmLayoutFrame = requestAnimationFrame(() => {
-    previewFilmLayoutFrame = null;
-    if (!viewerCoordinator.isOpen || previewFocusMode) return;
-    const measuredCapacity = measurePreviewFilmNearbyCapacity();
-    if (measuredCapacity === null || measuredCapacity === previewFilmNearbyCapacity) return;
-    previewFilmNearbyCapacity = measuredCapacity;
-    if (previewFilmMode === 'nearby') renderPreviewFilmstrip();
-  });
-}
-
 function renderPreviewFilmstrip(): void {
   const target = optionalHtml('preview-film-items');
   const info = optionalHtml('preview-film-info');
   const modes = optionalHtml('preview-film-modes');
   if (!target || !info || !modes) return;
   modes.querySelectorAll<HTMLElement>('button[data-mode]').forEach(button => {
-    button.classList.toggle('active', button.dataset.mode === previewFilmMode);
+    button.classList.toggle('active', button.dataset.mode === viewerCoordinator.filmMode);
   });
-  const items = previewFilmCandidates();
+  const items = viewerCoordinator.filmCandidates();
   const current = viewerCoordinator.currentImage;
   target.replaceChildren();
   for (const image of items) {
@@ -1960,26 +1909,23 @@ function renderPreviewFilmstrip(): void {
     });
     target.appendChild(button);
   }
-  const label = previewFilmMode === 'tag' ? 'SAME TAG' : previewFilmMode === 'folder' ? 'FOLDER' : 'NEARBY';
+  const label = viewerCoordinator.filmMode === 'tag'
+    ? 'SAME TAG'
+    : viewerCoordinator.filmMode === 'folder' ? 'FOLDER' : 'NEARBY';
   info.textContent = `${label} · ${items.length}`;
   requestAnimationFrame(() => {
     target.querySelector<HTMLElement>('.preview-film-item.active')?.scrollIntoView({inline: 'center', block: 'nearest'});
   });
 }
 
-function setPreviewFilmMode(mode: string | undefined): void {
-  previewFilmMode = mode === 'tag' || mode === 'folder' ? mode : 'nearby';
-  renderPreviewFilmstrip();
-}
-
 function renderPreviewUiState(): void {
   const modal = requiredHtml('preview-modal');
-  modal.classList.toggle('preview-focus-mode', previewFocusMode);
-  modal.classList.toggle('preview-inspector-hidden', !previewInspectorVisible);
+  modal.classList.toggle('preview-focus-mode', viewerCoordinator.focusMode);
+  modal.classList.toggle('preview-inspector-hidden', !viewerCoordinator.inspectorVisible);
   const button = optionalHtml('preview-focus-toggle');
   if (button) {
-    button.classList.toggle('active', previewFocusMode);
-    button.setAttribute('aria-pressed', previewFocusMode ? 'true' : 'false');
+    button.classList.toggle('active', viewerCoordinator.focusMode);
+    button.setAttribute('aria-pressed', viewerCoordinator.focusMode ? 'true' : 'false');
   }
 }
 
@@ -1987,50 +1933,15 @@ function refreshPreviewLayout(): void {
   if (!viewerCoordinator.isOpen) return;
   requestAnimationFrame(() => {
     previewModal?.refreshLayout();
-    schedulePreviewFilmstripLayoutRefresh();
+    viewerCoordinator.scheduleFilmstripLayoutRefresh();
   });
-}
-
-function setPreviewFocusMode(enabled: boolean): void {
-  if (enabled === previewFocusMode) return;
-  if (enabled) {
-    previewInspectorBeforeFocus = previewInspectorVisible;
-    previewInspectorChangedDuringFocus = false;
-    previewFocusMode = true;
-    previewInspectorVisible = false;
-  } else {
-    previewFocusMode = false;
-    if (!previewInspectorChangedDuringFocus) previewInspectorVisible = previewInspectorBeforeFocus;
-    previewInspectorChangedDuringFocus = false;
-  }
-  renderPreviewUiState();
-  refreshPreviewLayout();
-}
-
-function togglePreviewFocusMode(): void {
-  setPreviewFocusMode(!previewFocusMode);
-}
-
-function togglePreviewInspector(): void {
-  previewInspectorVisible = !previewInspectorVisible;
-  if (previewFocusMode) previewInspectorChangedDuringFocus = true;
-  renderPreviewUiState();
-  refreshPreviewLayout();
 }
 
 function focusPreviewTagInput(): void {
   if (!viewerCoordinator.isOpen) return;
   closePreviewQuickMenu();
-  if (!previewInspectorVisible) togglePreviewInspector();
+  if (!viewerCoordinator.inspectorVisible) viewerCoordinator.toggleInspector();
   requiredInput('preview-tag-input').focus({preventScroll: true});
-}
-
-function resetPreviewUiState(): void {
-  previewFocusMode = false;
-  previewInspectorVisible = true;
-  previewInspectorBeforeFocus = true;
-  previewInspectorChangedDuringFocus = false;
-  renderPreviewUiState();
 }
 
 function openPreviewQuickMenu(clientX: number, clientY: number): void {
@@ -2280,11 +2191,11 @@ function dispatchCommand(command: AppCommand, context: ShortcutContext, event: K
     case 'ui.consumeShortcut':
       break;
     case 'ui.toggleFocus':
-      if (context === 'viewer') togglePreviewFocusMode();
+      if (context === 'viewer') viewerCoordinator.toggleFocus();
       else if (context === 'gallery') toggleGalleryFocusMode();
       break;
     case 'ui.toggleSidePanel':
-      if (context === 'viewer') togglePreviewInspector();
+      if (context === 'viewer') viewerCoordinator.toggleInspector();
       else if (context === 'gallery') toggleFolderSidebar();
       break;
     case 'gallery.newTab':
@@ -2449,27 +2360,22 @@ function initPreview(): void {
       isGalleryActive: () => activeWorkspace === 'gallery',
     },
     ui: {
-      resetUiState: resetPreviewUiState,
-      resetNearbyCapacity: () => {
-        previewFilmNearbyCapacity = PREVIEW_FILM_NEARBY_FALLBACK_CAPACITY;
-      },
-      resetFilmMode: () => { previewFilmMode = 'nearby'; },
       closeTransientUi: () => {
         togglePreviewTagDropdown(false);
         closePreviewQuickMenu();
       },
-      cancelFilmstripLayoutRefresh: () => {
-        if (previewFilmLayoutFrame !== null) cancelAnimationFrame(previewFilmLayoutFrame);
-        previewFilmLayoutFrame = null;
-      },
       renderImage: renderPreviewMeta,
+      renderFilmstrip: renderPreviewFilmstrip,
+      renderViewerUiState: renderPreviewUiState,
       refreshSourceUi: refreshPreviewSourceUi,
+      measureFilmstripCapacity: measurePreviewFilmNearbyCapacity,
+      refreshPreviewLayout,
       setBodyLocked: locked => { document.body.style.overflow = locked ? 'hidden' : ''; },
-      scheduleFilmstripLayoutRefresh: schedulePreviewFilmstripLayoutRefresh,
       thumbnailUrls,
       fileName,
       diagnoseOriginalFailure: diagnosePreviewOriginalFailure,
     },
+    normalizeTag,
   });
   handleClosed = () => viewerCoordinator.handleModalClosed();
 }
@@ -3031,7 +2937,7 @@ function runAction(actionEl: HTMLElement): void {
       setMatchMode(actionEl.dataset.mode);
       break;
     case 'set-preview-film-mode':
-      setPreviewFilmMode(actionEl.dataset.mode);
+      viewerCoordinator.setFilmMode(actionEl.dataset.mode);
       break;
     case 'set-settings-tab':
       setSettingsTab(actionEl.dataset.settingsTab);
@@ -3043,10 +2949,10 @@ function runAction(actionEl: HTMLElement): void {
       toggleGalleryFocusMode();
       break;
     case 'toggle-preview-focus':
-      togglePreviewFocusMode();
+      viewerCoordinator.toggleFocus();
       break;
     case 'toggle-preview-inspector':
-      togglePreviewInspector();
+      viewerCoordinator.toggleInspector();
       break;
     case 'toggle-preview-tag-dropdown':
       togglePreviewTagDropdown();
@@ -3096,7 +3002,7 @@ requiredInput('tag-admin-create').addEventListener('keydown', e => {
 window.addEventListener('scroll', updateScrollTopButton, {passive: true});
 window.addEventListener('resize', () => {
   handleGalleryResize();
-  if (viewerCoordinator.isOpen) schedulePreviewFilmstripLayoutRefresh();
+  if (viewerCoordinator.isOpen) viewerCoordinator.scheduleFilmstripLayoutRefresh();
 });
 document.addEventListener('visibilitychange', () => problemsWorkspace.handleVisibilityChange());
 

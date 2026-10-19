@@ -1,7 +1,17 @@
 import {type ImageItem} from '../gallery/image-data';
+import {clamp} from '../shared/helpers';
 import {type PreviewImageRequest} from './preview-modal';
 
 export type PreviewSourceMode = 'gallery' | 'fixed';
+export type PreviewFilmMode = 'nearby' | 'tag' | 'folder';
+
+const PREVIEW_FILM_NEARBY_FALLBACK_CAPACITY = 15;
+
+function imageParentPath(path: string): string {
+  const normalized = String(path || '').replace(/\\/g, '/');
+  const slash = normalized.lastIndexOf('/');
+  return slash >= 0 ? normalized.slice(0, slash + 1) : normalized;
+}
 
 export interface ViewerModal {
   readonly modal: HTMLElement;
@@ -28,15 +38,14 @@ export interface ViewerSessionPort {
 }
 
 export interface ViewerUiPort {
-  resetUiState(): void;
-  resetNearbyCapacity(): void;
-  resetFilmMode(): void;
   closeTransientUi(): void;
-  cancelFilmstripLayoutRefresh(): void;
   renderImage(image: ImageItem, loading: boolean): void;
+  renderFilmstrip(): void;
+  renderViewerUiState(): void;
   refreshSourceUi(): void;
+  measureFilmstripCapacity(): number | null;
+  refreshPreviewLayout(): void;
   setBodyLocked(locked: boolean): void;
-  scheduleFilmstripLayoutRefresh(): void;
   thumbnailUrls(image: ImageItem): {primary: string; fallback: string};
   fileName(path: string): string;
   diagnoseOriginalFailure(image: ImageItem, isCurrent: () => boolean): Promise<void>;
@@ -47,6 +56,7 @@ export interface ViewerCoordinatorOptions {
   gallery: ViewerGalleryPort;
   session: ViewerSessionPort;
   ui: ViewerUiPort;
+  normalizeTag(tag: string): string;
 }
 
 export class ViewerCoordinator {
@@ -54,6 +64,7 @@ export class ViewerCoordinator {
   private readonly gallery: ViewerGalleryPort;
   private readonly session: ViewerSessionPort;
   private readonly ui: ViewerUiPort;
+  private readonly normalizeTag: (tag: string) => string;
 
   private previewSourceMode: PreviewSourceMode = 'gallery';
   private previewCurrentImageId: string | null = null;
@@ -65,12 +76,20 @@ export class ViewerCoordinator {
   private suppressPreviewCloseClear = false;
   private suppressPreviewGalleryReturn = false;
   private suppressedPreviewRestoreId: string | null = null;
+  private previewFilmMode: PreviewFilmMode = 'nearby';
+  private previewFilmNearbyCapacity = PREVIEW_FILM_NEARBY_FALLBACK_CAPACITY;
+  private previewFilmLayoutFrame: number | null = null;
+  private previewFocusMode = false;
+  private previewInspectorVisible = true;
+  private previewInspectorBeforeFocus = true;
+  private previewInspectorChangedDuringFocus = false;
 
   constructor(options: ViewerCoordinatorOptions) {
     this.modal = options.modal;
     this.gallery = options.gallery;
     this.session = options.session;
     this.ui = options.ui;
+    this.normalizeTag = options.normalizeTag;
   }
 
   get isOpen(): boolean {
@@ -94,6 +113,22 @@ export class ViewerCoordinator {
 
   get sourceMode(): PreviewSourceMode {
     return this.previewSourceMode;
+  }
+
+  get filmMode(): PreviewFilmMode {
+    return this.previewFilmMode;
+  }
+
+  get filmNearbyCapacity(): number {
+    return this.previewFilmNearbyCapacity;
+  }
+
+  get focusMode(): boolean {
+    return this.previewFocusMode;
+  }
+
+  get inspectorVisible(): boolean {
+    return this.previewInspectorVisible;
   }
 
   source(): ImageItem[] {
@@ -152,15 +187,15 @@ export class ViewerCoordinator {
     }
     if (!navigatingOpenViewer) {
       this.gallery.clearPendingAnchor();
-      this.ui.resetUiState();
-      this.ui.resetNearbyCapacity();
+      this.resetUiState();
+      this.previewFilmNearbyCapacity = PREVIEW_FILM_NEARBY_FALLBACK_CAPACITY;
     }
     this.previewSourceMode = sourceMode;
     this.lightboxImages = sourceMode === 'fixed' ? nextSource : [];
     this.previewCurrentImageId = nextImageId;
     if (persist) this.suppressedPreviewRestoreId = null;
     this.ui.closeTransientUi();
-    this.ui.resetFilmMode();
+    this.previewFilmMode = 'nearby';
 
     const image = this.source()[currentIndex];
     this.session.setLastImageId(image.id);
@@ -188,8 +223,91 @@ export class ViewerCoordinator {
         );
       },
     });
-    this.ui.scheduleFilmstripLayoutRefresh();
+    this.scheduleFilmstripLayoutRefresh();
     if (persist) this.session.saveSessionSoon();
+  }
+
+  filmCandidates(): ImageItem[] {
+    const source = this.source();
+    const currentIndex = this.currentIndex;
+    const current = currentIndex >= 0 ? source[currentIndex] : null;
+    if (!current) return [];
+    if (this.previewFilmMode === 'tag') {
+      const tags = new Set((current.tags || []).map(this.normalizeTag));
+      if (!tags.size) return [current];
+      return source.filter(image => (image.tags || []).some(
+        tag => tags.has(this.normalizeTag(tag)),
+      ));
+    }
+    if (this.previewFilmMode === 'folder') {
+      const folder = imageParentPath(current.path);
+      return source.filter(image => imageParentPath(image.path) === folder);
+    }
+    const capacity = Math.min(Math.max(1, this.previewFilmNearbyCapacity), source.length);
+    const start = clamp(
+      currentIndex - Math.floor(capacity / 2),
+      0,
+      Math.max(0, source.length - capacity),
+    );
+    const end = Math.min(source.length, start + capacity);
+    return source.slice(start, end);
+  }
+
+  setFilmMode(mode: string | undefined): void {
+    this.previewFilmMode = mode === 'tag' || mode === 'folder' ? mode : 'nearby';
+    this.ui.renderFilmstrip();
+  }
+
+  setFocusMode(enabled: boolean): void {
+    if (enabled === this.previewFocusMode) return;
+    if (enabled) {
+      this.previewInspectorBeforeFocus = this.previewInspectorVisible;
+      this.previewInspectorChangedDuringFocus = false;
+      this.previewFocusMode = true;
+      this.previewInspectorVisible = false;
+    } else {
+      this.previewFocusMode = false;
+      if (!this.previewInspectorChangedDuringFocus) {
+        this.previewInspectorVisible = this.previewInspectorBeforeFocus;
+      }
+      this.previewInspectorChangedDuringFocus = false;
+    }
+    this.ui.renderViewerUiState();
+    this.ui.refreshPreviewLayout();
+  }
+
+  toggleFocus(): void {
+    this.setFocusMode(!this.previewFocusMode);
+  }
+
+  toggleInspector(): void {
+    this.previewInspectorVisible = !this.previewInspectorVisible;
+    if (this.previewFocusMode) this.previewInspectorChangedDuringFocus = true;
+    this.ui.renderViewerUiState();
+    this.ui.refreshPreviewLayout();
+  }
+
+  resetUiState(): void {
+    this.previewFocusMode = false;
+    this.previewInspectorVisible = true;
+    this.previewInspectorBeforeFocus = true;
+    this.previewInspectorChangedDuringFocus = false;
+    this.ui.renderViewerUiState();
+  }
+
+  scheduleFilmstripLayoutRefresh(): void {
+    if (this.previewFilmLayoutFrame !== null) return;
+    this.previewFilmLayoutFrame = requestAnimationFrame(() => {
+      this.previewFilmLayoutFrame = null;
+      if (!this.modal.isOpen || this.previewFocusMode) return;
+      const measuredCapacity = this.ui.measureFilmstripCapacity();
+      if (
+        measuredCapacity === null
+        || measuredCapacity === this.previewFilmNearbyCapacity
+      ) return;
+      this.previewFilmNearbyCapacity = measuredCapacity;
+      if (this.previewFilmMode === 'nearby') this.ui.renderFilmstrip();
+    });
   }
 
   close(clearLast = true, restoreGalleryAnchor = clearLast): void {
@@ -268,10 +386,10 @@ export class ViewerCoordinator {
       && Boolean(closingImageId);
     this.previewRequestToken += 1;
     this.invalidateNavigation();
-    this.ui.cancelFilmstripLayoutRefresh();
+    this.cancelFilmstripLayoutRefresh();
     this.ui.setBodyLocked(false);
     this.ui.closeTransientUi();
-    this.ui.resetUiState();
+    this.resetUiState();
     this.lightboxImages = [];
     this.previewCurrentImageId = null;
     this.previewSourceMode = 'gallery';
@@ -288,6 +406,13 @@ export class ViewerCoordinator {
     this.previewNavigationGeneration += 1;
     this.previewPageNavigationBusy = false;
     this.previewPendingDirection = null;
+  }
+
+  private cancelFilmstripLayoutRefresh(): void {
+    if (this.previewFilmLayoutFrame !== null) {
+      cancelAnimationFrame(this.previewFilmLayoutFrame);
+    }
+    this.previewFilmLayoutFrame = null;
   }
 
   private isCurrentOriginalRequest(imageId: string, token: number): boolean {

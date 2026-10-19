@@ -635,9 +635,17 @@ test('format mismatch is a warning, stays in gallery, and does not increment err
 });
 
 test('pending thumbnail 202 admits once and polls only the cache resource', async ({ page }) => {
-  const [target] = await imageItems(page, 1);
-  expect(target?.id).toBeTruthy();
-  const imageId = target.id;
+  let target: ImageItem | undefined;
+  await expect.poll(async () => {
+    const response = await page.request.get(
+      '/api/images?match_mode=any&limit=40&sort=date_desc&include_total=1',
+    );
+    expect(response.ok()).toBeTruthy();
+    const payload = await response.json() as {items?: ImageItem[]};
+    target = (payload.items || []).find(item => fs.existsSync(path.join(fixtureRoot(), item.path)));
+    return target?.id || '';
+  }).not.toBe('');
+  const imageId = target!.id;
   const thumbnail = fs.readFileSync(path.join(fixtureRoot(), 'batch-a', 'fixture-001.png'));
   const requestOrder: string[] = [];
   let initialPrimaryRequests = 0;

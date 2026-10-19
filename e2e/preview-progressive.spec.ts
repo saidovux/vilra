@@ -1,4 +1,5 @@
 import {expect, test, type Page, type Route} from '@playwright/test';
+import {ViewerCoordinator} from '../static/src/viewer/preview-coordinator';
 
 const IMAGE_BYTES = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
@@ -21,8 +22,23 @@ type PreviewFixtureOptions = {
   width?: number;
   height?: number;
   ids?: string[];
+  items?: PreviewFixtureImage[];
   lastImageId?: string | null;
   immediateOriginals?: boolean;
+};
+
+type PreviewFixtureImage = {
+  id: string;
+  path: string;
+  thumb_url: string;
+  width: number;
+  height: number;
+  size: number;
+  mtime: number;
+  tags: string[];
+  auto_tags: string[];
+  folder_tags: string[];
+  user_tags: string[];
 };
 
 type FilmstripSnapshot = {
@@ -52,7 +68,7 @@ function deferred(): Deferred {
   return {promise, resolve};
 }
 
-function image(id: string, index: number, options: PreviewFixtureOptions = {}) {
+function image(id: string, index: number, options: PreviewFixtureOptions = {}): PreviewFixtureImage {
   return {
     id,
     path: `preview/${id}.png`,
@@ -74,7 +90,9 @@ async function fulfillOriginal(route: Route, wait: Deferred): Promise<void> {
 }
 
 async function installPreviewFixture(page: Page, options: PreviewFixtureOptions = {}): Promise<PreviewFixture> {
-  const ids = options.ids || ['preview-a', 'preview-b', 'preview-c'];
+  const defaultIds = options.ids || ['preview-a', 'preview-b', 'preview-c'];
+  const items = options.items || defaultIds.map((id, index) => image(id, index, options));
+  const ids = items.map(item => item.id);
   const controls = new Map(ids.map(id => [id, deferred()]));
   const originalRequests: string[] = [];
   const tagRequests: Array<{id: string; tags: string[]}> = [];
@@ -99,7 +117,7 @@ async function installPreviewFixture(page: Page, options: PreviewFixtureOptions 
     }});
   });
   await page.route('**/api/images?**', route => route.fulfill({status: 200, json: {
-    items: ids.map((id, index) => image(id, index, options)),
+    items,
     page: {total: ids.length, next_cursor: null, has_more: false},
   }}));
   await page.route('**/api/tags', route => route.fulfill({status: 200, json: {tags: ['hiking']}}));
@@ -311,6 +329,56 @@ function expectTrueFit(
   expect(Math.abs(topGap - bottomGap)).toBeLessThanOrEqual(tolerance);
 }
 
+test('invalid Viewer index or source does not reset the selected Filmstrip mode', () => {
+  const visibleImages = [image('preview-valid', 0)];
+  let filmstripRenders = 0;
+  const viewer = new ViewerCoordinator({
+    modal: {
+      modal: {dataset: {}} as unknown as HTMLElement,
+      isOpen: false,
+      open: () => undefined,
+      close: () => undefined,
+    },
+    gallery: {
+      getVisibleImages: () => visibleImages,
+      getAllImages: () => visibleImages,
+      hasMorePages: () => false,
+      loadNextPage: async () => undefined,
+      clearPendingAnchor: () => undefined,
+      scheduleAnchorRestore: () => undefined,
+    },
+    session: {
+      getLastImageId: () => null,
+      setLastImageId: () => undefined,
+      hasTabs: () => false,
+      saveSessionSoon: () => undefined,
+      isGalleryActive: () => true,
+    },
+    ui: {
+      closeTransientUi: () => undefined,
+      renderImage: () => undefined,
+      renderFilmstrip: () => { filmstripRenders += 1; },
+      renderViewerUiState: () => undefined,
+      refreshSourceUi: () => undefined,
+      measureFilmstripCapacity: () => null,
+      refreshPreviewLayout: () => undefined,
+      setBodyLocked: () => undefined,
+      thumbnailUrls: () => ({primary: '', fallback: ''}),
+      fileName: path => path,
+      diagnoseOriginalFailure: async () => undefined,
+    },
+    normalizeTag: tag => tag.trim().toLowerCase(),
+  });
+
+  viewer.setFilmMode('tag');
+  expect(filmstripRenders).toBe(1);
+  viewer.openAt(-1, true, visibleImages, 'gallery');
+  expect(viewer.filmMode).toBe('tag');
+  viewer.openAt(0, true, [image('preview-missing', 1)], 'gallery');
+  expect(viewer.filmMode).toBe('tag');
+  expect(filmstripRenders).toBe(1);
+});
+
 test('Nearby filmstrip fills visible width from the first image after opening', async ({page}) => {
   const ids = await openFilmstripFixture(page, 0);
   await expect.poll(() => page.locator('.preview-film-item').count()).toBeGreaterThan(8);
@@ -395,6 +463,86 @@ test('Nearby capacity resets before a fresh Viewer session is measured', async (
   await expect(page.locator('#preview-inspector')).toBeVisible();
   await expect.poll(() => page.locator('.preview-film-item').count()).toBe(inspectorCount);
   expectFilledFilmstrip(await filmstripSnapshot(page));
+});
+
+test('Same tag filmstrip preserves normalized intersections, source order, and mode reset', async ({page}) => {
+  const items = [
+    {...image('preview-tag-current', 0), path: 'tags/current.png', tags: [' Shared ', 'Current']},
+    {...image('preview-tag-second', 1), path: 'tags/second.png', tags: ['shared']},
+    {...image('preview-tag-other', 2), path: 'tags/other.png', tags: ['other']},
+    {...image('preview-tag-third', 3), path: 'tags/third.png', tags: ['SHARED']},
+    {...image('preview-tag-none', 4), path: 'tags/none.png', tags: []},
+  ];
+  await installPreviewFixture(page, {
+    items,
+    lastImageId: items[0].id,
+    immediateOriginals: true,
+  });
+  await page.goto('/');
+  const modal = page.locator('#preview-modal');
+  await expect(modal).toHaveAttribute('data-image-id', items[0].id);
+
+  const tagMode = page.locator('#preview-film-modes [data-mode="tag"]');
+  await tagMode.click();
+  await expect(tagMode).toHaveClass(/active/);
+  await expect(page.locator('.preview-film-item')).toHaveCount(3);
+  expect(await filmstripSnapshot(page)).toMatchObject({
+    titles: ['current.png', 'second.png', 'third.png'],
+    activeTitle: 'current.png',
+  });
+
+  await page.locator('.preview-film-item[title="second.png"]').click();
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-tag-second');
+  await expect(page.locator('#preview-film-modes [data-mode="nearby"]')).toHaveClass(/active/);
+
+  await page.keyboard.press('Escape');
+  const noTagsCard = page.locator('.card[data-id="preview-tag-none"]');
+  await noTagsCard.scrollIntoViewIfNeeded();
+  await noTagsCard.click();
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-tag-none');
+  await tagMode.click();
+  await expect(page.locator('.preview-film-item')).toHaveCount(1);
+  expect((await filmstripSnapshot(page)).titles).toEqual(['none.png']);
+});
+
+test('Folder filmstrip normalizes separators, preserves order, and isolates separatorless paths', async ({page}) => {
+  const items = [
+    {...image('preview-folder-current', 0), path: 'root\\mixed/nested\\current.png'},
+    {...image('preview-folder-second', 1), path: 'root/mixed/nested/second.png'},
+    {...image('preview-folder-other', 2), path: 'root/mixed/other/other.png'},
+    {...image('preview-folder-third', 3), path: 'root\\mixed\\nested/third.png'},
+    {...image('preview-folder-standalone', 4), path: 'standalone.png'},
+  ];
+  await installPreviewFixture(page, {
+    items,
+    lastImageId: items[0].id,
+    immediateOriginals: true,
+  });
+  await page.goto('/');
+  const modal = page.locator('#preview-modal');
+  await expect(modal).toHaveAttribute('data-image-id', items[0].id);
+
+  const folderMode = page.locator('#preview-film-modes [data-mode="folder"]');
+  await folderMode.click();
+  await expect(folderMode).toHaveClass(/active/);
+  await expect(page.locator('.preview-film-item')).toHaveCount(3);
+  expect(await filmstripSnapshot(page)).toMatchObject({
+    titles: ['current.png', 'second.png', 'third.png'],
+    activeTitle: 'current.png',
+  });
+
+  await page.locator('.preview-film-item[title="third.png"]').click();
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-folder-third');
+  await expect(page.locator('#preview-film-modes [data-mode="nearby"]')).toHaveClass(/active/);
+
+  await page.keyboard.press('Escape');
+  const standaloneCard = page.locator('.card[data-id="preview-folder-standalone"]');
+  await standaloneCard.scrollIntoViewIfNeeded();
+  await standaloneCard.click();
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-folder-standalone');
+  await folderMode.click();
+  await expect(page.locator('.preview-film-item')).toHaveCount(1);
+  expect((await filmstripSnapshot(page)).titles).toEqual(['standalone.png']);
 });
 
 test('Viewer navigation hints match the functional P/N shortcuts', async ({page}) => {
