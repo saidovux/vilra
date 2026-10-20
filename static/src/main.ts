@@ -60,6 +60,7 @@ import {
   ThumbnailLifecycleManager,
   type ThumbLifecycle,
 } from './gallery/thumbnail-lifecycle';
+import {LiveTotalReconciler} from './gallery/live-total-reconciler';
 import {VirtualGalleryView} from './gallery/virtual-gallery-view';
 import {GalleryVirtualizerController} from './gallery/virtualizer-controller';
 import {ProblemsWorkspace} from './problems/problems-workspace';
@@ -226,7 +227,6 @@ let nextCursor: string | null = null;
 let hasMorePages = false;
 let isLoadingPage = false;
 let activeImagesRequest = 0;
-let gallerySnapshotRequest = -1;
 let galleryGeometry: GalleryGeometry | null = null;
 let galleryResizeFrame: number | null = null;
 let paginationPrefetchFrame: number | null = null;
@@ -249,11 +249,6 @@ let lastLiveSequence = 0;
 let liveRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
 let liveFolderRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let liveTagRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-let liveTotalTimer: ReturnType<typeof setTimeout> | null = null;
-let liveTotalRevision = 0;
-let liveTotalRequestRunning = false;
-let liveTotalReconcilePending = false;
-const liveImageMembership = new Map<string, {requestId: number; matches: boolean}>();
 let activeWorkspace: AppWorkspace = 'gallery';
 const problemsWorkspace = new ProblemsWorkspace({
   isProblemsActive: () => activeWorkspace === 'settings' && settingsActiveTab === 'problems',
@@ -283,7 +278,6 @@ const THUMB_FAST_ENTER_SAMPLES = 2;
 const THUMB_FAST_EXIT_SAMPLES = 2;
 const THUMB_SCROLL_SAMPLE_MAX_MS = 250;
 const THUMB_SCROLL_SETTLE_FALLBACK_MS = 180;
-const LIVE_TOTAL_DEBOUNCE_MS = 50;
 const thumbnailLifecycles = new ThumbnailLifecycleManager({
   isTerminal: imageId => terminalThumbIds.has(imageId),
   onTerminalUnavailable: handleTerminalImageUnavailable,
@@ -301,6 +295,15 @@ const virtualGalleryView = new VirtualGalleryView({
 const galleryVirtualizerController = new GalleryVirtualizerController({
   getImages: () => visibleImages,
   onChange: handleGalleryVirtualizerChange,
+});
+const liveTotalReconciler = new LiveTotalReconciler({
+  getActiveRequestId: () => activeImagesRequest,
+  buildCountQueryParams: buildLiveTotalQueryParams,
+  applyCanonicalTotal: total => {
+    serverTotalKnown = true;
+    serverTotal = total;
+    updateImageCounter();
+  },
 });
 
 function activeTab(): GalleryTab {
@@ -739,17 +742,6 @@ function compareLiveImages(left: ImageItem, right: ImageItem): number {
   }
 }
 
-function knownLiveMembership(imageId: string, existingIndex: number): boolean | null {
-  const cached = liveImageMembership.get(imageId);
-  if (cached?.requestId === activeImagesRequest) return cached.matches;
-  if (gallerySnapshotRequest === activeImagesRequest && existingIndex >= 0) return true;
-  return null;
-}
-
-function recordLiveMembership(imageId: string, matches: boolean): void {
-  liveImageMembership.set(imageId, {requestId: activeImagesRequest, matches});
-}
-
 function buildLiveTotalQueryParams(): URLSearchParams {
   const tab = activeTab();
   return buildImageQueryParams({
@@ -762,62 +754,17 @@ function buildLiveTotalQueryParams(): URLSearchParams {
   });
 }
 
-function armLiveTotalReconciliation(): void {
-  if (liveTotalTimer || liveTotalRequestRunning || !liveTotalReconcilePending) return;
-  liveTotalTimer = setTimeout(() => {
-    liveTotalTimer = null;
-    void reconcileLiveTotal();
-  }, LIVE_TOTAL_DEBOUNCE_MS);
-}
-
-function scheduleLiveTotalReconciliation(): void {
-  liveTotalRevision += 1;
-  liveTotalReconcilePending = true;
-  armLiveTotalReconciliation();
-}
-
-async function reconcileLiveTotal(): Promise<void> {
-  if (liveTotalRequestRunning || !liveTotalReconcilePending) return;
-  liveTotalReconcilePending = false;
-  liveTotalRequestRunning = true;
-  const revision = liveTotalRevision;
-  const requestId = activeImagesRequest;
-  const params = buildLiveTotalQueryParams();
-  const querySignature = params.toString();
-  try {
-    const response = await fetch('/api/images?' + querySignature);
-    if (!response.ok) return;
-    const data = await readJsonRecord(response);
-    const total = pageTotalValue(imagePage(data.page));
-    if (total === null) return;
-    if (revision !== liveTotalRevision || requestId !== activeImagesRequest) return;
-    if (querySignature !== buildLiveTotalQueryParams().toString()) return;
-    serverTotalKnown = true;
-    serverTotal = total;
-    updateImageCounter();
-  } catch (error) {
-    console.warn('Unable to reconcile live gallery total', error);
-  } finally {
-    liveTotalRequestRunning = false;
-    armLiveTotalReconciliation();
-  }
-}
-
-function reconcileLiveMembership(previous: boolean | null, next: boolean): void {
-  if (previous === null || previous !== next) scheduleLiveTotalReconciliation();
-}
-
 function applyLiveImage(image: ImageItem): void {
   acceptActiveImage(image.id);
   const existingIndex = allImages.findIndex(item => item.id === image.id);
-  const previousMembership = knownLiveMembership(image.id, existingIndex);
+  const previousMembership = liveTotalReconciler.knownMembership(image.id, existingIndex);
   const nextMembership = imageMatchesActiveTab(image);
   if (existingIndex >= 0) allImages.splice(existingIndex, 1);
   if (nextMembership) allImages.push(image);
   allImages.sort(compareLiveImages);
   visibleImages = allImages.slice();
-  recordLiveMembership(image.id, nextMembership);
-  reconcileLiveMembership(previousMembership, nextMembership);
+  liveTotalReconciler.recordMembership(image.id, nextMembership);
+  liveTotalReconciler.reconcileMembership(previousMembership, nextMembership);
   renderLiveGalleryState();
   scheduleLiveFolderRefresh();
   scheduleLiveTagRefresh();
@@ -827,11 +774,11 @@ function applyLiveImage(image: ImageItem): void {
 function removeLiveImage(imageId: string): void {
   if (!imageId) return;
   const existingIndex = allImages.findIndex(item => item.id === imageId);
-  const previousMembership = knownLiveMembership(imageId, existingIndex);
+  const previousMembership = liveTotalReconciler.knownMembership(imageId, existingIndex);
   if (existingIndex >= 0) allImages.splice(existingIndex, 1);
   visibleImages = allImages.slice();
-  recordLiveMembership(imageId, false);
-  reconcileLiveMembership(previousMembership, false);
+  liveTotalReconciler.recordMembership(imageId, false);
+  liveTotalReconciler.reconcileMembership(previousMembership, false);
   if (viewerCoordinator.currentImageId === imageId) viewerCoordinator.close(true, false);
   renderLiveGalleryState();
   scheduleLiveFolderRefresh();
@@ -922,8 +869,7 @@ function updateImageCounter(): void {
 
 async function refreshImages(clear = true): Promise<void> {
   const requestId = ++activeImagesRequest;
-  const liveRevisionAtStart = liveTotalRevision;
-  liveImageMembership.clear();
+  const liveRevisionAtStart = liveTotalReconciler.beginGalleryRefresh(requestId);
   const diagnosticPage = galleryDiagnostics.beginPage('refresh', allImages.length);
   activePageLoad = null;
   isLoadingPage = true;
@@ -961,15 +907,16 @@ async function refreshImages(clear = true): Promise<void> {
     allImages = clear
       ? refreshedPage
       : mergeRefreshedPageIntoLoadedImages(allImages, refreshedPage);
-    const liveEventsDuringRequest = liveRevisionAtStart !== liveTotalRevision;
-    gallerySnapshotRequest = liveEventsDuringRequest ? -1 : requestId;
-    if (!liveEventsDuringRequest) liveImageMembership.clear();
+    const liveEventsDuringRequest = liveTotalReconciler.acceptGallerySnapshot(
+      requestId,
+      liveRevisionAtStart,
+    );
     galleryDiagnostics.pageStage(diagnosticPage, 'deduped');
     visibleImages = allImages.slice();
     galleryDiagnostics.pageStage(diagnosticPage, 'arrays');
     const page = imagePage(d.page);
     setServerTotalFromPage(page, visibleImages.length, true);
-    if (liveEventsDuringRequest) scheduleLiveTotalReconciliation();
+    if (liveEventsDuringRequest) liveTotalReconciler.schedule();
     nextCursor = page ? page.next_cursor || null : null;
     hasMorePages = Boolean(page && page.has_more);
     isLoadingPage = false;

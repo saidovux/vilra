@@ -24,9 +24,13 @@ type LiveFixtureState = {
   sequence: number;
   countRequests: number;
   countQueries: string[];
+  countRequestsInFlight: number;
+  maxConcurrentCountRequests: number;
+  failedCountResponses: number;
   galleryRequests: number;
   tagRequests: number;
   holdNextCount: boolean;
+  failNextCount: boolean;
   releaseHeldCount: (() => void) | null;
 };
 
@@ -75,9 +79,13 @@ async function installLiveFilteredFixture(page: Page): Promise<LiveFixtureState>
     sequence: 0,
     countRequests: 0,
     countQueries: [],
+    countRequestsInFlight: 0,
+    maxConcurrentCountRequests: 0,
+    failedCountResponses: 0,
     galleryRequests: 0,
     tagRequests: 0,
     holdNextCount: false,
+    failNextCount: false,
     releaseHeldCount: null,
   };
 
@@ -134,6 +142,13 @@ async function installLiveFilteredFixture(page: Page): Promise<LiveFixtureState>
     if (isCount) {
       state.countRequests += 1;
       state.countQueries.push(url.search);
+      state.countRequestsInFlight += 1;
+      state.maxConcurrentCountRequests = Math.max(
+        state.maxConcurrentCountRequests,
+        state.countRequestsInFlight,
+      );
+      const shouldFail = state.failNextCount;
+      state.failNextCount = false;
       if (state.holdNextCount) {
         state.holdNextCount = false;
         await new Promise<void>(resolve => {
@@ -141,12 +156,18 @@ async function installLiveFilteredFixture(page: Page): Promise<LiveFixtureState>
         });
         state.releaseHeldCount = null;
       }
+      if (shouldFail) {
+        state.failedCountResponses += 1;
+        await route.fulfill({status: 503, json: {detail: 'count unavailable'}});
+        state.countRequestsInFlight -= 1;
+        return;
+      }
     } else {
       state.galleryRequests += 1;
     }
     const items = matches.slice(offset, offset + limit);
     const end = offset + items.length;
-    return route.fulfill({status: 200, json: {
+    await route.fulfill({status: 200, json: {
       items,
       page: {
         total: url.searchParams.get('include_total') === '1' ? total : null,
@@ -154,6 +175,7 @@ async function installLiveFilteredFixture(page: Page): Promise<LiveFixtureState>
         has_more: end < total,
       },
     }});
+    if (isCount) state.countRequestsInFlight -= 1;
   });
   await page.route('**/api/tags', route => {
     state.tagRequests += 1;
@@ -192,6 +214,23 @@ async function emitLiveImage(page: Page, state: LiveFixtureState, type: string, 
     if (!emit) throw new Error('live event fixture is not installed');
     emit(event);
   }, {sequence: state.sequence, type, data: {image, image_id: image.id}});
+}
+
+async function emitLiveImages(
+  page: Page,
+  state: LiveFixtureState,
+  events: Array<{type: string; image: LiveImage}>,
+): Promise<void> {
+  const payloads = events.map(({type, image}) => ({
+    sequence: ++state.sequence,
+    type,
+    data: {image, image_id: image.id},
+  }));
+  await page.evaluate(batch => {
+    const emit = (window as Window & {__emitVilraLiveEvent?: (payload: unknown) => void}).__emitVilraLiveEvent;
+    if (!emit) throw new Error('live event fixture is not installed');
+    batch.forEach(emit);
+  }, payloads);
 }
 
 function replaceTags(image: LiveImage, tags: string[], path = image.path): LiveImage {
@@ -328,4 +367,80 @@ test('stale delayed count cannot overwrite a new tab and live changes trigger on
   expect(state.countQueries).toHaveLength(2);
   expect(state.countQueries[0]).toContain('include_tags=red');
   expect(state.countQueries[1]).not.toContain('include_tags=red');
+});
+
+test('ambiguous live-event burst coalesces without parallel counts or later stable requests', async ({page}) => {
+  const state = await installLiveFilteredFixture(page);
+  await openFilteredGallery(page);
+  const baselineGalleryRequests = state.galleryRequests;
+  const changed = ['live-047', 'live-048', 'live-049'].map(id => {
+    const index = state.images.findIndex(image => image.id === id);
+    const updated = replaceTags(state.images[index], []);
+    state.images[index] = updated;
+    return {type: 'image_updated', image: updated};
+  });
+
+  await emitLiveImages(page, state, changed);
+
+  await expect(page.locator('#count-text')).toHaveText('47 фото');
+  expect(state.countRequests).toBe(1);
+  expect(state.maxConcurrentCountRequests).toBe(1);
+  expect(state.galleryRequests).toBe(baselineGalleryRequests);
+
+  const baselineTags = state.tagRequests;
+  const stableIndex = state.images.findIndex(image => image.id === 'live-049');
+  const stable = replaceTags(state.images[stableIndex], [], 'outside/stable-049.jpg');
+  state.images[stableIndex] = stable;
+  await emitLiveImage(page, state, 'image_updated', stable);
+  await expect.poll(() => state.tagRequests).toBeGreaterThan(baselineTags);
+
+  expect(state.countRequests).toBe(1);
+  await expect(page.locator('#count-text')).toHaveText('47 фото');
+});
+
+test('failed canonical count keeps the prior total and preserves later pending reconciliation', async ({page}) => {
+  const state = await installLiveFilteredFixture(page);
+  await openFilteredGallery(page);
+  state.failNextCount = true;
+  const firstIndex = state.images.findIndex(image => image.id === 'live-047');
+  let first = replaceTags(state.images[firstIndex], []);
+  state.images[firstIndex] = first;
+
+  await emitLiveImage(page, state, 'image_updated', first);
+  await expect.poll(() => state.failedCountResponses).toBe(1);
+  await expect(page.locator('#count-text')).toHaveText('50 фото');
+
+  const baselineTags = state.tagRequests;
+  first = replaceTags(first, [], 'outside/stable-047.jpg');
+  state.images[firstIndex] = first;
+  await emitLiveImage(page, state, 'image_updated', first);
+  await expect.poll(() => state.tagRequests).toBeGreaterThan(baselineTags);
+  expect(state.countRequests).toBe(1);
+
+  state.failNextCount = true;
+  state.holdNextCount = true;
+  const secondIndex = state.images.findIndex(image => image.id === 'live-046');
+  const second = replaceTags(state.images[secondIndex], []);
+  state.images[secondIndex] = second;
+  await emitLiveImage(page, state, 'image_updated', second);
+  await expect.poll(() => state.countRequests).toBe(2);
+  expect(state.releaseHeldCount).not.toBeNull();
+
+  const thirdIndex = state.images.findIndex(image => image.id === 'live-049');
+  const third = replaceTags(state.images[thirdIndex], []);
+  state.images[thirdIndex] = third;
+  await emitLiveImage(page, state, 'image_updated', third);
+  state.holdNextCount = true;
+  state.releaseHeldCount?.();
+
+  await expect.poll(() => state.failedCountResponses).toBe(2);
+  await expect.poll(() => state.countRequests).toBe(3);
+  expect(state.releaseHeldCount).not.toBeNull();
+  expect(state.maxConcurrentCountRequests).toBe(1);
+  await expect(page.locator('#count-text')).toHaveText('50 фото');
+
+  state.releaseHeldCount?.();
+  await expect(page.locator('#count-text')).toHaveText('47 фото');
+  expect(state.countRequests).toBe(3);
+  expect(state.maxConcurrentCountRequests).toBe(1);
 });
