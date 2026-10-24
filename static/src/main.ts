@@ -64,6 +64,14 @@ import {LiveTotalReconciler} from './gallery/live-total-reconciler';
 import {VirtualGalleryView} from './gallery/virtual-gallery-view';
 import {GalleryVirtualizerController} from './gallery/virtualizer-controller';
 import {ProblemsWorkspace} from './problems/problems-workspace';
+import {
+  dedupeDisplayTags,
+  normalizeTag,
+  splitTagPrefix,
+  TagCatalog,
+  tagName,
+  type TagMeta,
+} from './tags/tag-catalog';
 import {ViewerCoordinator} from './viewer/preview-coordinator';
 import {PreviewModal} from './viewer/preview-modal';
 
@@ -95,19 +103,6 @@ type AppCommand =
   | 'settings.close';
 type TagAdminSort = 'name' | 'image_count' | 'user_count' | 'auto_count';
 type TagKind = 'include' | 'exclude';
-interface TagMeta {
-  name: string;
-  normalized: string;
-  color: string | null;
-  image_count: number;
-  auto_count: number;
-  user_count: number;
-  user_defined: boolean;
-  is_auto: boolean;
-  source: 'auto' | 'user';
-  sources: Array<'auto' | 'user'>;
-}
-
 interface StatusResponse {
   db_ready?: boolean;
   db_error?: string;
@@ -135,11 +130,6 @@ interface LiveEventEnvelope {
   sequence?: number;
   type: string;
   data: JsonRecord;
-}
-
-interface TagInputParse {
-  prefix: string;
-  value: string;
 }
 
 interface FishController {
@@ -214,11 +204,10 @@ function isTextEntryTarget(target: EventTarget | null): boolean {
 
 let allImages: ImageItem[] = [];
 let visibleImages: ImageItem[] = [];
-let allTagPool: string[] = [];
-let allTagMeta: Map<string, TagMeta> = new Map();
 let scannedRoots: string[] = [];
 let folderTagSync = true;
 const galleryTabs = new GalleryTabsState();
+const tagCatalog = new TagCatalog();
 let statusInterval: ReturnType<typeof setInterval> | null = null;
 let sessionSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let serverTotal = 0;
@@ -1087,7 +1076,7 @@ function clearImageSelection(): void {
 async function addTagToSelectedImages(): Promise<void> {
   if (!selectedImageIds.size) return;
   const raw = window.prompt('Добавить тег к выбранным изображениям:');
-  const value = raw ? findDisplayTag(raw.trim()) : '';
+  const value = raw ? tagCatalog.findDisplayTag(raw.trim()) : '';
   if (!value) return;
   const targets = allImages.filter(image => selectedImageIds.has(image.id));
   const failures: string[] = [];
@@ -1374,7 +1363,7 @@ function parseFilterTagInput(raw: string): {kind: TagKind; tag: string} | null {
     kind = 'exclude';
   }
   if (!value) return null;
-  return {kind, tag: findDisplayTag(value)};
+  return {kind, tag: tagCatalog.findDisplayTag(value)};
 }
 
 function addFilterFromInput(raw: string): void {
@@ -1394,7 +1383,7 @@ function addFilterTag(kind: string | undefined, tag: string | undefined, clearIn
 }
 
 function applyFilterTagToTab(kind: string | undefined, tag: string, tab: GalleryTab): boolean {
-  const value = findDisplayTag(tag);
+  const value = tagCatalog.findDisplayTag(tag);
   if (!value) return false;
   const norm = normalizeTag(value);
   const normalizedKind = normalizeTagKind(kind);
@@ -1459,7 +1448,7 @@ function updateFilterGhost(): void {
   const parsed = splitTagPrefix(token);
   const q = normalizeTag(parsed.value);
   const suggestion = q
-    ? allTagPool.find(tag => normalizeTag(tag).startsWith(q) && normalizeTag(tag) !== q)
+    ? tagCatalog.names.find(tag => normalizeTag(tag).startsWith(q) && normalizeTag(tag) !== q)
     : '';
   if (!suggestion) {
     input.dataset.suggestion = '';
@@ -1481,7 +1470,7 @@ function renderFilterSuggestions(): void {
   const {query, prefix, kind} = currentFilterPrefix();
   const tab = activeTab();
   const used = new Set([...(tab.includeTags || []), ...(tab.excludeTags || [])].map(normalizeTag));
-  const matches = allTagPool
+  const matches = tagCatalog.names
     .filter(tag => !query || normalizeTag(tag).includes(query))
     .slice(0, 80);
   list.classList.toggle('open', filterSuggestionOpen);
@@ -1563,18 +1552,18 @@ function renderTagAdmin(): void {
   const list = optionalHtml('tag-admin-list');
   if (!list) return;
   const query = normalizeTag(optionalInput('tag-admin-search')?.value || '');
-  const tags = allTagPool
+  const tags = tagCatalog.names
     .filter(tag => !query || normalizeTag(tag).includes(query))
     .sort((a, b) => {
-      const metaA = getTagMeta(a);
-      const metaB = getTagMeta(b);
+      const metaA = tagCatalog.getMeta(a);
+      const metaB = tagCatalog.getMeta(b);
       if (tagAdminSort === 'image_count' || tagAdminSort === 'user_count' || tagAdminSort === 'auto_count') {
         return Number(metaB[tagAdminSort] || 0) - Number(metaA[tagAdminSort] || 0) || a.localeCompare(b);
       }
       return a.localeCompare(b);
     });
   list.innerHTML = tags.length ? tags.map(tag => {
-    const meta = getTagMeta(tag);
+    const meta = tagCatalog.getMeta(tag);
     const isAuto = Boolean(meta.is_auto || Number(meta.auto_count || 0) > 0);
     const color = meta.color || (isAuto ? '#D4D4D4' : '#E5E5E5');
     return `
@@ -1624,7 +1613,7 @@ async function createTagFromSettings(): Promise<void> {
     });
     if (!r.ok) throw new Error(await readError(r));
     const d = await readJsonRecord(r);
-    setTagPool(d.tags || [...allTagPool, d.tag || value]);
+    setTagPool(d.tags || [...tagCatalog.names, d.tag || value]);
     input.value = '';
     renderAllTagSurfaces();
     updateFishGhosts();
@@ -1654,7 +1643,7 @@ async function updateTagDefinition(tag: string | undefined, body: {name?: string
 
 async function deleteTagDefinition(tag: string | undefined): Promise<void> {
   if (!tag) return;
-  const meta = getTagMeta(tag);
+  const meta = tagCatalog.getMeta(tag);
   const isAuto = Boolean(meta.is_auto || Number(meta.auto_count || 0) > 0);
   const message = isAuto
     ? `Удалить авто-тег "${tag}"? Он останется скрытым при следующих изменениях файлов, пока вы не создадите его вручную.`
@@ -1696,7 +1685,7 @@ function initFishInput(
     const q = normalizeTag(parsed.value);
     const excluded = new Set(getExcluded(value).map(normalizeTag));
     const suggestion = q
-      ? allTagPool.find(tag => normalizeTag(tag).startsWith(q) && normalizeTag(tag) !== q && !excluded.has(normalizeTag(tag)))
+      ? tagCatalog.names.find(tag => normalizeTag(tag).startsWith(q) && normalizeTag(tag) !== q && !excluded.has(normalizeTag(tag)))
       : '';
     controller.suggestion = suggestion ? parsed.prefix + suggestion : '';
     ghost.innerHTML = controller.suggestion
@@ -1981,7 +1970,7 @@ function renderPreviewTagDropdown(): void {
   if (!dropdown) return;
   const img = viewerCoordinator.currentImage;
   const used = new Set((img ? img.tags || [] : []).map(normalizeTag));
-  const tags = allTagPool.filter(tag => !used.has(normalizeTag(tag)));
+  const tags = tagCatalog.names.filter(tag => !used.has(normalizeTag(tag)));
   dropdown.innerHTML = tags.length
     ? tags.map(tag => `<button class="preview-pick-tag" type="button" data-tag="${escAttr(tag)}">${renderTagChip(tag, {count: true})}</button>`).join('')
     : `<span class="muted-inline">Нет доступных тегов для добавления</span>`;
@@ -2006,7 +1995,7 @@ async function addTagToPreview(tag: string | undefined): Promise<void> {
   if (!tag) return;
   const img = viewerCoordinator.currentImage;
   if (!img) return;
-  const newTags = dedupeDisplayTags([...(img.user_tags || []), findDisplayTag(tag)]);
+  const newTags = dedupeDisplayTags([...(img.user_tags || []), tagCatalog.findDisplayTag(tag)]);
   await saveTags(img.id, newTags);
 }
 
@@ -2046,7 +2035,7 @@ function updateImageTags(id: string, updated: JsonRecord): void {
     updatedImage = img;
   }
   if (updatedImage) {
-    setTagPool([...allTagPool, ...(updatedImage.tags || [])]);
+    setTagPool([...tagCatalog.names, ...(updatedImage.tags || [])]);
     const previewImage = viewerCoordinator.currentImage;
     if (previewImage && previewImage.id === id) renderPreviewTags(previewImage);
     updateCardForImage(updatedImage);
@@ -2620,78 +2609,9 @@ function handleGalleryResize(): void {
   scheduleGalleryResize(captureGalleryAnchor());
 }
 
-function normalizeTag(tag: unknown): string {
-  return String(tag || '').trim().replace(/\s+/g, ' ').toLowerCase();
-}
-
-function tagName(tag: unknown): string {
-  if (isRecord(tag)) return String(tag.name || '').trim().replace(/\s+/g, ' ');
-  return String(tag || '').trim().replace(/\s+/g, ' ');
-}
-
 function setTagPool(rawTags: unknown): void {
-  const previous = allTagMeta;
-  const nextMeta = new Map<string, TagMeta>();
-  const names: string[] = [];
-  const source = Array.isArray(rawTags) ? rawTags : [];
-  for (const item of source) {
-    const name = tagName(item);
-    const norm = normalizeTag(name);
-    if (!name || nextMeta.has(norm)) continue;
-    const old = (previous.get(norm) || {}) as Partial<TagMeta>;
-    const meta: TagMeta = isRecord(item)
-      ? {
-        name,
-        normalized: String(item.normalized || norm),
-        color: typeof item.color === 'string' ? item.color : null,
-        image_count: Number(item.image_count || 0),
-        auto_count: Number(item.auto_count || 0),
-        user_count: Number(item.user_count || 0),
-        user_defined: Boolean(item.user_defined || Number(item.user_count || 0) > 0),
-        is_auto: Boolean(item.is_auto || Number(item.auto_count || 0) > 0),
-        source: item.source === 'auto' || Number(item.auto_count || 0) > 0 ? 'auto' : 'user',
-        sources: Array.isArray(item.sources)
-          ? item.sources.filter((value): value is 'auto' | 'user' => value === 'auto' || value === 'user')
-          : [
-            ...(Number(item.auto_count || 0) > 0 ? ['auto' as const] : []),
-            ...(Boolean(item.user_defined) || Number(item.user_count || 0) > 0 ? ['user' as const] : []),
-          ]
-      }
-      : {
-        name,
-        normalized: norm,
-        color: old.color || null,
-        image_count: Number(old.image_count || 0),
-        auto_count: Number(old.auto_count || 0),
-        user_count: Number(old.user_count || 0),
-        user_defined: Boolean(old.user_defined),
-        is_auto: Boolean(old.is_auto),
-        source: old.source === 'auto' ? 'auto' : 'user',
-        sources: old.sources || []
-      };
-    nextMeta.set(norm, meta);
-    names.push(name);
-  }
-  allTagMeta = nextMeta;
-  allTagPool = names;
+  tagCatalog.replace(rawTags);
   renderSidebarTags();
-}
-
-function getTagMeta(tag: unknown): TagMeta {
-  const name = tagName(tag);
-  const norm = normalizeTag(name);
-  return allTagMeta.get(norm) || {
-    name,
-    normalized: norm,
-    color: null,
-    image_count: 0,
-    auto_count: 0,
-    user_count: 0,
-    user_defined: false,
-    is_auto: false,
-    source: 'user',
-    sources: []
-  };
 }
 
 function renderSidebarTags(): void {
@@ -2702,7 +2622,7 @@ function renderSidebarTags(): void {
   const tab = galleryTabs.list.length ? activeTab() : null;
   const included = new Set((tab?.includeTags || []).map(normalizeTag));
   const excluded = new Set((tab?.excludeTags || []).map(normalizeTag));
-  const tags = Array.from(allTagMeta.values())
+  const tags = tagCatalog.names.map(tag => tagCatalog.getMeta(tag))
     .filter(tag => !query || normalizeTag(tag.name).includes(query))
     .sort((left, right) => left.name.localeCompare(right.name, undefined, {sensitivity: 'base'}));
   const renderRows = (items: TagMeta[], auto: boolean): string => items.length
@@ -2749,7 +2669,7 @@ function hexToRgbTriplet(hex: unknown): string {
 
 function renderTagChip(tag: unknown, options: TagChipOptions = {}): string {
   const name = tagName(tag);
-  const meta = getTagMeta(name);
+  const meta = tagCatalog.getMeta(name);
   const color = normalizeHexColor(meta.color, '#D4D4D4');
   const rgb = hexToRgbTriplet(color);
   const classes = [
@@ -2765,34 +2685,6 @@ function renderTagChip(tag: unknown, options: TagChipOptions = {}): string {
     ? `<button type="button" data-kind="${escAttr(options.actionKind || '')}" data-tag="${escAttr(name)}">×</button>`
     : '';
   return `<span class="${classes}" style="--tag-color:${escAttr(color)};--tag-rgb:${escAttr(rgb)}" title="${escAttr(label)}"><span class="tag-label">${escHtml(label)}</span>${source}${count}${remove}</span>`;
-}
-
-function splitTagPrefix(value: unknown): TagInputParse {
-  const raw = String(value || '').trim().replace(/\s+/g, ' ');
-  if (raw.startsWith('!') || raw.startsWith('-')) {
-    return {prefix: raw[0], value: raw.slice(1).trim()};
-  }
-  return {prefix: '', value: raw};
-}
-
-function dedupeDisplayTags(tags: unknown): string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
-  const source = Array.isArray(tags) ? tags : [];
-  for (const tag of source) {
-    const value = tagName(tag);
-    const norm = normalizeTag(value);
-    if (!value || seen.has(norm)) continue;
-    seen.add(norm);
-    result.push(value);
-  }
-  return result;
-}
-
-function findDisplayTag(tag: unknown): string {
-  const value = tagName(tag);
-  const norm = normalizeTag(value);
-  return allTagPool.find(item => normalizeTag(item) === norm) || value;
 }
 
 function cssEscape(value: unknown): string {
