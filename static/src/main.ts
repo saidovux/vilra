@@ -238,6 +238,7 @@ let lastLiveSequence = 0;
 let liveRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
 let liveFolderRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let liveTagRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let tagCatalogRevision = 0;
 let activeWorkspace: AppWorkspace = 'gallery';
 const problemsWorkspace = new ProblemsWorkspace({
   isProblemsActive: () => activeWorkspace === 'settings' && settingsActiveTab === 'problems',
@@ -910,12 +911,17 @@ async function refreshImages(clear = true): Promise<void> {
     hasMorePages = Boolean(page && page.has_more);
     isLoadingPage = false;
     await refreshTagPool();
+    if (requestId !== activeImagesRequest) {
+      galleryDiagnostics.finishPage(diagnosticPage, 'stale', allImages.length);
+      return;
+    }
     galleryDiagnostics.pageStage(diagnosticPage, 'pre_virtualizer_wait');
     applyFilter(clear);
     viewerCoordinator.refreshGallerySource();
     galleryDiagnostics.pageStage(diagnosticPage, 'virtualizer');
     galleryDiagnostics.finishPage(diagnosticPage, 'success', allImages.length);
-    await restorePendingGalleryScroll();
+    await restorePendingGalleryScroll(requestId);
+    if (requestId !== activeImagesRequest) return;
     viewerCoordinator.restoreIfNeeded();
   } catch (e) {
     if (diagnosticPage && !diagnosticPage.finished) {
@@ -924,9 +930,11 @@ async function refreshImages(clear = true): Promise<void> {
         : 'network_failure';
       galleryDiagnostics.finishPage(diagnosticPage, outcome, allImages.length);
     }
-    if (requestId === activeImagesRequest) isLoadingPage = false;
     console.error(e);
-    requiredHtml('status-text').textContent = errorMessage(e);
+    if (requestId === activeImagesRequest) {
+      isLoadingPage = false;
+      requiredHtml('status-text').textContent = errorMessage(e);
+    }
   }
 }
 
@@ -1235,11 +1243,13 @@ function handleTerminalImageUnavailable(imageId: string): void {
   }
 }
 
-async function refreshTagPool() {
+async function refreshTagPool(): Promise<void> {
+  const revision = ++tagCatalogRevision;
   try {
     const r = await fetch('/api/tags');
     if (!r.ok) throw new Error(await readError(r));
     const d = await readJsonRecord(r);
+    if (revision !== tagCatalogRevision) return;
     setTagPool(d.tags || []);
     updateFishGhosts();
     renderFilterSuggestions();
@@ -2580,16 +2590,19 @@ function galleryContentBottom(): number {
   return galleryGeometry.scrollMargin + instance.getTotalSize();
 }
 
-async function restorePendingGalleryScroll(): Promise<void> {
-  if (pendingGalleryScrollTop === null) return;
+async function restorePendingGalleryScroll(requestId: number): Promise<void> {
+  if (requestId !== activeImagesRequest || pendingGalleryScrollTop === null) return;
   const target = Math.max(0, pendingGalleryScrollTop);
   pendingGalleryScrollTop = null;
   while (hasMorePages && galleryContentBottom() < target + window.innerHeight * 1.5) {
+    if (requestId !== activeImagesRequest) return;
     const previousCount = visibleImages.length;
     await loadNextImagesPage();
+    if (requestId !== activeImagesRequest) return;
     if (visibleImages.length <= previousCount) break;
   }
   await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+  if (requestId !== activeImagesRequest) return;
   galleryVirtualizerController.current?.scrollToOffset(target, {behavior: 'instant'});
 }
 
@@ -2610,6 +2623,7 @@ function handleGalleryResize(): void {
 }
 
 function setTagPool(rawTags: unknown): void {
+  tagCatalogRevision += 1;
   tagCatalog.replace(rawTags);
   renderSidebarTags();
 }
