@@ -22,8 +22,8 @@
     "electron:smoke": "npm run electron:prepare && node scripts/run-electron.mjs --smoke",
     "electron:package:prepare": "node scripts/prepare-electron-package.mjs",
     "electron:build": "npm run build:linux",
-    "build:linux": "npm run electron:prepare && npm run electron:package:prepare && electron-builder --config electron-builder.yml --linux AppImage --x64",
-    "build:win": "npm run electron:prepare && npm run electron:package:prepare && electron-builder --config electron-builder.yml --win nsis --x64",
+    "build:linux": "npm run electron:prepare && npm run electron:package:prepare && electron-builder --config electron-builder.yml --linux AppImage --x64 --publish never",
+    "build:win": "npm run electron:prepare && npm run electron:package:prepare && electron-builder --config electron-builder.yml --win nsis --x64 --publish never",
     "release:verify": "node scripts/verify-electron-release.mjs",
     "electron:check": "node --check electron/main.cjs && node --check electron/preload.cjs && node --check electron/diagnostics.cjs && node --check scripts/run-electron.mjs && node --check scripts/build-frontend.mjs && node --check scripts/electron-build-context.mjs && node --check scripts/prepare-electron-package.mjs && node --check scripts/verify-electron-release.mjs && node --test electron/*.test.cjs"
   },

@@ -72,7 +72,7 @@ test('packaged layout uses external resources and resolves relative static overr
     platform: 'linux',
     env: {TAGIMAGE_STATIC_DIR: 'alternate-static'},
   });
-  assert.equal(overridden.staticDirectory, path.join(resourcesPath, 'alternate-static'));
+  assert.equal(overridden.staticDirectory, path.resolve(resourcesPath, 'alternate-static'));
 });
 
 test('packaged build ID is loaded without invoking the development Git resolver', t => {

@@ -64,9 +64,11 @@ test('package scripts keep dev runtime and make Electron build self-contained', 
   assert.ok(packageJson.scripts['build:linux'].includes('electron:prepare'));
   assert.ok(packageJson.scripts['build:linux'].includes('electron:package:prepare'));
   assert.ok(packageJson.scripts['build:linux'].includes('--linux AppImage --x64'));
+  assert.ok(packageJson.scripts['build:linux'].includes('--publish never'));
   assert.ok(packageJson.scripts['build:win'].includes('electron:prepare'));
   assert.ok(packageJson.scripts['build:win'].includes('electron:package:prepare'));
   assert.ok(packageJson.scripts['build:win'].includes('--win nsis --x64'));
+  assert.ok(packageJson.scripts['build:win'].includes('--publish never'));
   assert.equal(packageJson.scripts.dev, 'npm run electron:dev');
   assert.equal(packageJson.scripts.build, 'npm run build:linux');
   assert.equal(packageJson.scripts.smoke, 'npm run electron:smoke');

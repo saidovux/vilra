@@ -62,10 +62,11 @@ test('native original and reveal actions resolve IDs through Rust before using E
 
   await value.actions.openOriginal({}, 'image-1');
   await value.actions.revealImage({}, 'image-1');
+  const canonicalFile = await fs.promises.realpath(value.file);
 
   assert.deepEqual(value.calls, [
-    {method: 'openPath', target: fs.realpathSync(value.file)},
-    {method: 'showItemInFolder', target: fs.realpathSync(value.file)},
+    {method: 'openPath', target: canonicalFile},
+    {method: 'showItemInFolder', target: canonicalFile},
   ]);
   assert.deepEqual(value.fetchCalls, [
     'http://127.0.0.1:8123/api/images/image-1/local-file',
