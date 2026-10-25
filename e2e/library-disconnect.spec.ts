@@ -44,6 +44,16 @@ async function disconnectThroughUi(page: Page, root: string): Promise<void> {
   await expect(button).toHaveCount(0);
 }
 
+test.beforeEach(async ({page}) => {
+  await page.request.patch('/api/session', {data: {
+    tabs: [],
+    active_tab_id: null,
+    search_tags: [],
+    search_mode: 'any',
+    last_image_id: null,
+  }}).catch(() => undefined);
+});
+
 test('libraries disconnect safely without deleting indexed data or restoring stale roots', async ({page}) => {
   const fixtureRoot = e2eState().fixtureDir;
   const temporaryRoot = path.resolve(__dirname, '..', '.run', 'e2e-disconnect-library');
@@ -104,6 +114,8 @@ test('libraries disconnect safely without deleting indexed data or restoring sta
     await expect(page.locator('#preview-modal')).not.toBeVisible();
     await expect(page.locator('#selection-count')).toHaveText('0');
     await expect(page.locator('#empty-state .label')).toHaveText('Библиотеки не добавлены');
+    await expect(page.locator('#empty-state-action')).toHaveText('Добавить библиотеку');
+    await expect(page.locator('#empty-state-action')).toBeVisible();
 
     const empty = await page.request.get('/api/images?limit=20&include_total=1');
     expect(empty.ok()).toBeTruthy();
@@ -231,6 +243,7 @@ test('late gallery responses and filesystem events cannot restore a disconnected
   page.once('dialog', dialog => dialog.accept());
   await page.locator(`[data-action="disconnect-folder"][data-root="${root}"]`).click();
   await expect(page.locator('#empty-state .label')).toHaveText('Библиотеки не добавлены');
+  await expect(page.locator('#empty-state-action')).toHaveText('Добавить библиотеку');
 
   releaseOldResponse?.();
   releaseLateEvent?.();

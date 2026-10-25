@@ -280,6 +280,8 @@ test('stale Gallery error does not overwrite the current status', async ({page})
   await settleRenderer(page);
 
   await expect(page.locator('#status-text')).not.toContainText('stale gallery failure');
+  await expect(page.locator('#empty-state')).not.toHaveAttribute('data-state', 'load_error');
+  await expect(page.locator('#app-notification')).not.toContainText('stale gallery failure');
   await expect(page.locator('.card[data-id="fresh-gallery"]')).toBeVisible();
 });
 

@@ -440,6 +440,48 @@ input::placeholder { color: var(--faint); }
   text-align: center;
 }
 #empty-state .label { color: var(--text); font-weight: 700; margin-bottom: 4px; }
+.empty-state-content { display: grid; justify-items: center; gap: 7px; max-width: 420px; padding: 24px; }
+.empty-state-detail { color: var(--muted); font-size: 12px; line-height: 1.5; }
+#empty-state-action { margin-top: 5px; }
+#empty-state-action[hidden], #app-notification-action[hidden] { display: none; }
+
+.app-notification {
+  position: fixed;
+  z-index: 1600;
+  top: 58px;
+  right: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: min(380px, calc(100vw - 28px));
+  min-height: 38px;
+  padding: 7px 8px 7px 11px;
+  border: 1px solid #343434;
+  border-radius: 5px;
+  background: rgba(10, 10, 10, .97);
+  box-shadow: 0 10px 34px rgba(0, 0, 0, .58);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.app-notification[hidden] { display: none; }
+.app-notification.error { border-color: rgba(214, 91, 86, .72); }
+.app-notification.warning { border-color: rgba(240, 154, 67, .68); }
+.app-notification.success { border-color: rgba(98, 173, 113, .62); }
+#app-notification-message { min-width: 0; flex: 1 1 auto; overflow-wrap: anywhere; }
+#app-notification-action { flex: 0 0 auto; }
+.app-notification-dismiss {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #777;
+  font-size: 16px;
+  cursor: pointer;
+}
+.app-notification-dismiss:hover { color: #fff; }
 
 #preview-modal {
   position: fixed;

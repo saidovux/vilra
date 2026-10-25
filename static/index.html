@@ -211,10 +211,11 @@
 
     <main id="gallery-wrap">
       <div id="gallery"></div>
-      <div id="empty-state">
-        <div>
+      <div id="empty-state" data-state="content" aria-live="polite">
+        <div class="empty-state-content">
           <div class="label">Изображения не найдены</div>
-          <div>Измените фильтр или анти-список</div>
+          <div class="empty-state-detail">Проверьте содержимое папки или поддержку формата</div>
+          <button id="empty-state-action" class="btn btn-primary btn-sm" type="button" data-action="empty-state-action" hidden></button>
         </div>
       </div>
     </main>
@@ -337,7 +338,7 @@
             <input id="preview-tag-input" type="text" placeholder="Добавить тег" autocomplete="off">
           </div>
           <button id="preview-tag-pick" class="btn btn-ghost btn-sm" data-action="toggle-preview-tag-dropdown" title="Выбрать из списка">▾</button>
-          <button class="btn btn-primary btn-sm" data-action="add-tag-from-preview-input" title="Добавить тег">+</button>
+          <button id="preview-tag-add" class="btn btn-primary btn-sm" data-action="add-tag-from-preview-input" title="Добавить тег">+</button>
         </div>
       </section>
 
@@ -369,6 +370,12 @@
       <div id="preview-film-items" aria-label="Навигация по изображениям"></div>
     </footer>
   </div>
+</div>
+
+<div id="app-notification" class="app-notification" role="status" aria-live="polite" hidden>
+  <span id="app-notification-message"></span>
+  <button id="app-notification-action" class="btn btn-ghost btn-sm" type="button" data-action="app-notification-action" hidden></button>
+  <button class="app-notification-dismiss" type="button" data-action="app-notification-dismiss" aria-label="Закрыть уведомление">×</button>
 </div>
 
 <div id="quickMenu" role="menu" aria-label="Быстрые действия" aria-hidden="true">

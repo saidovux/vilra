@@ -79,6 +79,10 @@ import {PreviewModal} from './viewer/preview-modal';
 
 type SettingsTab = 'general' | 'tags' | 'problems';
 type AppWorkspace = 'gallery' | 'settings';
+type GalleryContentState = 'no_library' | 'no_images' | 'filtered_empty' | 'load_error' | 'content';
+type GalleryRetryKind = 'session' | 'images';
+type NotificationKind = 'status' | 'success' | 'warning' | 'error';
+type TagCatalogRefreshResult = 'updated' | 'stale' | 'failed';
 type ShortcutContext = 'gallery' | 'viewer' | 'settings' | 'blocked';
 type AppCommand =
   | 'ui.consumeShortcut'
@@ -137,6 +141,18 @@ interface LiveEventEnvelope {
 interface FishController {
   suggestion: string;
   update?: () => void;
+}
+
+interface GalleryLoadFailure {
+  message: string;
+  retry: GalleryRetryKind;
+}
+
+interface NotificationOptions {
+  actionLabel?: string;
+  action?: () => void | Promise<void>;
+  key?: string;
+  persistent?: boolean;
 }
 
 interface TagChipOptions {
@@ -220,6 +236,10 @@ let nextCursor: string | null = null;
 let hasMorePages = false;
 let isLoadingPage = false;
 let activeImagesRequest = 0;
+let activeSessionRequest = 0;
+let galleryRequestPending = false;
+let sessionRequestPending = false;
+let galleryLoadFailure: GalleryLoadFailure | null = null;
 let galleryGeometry: GalleryGeometry | null = null;
 let galleryResizeFrame: number | null = null;
 let paginationPrefetchFrame: number | null = null;
@@ -250,6 +270,10 @@ let liveFolderRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let liveTagRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let tagCatalogRevision = 0;
 let activeWorkspace: AppWorkspace = 'gallery';
+const tagSavesInFlight = new Set<string>();
+let notificationAction: (() => void | Promise<void>) | null = null;
+let notificationKey = '';
+let notificationTimer: ReturnType<typeof setTimeout> | null = null;
 const problemsWorkspace = new ProblemsWorkspace({
   isProblemsActive: () => activeWorkspace === 'settings' && settingsActiveTab === 'problems',
 });
@@ -310,6 +334,50 @@ function activeTab(): GalleryTab {
   return galleryTabs.current();
 }
 
+function dismissNotification(key = ''): void {
+  if (key && notificationKey !== key) return;
+  if (notificationTimer) clearTimeout(notificationTimer);
+  notificationTimer = null;
+  notificationAction = null;
+  notificationKey = '';
+  const notification = optionalHtml('app-notification');
+  if (notification) notification.hidden = true;
+}
+
+function showNotification(
+  message: string,
+  kind: NotificationKind = 'status',
+  options: NotificationOptions = {},
+): void {
+  const notification = requiredHtml('app-notification');
+  const messageNode = requiredHtml('app-notification-message');
+  const actionButton = requireElement(
+    'app-notification-action',
+    HTMLButtonElement,
+    'Notification action is missing',
+  );
+  if (notificationTimer) clearTimeout(notificationTimer);
+  notificationTimer = null;
+  notificationAction = options.action || null;
+  notificationKey = options.key || '';
+  messageNode.textContent = message;
+  notification.classList.remove('status', 'success', 'warning', 'error');
+  notification.classList.add(kind);
+  notification.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+  actionButton.hidden = !options.actionLabel || !notificationAction;
+  actionButton.textContent = options.actionLabel || '';
+  notification.hidden = false;
+  if (!options.persistent && kind !== 'error' && kind !== 'warning') {
+    notificationTimer = setTimeout(() => dismissNotification(options.key), 4_000);
+  }
+}
+
+function runNotificationAction(): void {
+  const action = notificationAction;
+  dismissNotification();
+  if (action) void action();
+}
+
 function setFolderInputValues(path: string): void {
   ['setup-folder', 'folder-input'].forEach(id => {
     const input = optionalInput(id);
@@ -344,6 +412,7 @@ async function openFolder(pathOverride = '') {
       libraryStateRevision += 1;
       scannedRoots = stringArray(data.root_paths);
     }
+    galleryLoadFailure = null;
     showGallery();
     renderTabs();
     renderFilterControls();
@@ -352,7 +421,10 @@ async function openFolder(pathOverride = '') {
     await refreshFolderTree();
     saveSessionSoon();
   } catch (e) {
-    alert('Ошибка: ' + errorMessage(e));
+    showNotification('Не удалось добавить библиотеку: ' + errorMessage(e), 'error', {
+      key: 'library-open',
+      persistent: true,
+    });
   }
 }
 
@@ -423,6 +495,7 @@ async function disconnectFolder(root: string): Promise<void> {
     const data = await readJsonRecord(response);
     libraryStateRevision += 1;
     scannedRoots = stringArray(data.root_paths);
+    galleryLoadFailure = null;
     setFolderInputValues(typeof data.root === 'string' ? data.root : '');
     viewerCoordinator.suppressRestoreFromActiveTab();
     viewerCoordinator.close(false, false);
@@ -531,17 +604,78 @@ function renderFolderTree(): void {
     : '<div class="folder-empty">Библиотеки не добавлены</div>';
 }
 
+function hasActiveGalleryFilters(): boolean {
+  if (!galleryTabs.list.length) return false;
+  const tab = activeTab();
+  return Boolean((tab.includeTags || []).length || (tab.excludeTags || []).length);
+}
+
+function galleryContentState(): GalleryContentState {
+  if (visibleImages.length) return 'content';
+  if (galleryLoadFailure) return 'load_error';
+  if (!scannedRoots.length) return 'no_library';
+  if (galleryRequestPending || sessionRequestPending) return 'content';
+  if (hasActiveGalleryFilters()) return 'filtered_empty';
+  return 'no_images';
+}
+
 function updateEmptyStateMessage(): void {
   const empty = requiredHtml('empty-state');
   const label = empty.querySelector<HTMLElement>('.label');
-  const detail = label?.nextElementSibling;
-  if (!label || !(detail instanceof HTMLElement)) return;
-  if (!scannedRoots.length) {
-    label.textContent = 'Библиотеки не добавлены';
-    detail.textContent = 'Добавьте папку, чтобы показать изображения';
-  } else {
-    label.textContent = 'Изображения не найдены';
-    detail.textContent = 'Измените фильтр или анти-список';
+  const detail = empty.querySelector<HTMLElement>('.empty-state-detail');
+  const action = empty.querySelector<HTMLButtonElement>('#empty-state-action');
+  if (!label || !detail || !action) return;
+  const state = galleryContentState();
+  empty.dataset.state = state;
+  empty.style.display = state === 'content' ? 'none' : 'flex';
+  action.hidden = false;
+  action.disabled = galleryRequestPending || sessionRequestPending;
+  switch (state) {
+    case 'no_library':
+      label.textContent = 'Библиотеки не добавлены';
+      detail.textContent = 'Добавьте папку с изображениями, чтобы начать работу';
+      action.textContent = 'Добавить библиотеку';
+      action.dataset.emptyAction = 'add-library';
+      break;
+    case 'no_images':
+      label.textContent = 'Изображения не найдены';
+      detail.textContent = 'Проверьте содержимое папки или поддержку формата';
+      action.hidden = true;
+      action.dataset.emptyAction = '';
+      break;
+    case 'filtered_empty':
+      label.textContent = 'Нет изображений по выбранным тегам';
+      detail.textContent = 'Сбросьте фильтры, чтобы снова показать всю библиотеку';
+      action.textContent = 'Сбросить фильтры';
+      action.dataset.emptyAction = 'reset-filters';
+      break;
+    case 'load_error':
+      label.textContent = 'Не удалось загрузить изображения';
+      detail.textContent = galleryLoadFailure?.message || 'Проверьте подключение и повторите попытку';
+      action.textContent = galleryRequestPending || sessionRequestPending ? 'Повторяем…' : 'Повторить';
+      action.dataset.emptyAction = galleryLoadFailure?.retry || 'images';
+      break;
+    case 'content':
+      action.hidden = true;
+      action.dataset.emptyAction = '';
+      break;
+  }
+}
+
+function runEmptyStateAction(action: string | undefined): void {
+  switch (action) {
+    case 'add-library':
+      void pickFolder();
+      break;
+    case 'reset-filters':
+      clearActiveFilters();
+      break;
+    case 'session':
+      void loadSession();
+      break;
+    case 'images':
+      void refreshImages(true);
+      break;
   }
 }
 
@@ -638,6 +772,7 @@ function showSetup(): void {
   toggleFolderSidebar(true, false);
   renderFolderTree();
   updateRootSummary();
+  updateEmptyStateMessage();
 }
 
 const setupFolderInput = optionalInput('setup-folder');
@@ -659,6 +794,7 @@ async function pollStatus(): Promise<void> {
   const revision = libraryStateRevision;
   try {
     const r = await fetch('/api/status');
+    if (!r.ok) throw new Error(await readError(r));
     const s = statusResponse(await readJsonRecord(r));
     if (revision !== libraryStateRevision) return;
     latestStatus = s;
@@ -775,6 +911,7 @@ function handleLiveEvent(event: LiveEventEnvelope): void {
     case 'library_disconnected':
       libraryStateRevision += 1;
       scannedRoots = stringArray(event.data.root_paths);
+      galleryLoadFailure = null;
       setFolderInputValues(typeof event.data.root === 'string' ? event.data.root : '');
       viewerCoordinator.suppressRestoreFromActiveTab();
       viewerCoordinator.close(false, false);
@@ -872,7 +1009,6 @@ function renderLiveGalleryState(): void {
   invalidateVirtualGallery({preserveAnchor: true, resetCards: false});
   updateImageCounter();
   viewerCoordinator.refreshGallerySource();
-  requiredHtml('empty-state').style.display = visibleImages.length ? 'none' : 'flex';
   updateEmptyStateMessage();
 }
 
@@ -957,6 +1093,8 @@ async function refreshImages(clear = true): Promise<void> {
   const diagnosticPage = galleryDiagnostics.beginPage('refresh', allImages.length);
   activePageLoad = null;
   isLoadingPage = true;
+  galleryRequestPending = true;
+  updateEmptyStateMessage();
   const tab = activeTab();
   const params = buildImageQueryParams({
     includeTags: tab.includeTags || [],
@@ -1004,6 +1142,9 @@ async function refreshImages(clear = true): Promise<void> {
     nextCursor = page ? page.next_cursor || null : null;
     hasMorePages = Boolean(page && page.has_more);
     isLoadingPage = false;
+    galleryRequestPending = false;
+    galleryLoadFailure = null;
+    dismissNotification('gallery-load');
     await refreshTagPool();
     if (requestId !== activeImagesRequest) {
       galleryDiagnostics.finishPage(diagnosticPage, 'stale', allImages.length);
@@ -1027,7 +1168,19 @@ async function refreshImages(clear = true): Promise<void> {
     console.error(e);
     if (requestId === activeImagesRequest) {
       isLoadingPage = false;
-      requiredHtml('status-text').textContent = errorMessage(e);
+      galleryRequestPending = false;
+      const message = errorMessage(e);
+      galleryLoadFailure = {message, retry: 'images'};
+      requiredHtml('status-text').textContent = message;
+      updateEmptyStateMessage();
+      if (visibleImages.length) {
+        showNotification('Не удалось обновить галерею: ' + message, 'error', {
+          actionLabel: 'Повторить',
+          action: () => refreshImages(true),
+          key: 'gallery-load',
+          persistent: true,
+        });
+      }
     }
   }
 }
@@ -1040,7 +1193,6 @@ function applyFilter(clear = true): void {
   renderTabs();
   renderFilterControls();
   invalidateVirtualGallery({preserveAnchor: !clear, resetCards: clear});
-  requiredHtml('empty-state').style.display = visibleImages.length ? 'none' : 'flex';
   updateEmptyStateMessage();
 }
 
@@ -1112,6 +1264,14 @@ function loadNextImagesPage(): Promise<void> {
         galleryDiagnostics.finishPage(diagnosticPage, outcome, allImages.length);
       }
       console.error(e);
+      if (requestId === activeImagesRequest) {
+        showNotification('Не удалось загрузить следующую страницу: ' + errorMessage(e), 'error', {
+          actionLabel: 'Повторить',
+          action: loadNextImagesPage,
+          key: 'gallery-page',
+          persistent: true,
+        });
+      }
     } finally {
       if (activePageLoad === load) {
         isLoadingPage = false;
@@ -1517,18 +1677,22 @@ function handleTerminalImageUnavailable(imageId: string): void {
   }
 }
 
-async function refreshTagPool(): Promise<void> {
+async function refreshTagPool(): Promise<TagCatalogRefreshResult> {
   const revision = ++tagCatalogRevision;
   try {
     const r = await fetch('/api/tags');
     if (!r.ok) throw new Error(await readError(r));
     const d = await readJsonRecord(r);
-    if (revision !== tagCatalogRevision) return;
+    if (revision !== tagCatalogRevision) return 'stale';
     setTagPool(d.tags || []);
     updateFishGhosts();
     renderFilterSuggestions();
     renderTagAdmin();
-  } catch {}
+    return 'updated';
+  } catch (error) {
+    console.error('Failed to refresh tag catalog', error);
+    return 'failed';
+  }
 }
 
 function addTab() {
@@ -1958,7 +2122,7 @@ function initFishInput(
   inputId: string,
   ghostId: string,
   getExcluded: (value: string) => string[],
-  onCommit: (tag: string) => void | Promise<void>
+  onCommit: (tag: string) => void | boolean | Promise<void | boolean>
 ): FishController {
   const input = requiredInput(inputId);
   const ghost = requiredHtml(ghostId);
@@ -1988,9 +2152,11 @@ function initFishInput(
       e.preventDefault();
       const value = input.value.trim();
       if (value) {
-        onCommit(controller.suggestion && normalizeTag(value) !== normalizeTag(controller.suggestion) ? value : (controller.suggestion || value));
-        input.value = '';
-        update();
+        void onCommit(
+          controller.suggestion && normalizeTag(value) !== normalizeTag(controller.suggestion)
+            ? value
+            : (controller.suggestion || value),
+        );
       }
     }
     if (e.key === 'Escape') {
@@ -2008,7 +2174,7 @@ function initFishInputs(): void {
     initFishInput('preview-tag-input', 'preview-tag-ghost', () => {
       const img = viewerCoordinator.currentImage;
       return img ? img.tags || [] : [];
-    }, tag => addTagToPreview(tag))
+    }, tag => commitPreviewTagInput(tag))
   ];
 }
 
@@ -2260,9 +2426,29 @@ function renderPreviewTags(img: ImageItem): void {
     ${renderTagChip(t, {removable: true, className: 'preview-chip'})}
   `).join('');
   user.querySelectorAll<HTMLElement>('button[data-tag]').forEach(btn => {
-    btn.addEventListener('click', () => removeTagFromPreview(btn.dataset.tag));
+    btn.addEventListener('click', () => { void removeTagFromPreview(btn.dataset.tag); });
   });
   renderPreviewTagDropdown();
+  updatePreviewTagSavingState();
+}
+
+function updatePreviewTagSavingState(): void {
+  const currentId = viewerCoordinator.currentImageId;
+  const saving = Boolean(currentId && tagSavesInFlight.has(currentId));
+  const panel = optionalHtml('preview-tag-panel');
+  const input = optionalInput('preview-tag-input');
+  if (panel) panel.setAttribute('aria-busy', saving ? 'true' : 'false');
+  if (input) {
+    input.readOnly = saving;
+    input.setAttribute('aria-disabled', saving ? 'true' : 'false');
+  }
+  ['preview-tag-pick', 'preview-tag-add'].forEach(id => {
+    const button = optionalElement(id, HTMLButtonElement);
+    if (button) button.disabled = saving;
+  });
+  panel?.querySelectorAll<HTMLButtonElement>('button[data-tag]').forEach(button => {
+    button.disabled = saving;
+  });
 }
 
 function togglePreviewTagDropdown(force?: boolean): void {
@@ -2283,38 +2469,51 @@ function renderPreviewTagDropdown(): void {
     : `<span class="muted-inline">Нет доступных тегов для добавления</span>`;
   dropdown.querySelectorAll<HTMLElement>('button[data-tag]').forEach(btn => {
     btn.addEventListener('click', async () => {
-      await addTagToPreview(btn.dataset.tag);
-      togglePreviewTagDropdown(false);
+      if (await addTagToPreview(btn.dataset.tag)) togglePreviewTagDropdown(false);
     });
   });
+  updatePreviewTagSavingState();
 }
 
 async function addTagFromPreviewInput(): Promise<void> {
+  await commitPreviewTagInput();
+}
+
+async function commitPreviewTagInput(tagOverride = ''): Promise<boolean> {
   const input = requiredInput('preview-tag-input');
-  const value = input.value.trim();
-  if (!value) return;
-  await addTagToPreview(value);
-  input.value = '';
-  updateFishGhosts();
+  const inputValue = input.value;
+  const value = String(tagOverride || inputValue).trim();
+  const imageId = viewerCoordinator.currentImageId;
+  if (!value || !imageId) return false;
+  const saved = await addTagToPreview(value);
+  if (saved && viewerCoordinator.currentImageId === imageId && input.value === inputValue) {
+    input.value = '';
+    updateFishGhosts();
+  }
+  return saved;
 }
 
-async function addTagToPreview(tag: string | undefined): Promise<void> {
-  if (!tag) return;
+async function addTagToPreview(tag: string | undefined): Promise<boolean> {
+  if (!tag) return false;
   const img = viewerCoordinator.currentImage;
-  if (!img) return;
+  if (!img) return false;
   const newTags = dedupeDisplayTags([...(img.user_tags || []), tagCatalog.findDisplayTag(tag)]);
-  await saveTags(img.id, newTags);
+  return saveTags(img.id, newTags);
 }
 
-async function removeTagFromPreview(tag: string | undefined): Promise<void> {
-  if (!tag) return;
+async function removeTagFromPreview(tag: string | undefined): Promise<boolean> {
+  if (!tag) return false;
   const img = viewerCoordinator.currentImage;
-  if (!img) return;
+  if (!img) return false;
   const newTags = (img.user_tags || []).filter(t => normalizeTag(t) !== normalizeTag(tag));
-  await saveTags(img.id, newTags);
+  return saveTags(img.id, newTags);
 }
 
-async function saveTags(id: string, userTags: string[]): Promise<void> {
+async function saveTags(id: string, userTags: string[]): Promise<boolean> {
+  if (tagSavesInFlight.has(id)) return false;
+  tagSavesInFlight.add(id);
+  updatePreviewTagSavingState();
+  let postCommitted = false;
   try {
     const r = await fetch(`/api/tag/${id}`, {
       method: 'POST',
@@ -2322,11 +2521,36 @@ async function saveTags(id: string, userTags: string[]): Promise<void> {
       body: JSON.stringify({tags: userTags})
     });
     if (!r.ok) throw new Error(await readError(r));
+    postCommitted = true;
     const updated = await readJsonRecord(r);
     updateImageTags(id, updated);
-    await refreshTagPool();
+    const catalogResult = await refreshTagPool();
+    if (catalogResult === 'failed') {
+      showNotification('Теги сохранены, но список тегов не удалось обновить', 'warning', {
+        key: 'tag-save',
+        persistent: true,
+      });
+    } else {
+      showNotification('Теги сохранены', 'success', {key: 'tag-save'});
+    }
+    return true;
   } catch (e) {
     console.error(e);
+    if (postCommitted) {
+      showNotification('Теги сохранены, но интерфейс не удалось обновить: ' + errorMessage(e), 'warning', {
+        key: 'tag-save',
+        persistent: true,
+      });
+      return true;
+    }
+    showNotification('Не удалось сохранить теги: ' + errorMessage(e), 'error', {
+      key: 'tag-save',
+      persistent: true,
+    });
+    return false;
+  } finally {
+    tagSavesInFlight.delete(id);
+    updatePreviewTagSavingState();
   }
 }
 
@@ -2547,10 +2771,17 @@ async function saveSession(): Promise<void> {
 }
 
 async function loadSession(): Promise<void> {
+  const requestId = ++activeSessionRequest;
+  sessionRequestPending = true;
+  updateEmptyStateMessage();
   try {
     const r = await fetch('/api/session');
     if (!r.ok) throw new Error(await readError(r));
     const s = await readJsonRecord(r);
+    if (requestId !== activeSessionRequest) return;
+    sessionRequestPending = false;
+    galleryLoadFailure = null;
+    dismissNotification('gallery-load');
     folderTagSync = s.folder_tag_sync !== false;
     renderFolderTagSyncSetting();
     const restoredTabs = normalizeTabs(s.tabs, s, dedupeDisplayTags);
@@ -2565,6 +2796,7 @@ async function loadSession(): Promise<void> {
       setFolderInputValues(currentRoot);
       updateRootSummary();
       await refreshFolderTree();
+      if (requestId !== activeSessionRequest) return;
       showGallery();
       startStatusPolling();
       pendingGalleryScrollTop = activeTab().scrollTop || 0;
@@ -2574,11 +2806,16 @@ async function loadSession(): Promise<void> {
       pollStatus();
     }
   } catch (e) {
+    if (requestId !== activeSessionRequest) return;
+    sessionRequestPending = false;
     galleryTabs.reset();
     renderTabs();
     renderFilterControls();
     showSetup();
-    setDbStatus(false, errorMessage(e));
+    const message = errorMessage(e);
+    galleryLoadFailure = {message, retry: 'session'};
+    setDbStatus(false, message);
+    updateEmptyStateMessage();
   }
 }
 
@@ -3012,6 +3249,12 @@ function escAttr(s: unknown): string {
 function runAction(actionEl: HTMLElement): void {
   const action = actionEl.dataset.action;
   switch (action) {
+    case 'app-notification-action':
+      runNotificationAction();
+      break;
+    case 'app-notification-dismiss':
+      dismissNotification();
+      break;
     case 'add-tab':
       addTab();
       break;
@@ -3044,6 +3287,9 @@ function runAction(actionEl: HTMLElement): void {
       break;
     case 'disconnect-folder':
       void disconnectFolder(String(actionEl.dataset.root || ''));
+      break;
+    case 'empty-state-action':
+      runEmptyStateAction(actionEl.dataset.emptyAction);
       break;
     case 'open-folder':
       openFolder();
