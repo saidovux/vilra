@@ -7,6 +7,7 @@ files:
   - electron/main.cjs
   - electron/preload.cjs
   - electron/diagnostics.cjs
+  - electron/native-file-actions.cjs
   - electron/runtime-layout.cjs
   - electron/runtime-paths.cjs
   - package.json

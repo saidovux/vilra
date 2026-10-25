@@ -6,6 +6,7 @@ const path = require('node:path');
 const readline = require('node:readline');
 
 const {createGalleryDiagnostics} = require('./diagnostics.cjs');
+const {createNativeFileActions} = require('./native-file-actions.cjs');
 const {resolveRuntimeBuildId, resolveRuntimeLayout} = require('./runtime-layout.cjs');
 const {resolveDiagnosticsPath, resolveSqlitePath} = require('./runtime-paths.cjs');
 
@@ -257,8 +258,23 @@ function requireTrustedSender(event) {
   }
 }
 
+function requireTrustedMainFrame(event) {
+  requireTrustedSender(event);
+  if (!event.senderFrame || event.senderFrame !== event.sender.mainFrame) {
+    throw new Error('Rejected native request from a child frame');
+  }
+}
+
 function registerNativeBridge() {
   const diagnostics = createGalleryDiagnostics({diagnosticsDirectory: resolveDiagnosticsPath()});
+  const fileActions = createNativeFileActions({
+    fs,
+    path,
+    shell,
+    fetchImpl: fetch,
+    getLocalOrigin: () => localOrigin,
+    requireTrustedMainFrame,
+  });
 
   ipcMain.on('vilra:gallery-arrow-input', (event, direction, phase, repeat) => {
     try {
@@ -303,6 +319,9 @@ function registerNativeBridge() {
     if (!fs.existsSync(targetPath)) throw new Error('File does not exist');
     shell.showItemInFolder(targetPath);
   });
+
+  ipcMain.handle('vilra:open-original', fileActions.openOriginal);
+  ipcMain.handle('vilra:reveal-image', fileActions.revealImage);
 
   ipcMain.handle('vilra:diagnostics:begin', event => {
     requireTrustedSender(event);

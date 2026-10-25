@@ -14,6 +14,7 @@ use axum::{
     response::{sse::Event as SseEvent, sse::KeepAlive, IntoResponse, Response, Sse},
     Json,
 };
+use serde::Serialize;
 use serde::{de, Deserialize, Deserializer};
 use serde_json::{json, Value};
 use std::{
@@ -97,6 +98,13 @@ pub struct EventsRequest {
 #[derive(Debug, Deserialize)]
 pub struct DisconnectFolderRequest {
     path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocalImageFile {
+    image_id: String,
+    root_path: String,
+    absolute_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -938,6 +946,59 @@ pub async fn get_file(
     file_response(path, Some(mime), Some("public, max-age=3600")).await
 }
 
+pub async fn get_local_image_file(
+    State(state): State<Arc<AppState>>,
+    Path(img_id): Path<String>,
+) -> Result<Json<LocalImageFile>, ApiError> {
+    if !validate_image_id(&img_id) {
+        return Err(ApiError::not_found("Unknown image"));
+    }
+    let client = state.connect()?;
+    let image = get_image_record_for_delivery(&client, &img_id)?
+        .ok_or_else(|| ApiError::not_found("Unknown image or disconnected library"))?;
+    let issue = get_image_file_issue(&client, &image)?;
+    if issue
+        .as_ref()
+        .is_some_and(|issue| issue.severity == FileIssueSeverity::Error)
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Image is unavailable because of a file problem",
+        ));
+    }
+    if original_image_content_type(&image, issue.as_ref()).is_none() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Unsupported image format",
+        ));
+    }
+
+    let canonical_root = std::fs::canonicalize(&image.root_path)
+        .map_err(|_| ApiError::not_found("Library is unavailable"))?;
+    if !canonical_root.is_dir() {
+        return Err(ApiError::not_found("Library is unavailable"));
+    }
+    let canonical_file = std::fs::canonicalize(image_file_path(&image))
+        .map_err(|_| ApiError::not_found("Original file is unavailable"))?;
+    if !canonical_file.starts_with(&canonical_root) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Original file resolves outside the library",
+        ));
+    }
+    let metadata = std::fs::metadata(&canonical_file)
+        .map_err(|_| ApiError::not_found("Original file is unavailable"))?;
+    if !metadata.is_file() {
+        return Err(ApiError::not_found("Original path is not a regular file"));
+    }
+
+    Ok(Json(LocalImageFile {
+        image_id: image.id,
+        root_path: canonical_root.to_string_lossy().into_owned(),
+        absolute_path: canonical_file.to_string_lossy().into_owned(),
+    }))
+}
+
 fn unavailable_image_response(
     issue: Option<SqliteFileIssue>,
     include_issue: bool,
@@ -1207,15 +1268,27 @@ mod tests {
         root: &std::path::Path,
         contents: &[u8],
     ) -> tagimage_core::FileFingerprint {
-        fs::write(root.join("photo.jpg"), contents).unwrap();
-        let fingerprint = file_fingerprint(&root.join("photo.jpg")).unwrap();
+        insert_delivery_image_at(conn, root, "image-1", "photo.jpg", contents)
+    }
+
+    fn insert_delivery_image_at(
+        conn: &rusqlite::Connection,
+        root: &std::path::Path,
+        id: &str,
+        relative_path: &str,
+        contents: &[u8],
+    ) -> tagimage_core::FileFingerprint {
+        let source = root.join(relative_path);
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, contents).unwrap();
+        let fingerprint = file_fingerprint(&source).unwrap();
         upsert_sqlite_image(
             conn,
             &SqliteImageUpsert {
-                id: Some("image-1".to_string()),
+                id: Some(id.to_string()),
                 root_path: root.to_string_lossy().to_string(),
-                path: "photo.jpg".to_string(),
-                thumb: ".imgindex/thumbs/image-1.jpg".to_string(),
+                path: relative_path.to_string(),
+                thumb: format!(".imgindex/thumbs/{id}.jpg"),
                 size: fingerprint.size,
                 mtime: fingerprint.mtime,
                 width: 4,
@@ -1225,6 +1298,167 @@ mod tests {
         )
         .unwrap();
         fingerprint
+    }
+
+    #[tokio::test]
+    async fn local_file_resolution_validates_active_visible_regular_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        insert_delivery_image_at(
+            &conn,
+            &root,
+            "unicode-1",
+            "вложенная папка/фото с пробелом.jpg",
+            &encoded(ImageFormat::Jpeg),
+        );
+        drop(conn);
+        let state = test_state_with_roots(dir.path(), db_path.clone(), vec![root.clone()]);
+
+        let resolved = get_local_image_file(State(state.clone()), Path("unicode-1".to_string()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resolved.image_id, "unicode-1");
+        assert_eq!(
+            std::path::Path::new(&resolved.root_path),
+            std::fs::canonicalize(&root).unwrap()
+        );
+        assert_eq!(
+            std::path::Path::new(&resolved.absolute_path),
+            std::fs::canonicalize(root.join("вложенная папка/фото с пробелом.jpg")).unwrap()
+        );
+
+        assert_eq!(
+            get_local_image_file(State(state.clone()), Path("unknown-1".to_string()))
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::NOT_FOUND
+        );
+
+        let conn = state.connect().unwrap();
+        conn.execute("UPDATE images SET hidden = 1 WHERE id = 'unicode-1'", [])
+            .unwrap();
+        drop(conn);
+        assert_eq!(
+            get_local_image_file(State(state.clone()), Path("unicode-1".to_string()))
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::NOT_FOUND
+        );
+
+        let conn = state.connect().unwrap();
+        conn.execute("UPDATE images SET hidden = 0 WHERE id = 'unicode-1'", [])
+            .unwrap();
+        drop(conn);
+        fs::remove_file(root.join("вложенная папка/фото с пробелом.jpg")).unwrap();
+        assert_eq!(
+            get_local_image_file(State(state), Path("unicode-1".to_string()))
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn local_file_resolution_rejects_disconnected_library_and_error_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("library");
+        let other_root = dir.path().join("other-library");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&other_root).unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        let fingerprint = insert_delivery_image_at(
+            &conn,
+            &root,
+            "problem-1",
+            "photo.jpg",
+            &encoded(ImageFormat::Jpeg),
+        );
+        drop(conn);
+        let disconnected =
+            test_state_with_roots(dir.path(), db_path.clone(), vec![other_root.clone()]);
+        assert_eq!(
+            get_local_image_file(State(disconnected.clone()), Path("problem-1".to_string()),)
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::NOT_FOUND
+        );
+
+        let conn = disconnected.connect().unwrap();
+        tagimage_db::sqlite::set_sqlite_session_root(&conn, &root, true).unwrap();
+        upsert_sqlite_file_issue(
+            &conn,
+            &SqliteFileIssueUpsert {
+                image_id: Some("problem-1".to_string()),
+                root_path: root.to_string_lossy().into_owned(),
+                path: "photo.jpg".to_string(),
+                severity: FileIssueSeverity::Error,
+                kind: FileIssueKind::DecodeError,
+                expected_format: Some(SupportedImageFormat::Jpeg),
+                detected_format: Some("jpeg".to_string()),
+                size: fingerprint.size,
+                mtime_ns: fingerprint.mtime_ns,
+                detail: Some("fixture".to_string()),
+            },
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(
+            get_local_image_file(State(disconnected), Path("problem-1".to_string()))
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_file_resolution_rejects_symlink_outside_library() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("library");
+        let outside = dir.path().join("outside.jpg");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside, encoded(ImageFormat::Jpeg)).unwrap();
+        symlink(&outside, root.join("linked.jpg")).unwrap();
+        let fingerprint = file_fingerprint(&root.join("linked.jpg")).unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        upsert_sqlite_image(
+            &conn,
+            &SqliteImageUpsert {
+                id: Some("linked-1".to_string()),
+                root_path: root.to_string_lossy().into_owned(),
+                path: "linked.jpg".to_string(),
+                thumb: ".imgindex/thumbs/linked-1.jpg".to_string(),
+                size: fingerprint.size,
+                mtime: fingerprint.mtime,
+                width: 4,
+                height: 3,
+                ext: "jpg".to_string(),
+            },
+        )
+        .unwrap();
+        drop(conn);
+        let state = test_state_with_roots(dir.path(), db_path, vec![root]);
+
+        assert_eq!(
+            get_local_image_file(State(state), Path("linked-1".to_string()))
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]

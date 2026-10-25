@@ -23,6 +23,7 @@ test('electron-builder configuration is valid, explicit, and AppImage-only', asy
     'electron/main.cjs',
     'electron/preload.cjs',
     'electron/diagnostics.cjs',
+    'electron/native-file-actions.cjs',
     'electron/runtime-layout.cjs',
     'electron/runtime-paths.cjs',
     'from: electron/package-resources/bin',

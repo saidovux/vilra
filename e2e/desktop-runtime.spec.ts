@@ -72,6 +72,8 @@ test('Electron bridge provides folder, reveal, diagnostics, and Chromium labelin
         runtime: 'electron';
         pickFolder: (defaultPath?: string) => Promise<string | null>;
         revealPath: (targetPath: string) => Promise<void>;
+        openOriginal: (imageId: string) => Promise<void>;
+        revealImage: (imageId: string) => Promise<void>;
         sendGalleryArrowInput: () => void;
         diagnosticsBegin: () => Promise<unknown>;
         diagnosticsCheckpoint: (sessionId: string, reportJson: string) => Promise<unknown>;
@@ -89,6 +91,12 @@ test('Electron bridge provides folder, reveal, diagnostics, and Chromium labelin
       },
       revealPath: async targetPath => {
         runtime.__electronCalls!.push({method: 'revealPath', value: targetPath});
+      },
+      openOriginal: async imageId => {
+        runtime.__electronCalls!.push({method: 'openOriginal', value: imageId});
+      },
+      revealImage: async imageId => {
+        runtime.__electronCalls!.push({method: 'revealImage', value: imageId});
       },
       sendGalleryArrowInput: () => undefined,
       diagnosticsBegin: async () => {

@@ -10,7 +10,9 @@ import {
 import {
   type GalleryArrowDirection,
   isDesktopRuntime,
+  openOriginalNative,
   pickFolderNative,
+  revealImageNative,
   sendGalleryArrowInputNative,
 } from './desktop-runtime';
 import {
@@ -2147,6 +2149,20 @@ function renderPreviewUiState(): void {
   }
 }
 
+async function runNativeImageAction(
+  imageId: string,
+  action: 'original' | 'reveal',
+): Promise<void> {
+  try {
+    if (action === 'original') await openOriginalNative(imageId);
+    else await revealImageNative(imageId);
+  } catch (error) {
+    const label = action === 'original' ? 'Не удалось открыть оригинал' : 'Не удалось показать файл';
+    console.error(label, error);
+    alert(`${label}: ${errorMessage(error)}`);
+  }
+}
+
 function refreshPreviewLayout(): void {
   if (!viewerCoordinator.isOpen) return;
   requestAnimationFrame(() => {
@@ -2195,13 +2211,24 @@ function runPreviewQuickAction(action: string | undefined): void {
   if (action === 'Tag') {
     requiredInput('preview-tag-input').focus();
   } else if (action === 'Original') {
-    requiredAnchor('preview-open').click();
+    if (isDesktopRuntime()) void runNativeImageAction(imageId, 'original');
+    else requiredAnchor('preview-open').click();
+  } else if (action === 'Reveal in folder' && isDesktopRuntime()) {
+    void runNativeImageAction(imageId, 'reveal');
   }
 }
 
 function initPreviewQuickMenu(): void {
   const menu = requiredHtml('quickMenu');
   const modal = requiredHtml('preview-modal');
+  const revealAction = menu.querySelector<HTMLElement>('[data-quick-action="Reveal in folder"]');
+  if (revealAction) revealAction.hidden = !isDesktopRuntime();
+  requiredAnchor('preview-open').addEventListener('click', event => {
+    if (!isDesktopRuntime()) return;
+    event.preventDefault();
+    const imageId = viewerCoordinator.currentImageId;
+    if (imageId) void runNativeImageAction(imageId, 'original');
+  });
   modal.addEventListener('contextmenu', event => {
     if (!viewerCoordinator.isOpen) return;
     event.preventDefault();

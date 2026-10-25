@@ -11,6 +11,12 @@ contextBridge.exposeInMainWorld('vilraDesktop', Object.freeze({
   revealPath(targetPath) {
     return ipcRenderer.invoke('vilra:reveal-path', targetPath);
   },
+  openOriginal(imageId) {
+    return ipcRenderer.invoke('vilra:open-original', imageId);
+  },
+  revealImage(imageId) {
+    return ipcRenderer.invoke('vilra:reveal-image', imageId);
+  },
   sendGalleryArrowInput(direction, phase, repeat) {
     ipcRenderer.send(
       'vilra:gallery-arrow-input',

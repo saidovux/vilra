@@ -6,6 +6,8 @@ type ElectronBridge = {
   runtime: 'electron';
   pickFolder: (defaultPath?: string) => Promise<string | null>;
   revealPath: (path: string) => Promise<void>;
+  openOriginal: (imageId: string) => Promise<void>;
+  revealImage: (imageId: string) => Promise<void>;
   sendGalleryArrowInput: (
     direction: GalleryArrowDirection,
     phase: GalleryArrowPhase,
@@ -52,6 +54,14 @@ export async function revealFileNative(absolutePath: string): Promise<void> {
     throw new Error('Native file reveal is unavailable');
   }
   await window.vilraDesktop!.revealPath(absolutePath);
+}
+
+export async function openOriginalNative(imageId: string): Promise<void> {
+  await electronBridge().openOriginal(imageId);
+}
+
+export async function revealImageNative(imageId: string): Promise<void> {
+  await electronBridge().revealImage(imageId);
 }
 
 export function sendGalleryArrowInputNative(

@@ -1367,15 +1367,12 @@ test('viewer quick actions open for the current image by right click and Space',
   await modal.click({button: 'right', position: {x: 320, y: 240}});
   await expect(menu).toBeVisible();
   await expect(menu).toHaveAttribute('data-image-id', 'preview-a');
-  await expect(menu.locator('button')).toHaveText([
+  await expect(menu.locator('button:visible')).toHaveText([
     'Tag',
-    'Note',
-    'Link',
-    'Similar',
-    'Reveal in folder',
     'Original',
-    'Delete',
   ]);
+  await expect(page.locator('#preview-open')).toHaveAttribute('href', '/file/preview-a');
+  await expect(page.locator('#preview-open')).toHaveAttribute('target', '_blank');
 
   await menu.locator('[data-quick-action="Tag"]').click();
   await expect(menu).not.toBeVisible();
@@ -1395,6 +1392,86 @@ test('viewer quick actions open for the current image by right click and Space',
   fixture.controls.forEach(control => control.resolve());
   await page.keyboard.press('Escape');
   await expect(modal).not.toBeVisible();
+});
+
+test('Electron viewer actions keep the captured image ID and report native failures', async ({page}) => {
+  await page.addInitScript(() => {
+    const runtime = window as Window & {
+      __nativeImageCalls?: Array<{method: string; imageId: string}>;
+      __nativeImageFailure?: boolean;
+      vilraDesktop?: {
+        runtime: 'electron';
+        pickFolder: () => Promise<string | null>;
+        revealPath: () => Promise<void>;
+        openOriginal: (imageId: string) => Promise<void>;
+        revealImage: (imageId: string) => Promise<void>;
+        sendGalleryArrowInput: () => void;
+        diagnosticsBegin: () => Promise<unknown>;
+        diagnosticsCheckpoint: () => Promise<unknown>;
+        diagnosticsFinalize: () => Promise<unknown>;
+        diagnosticsStatus: () => Promise<unknown>;
+      };
+    };
+    runtime.__nativeImageCalls = [];
+    runtime.vilraDesktop = {
+      runtime: 'electron',
+      pickFolder: async () => null,
+      revealPath: async () => undefined,
+      openOriginal: async imageId => {
+        runtime.__nativeImageCalls!.push({method: 'openOriginal', imageId});
+        await new Promise(resolve => setTimeout(resolve, 25));
+        if (runtime.__nativeImageFailure) throw new Error('No system application is available');
+      },
+      revealImage: async imageId => {
+        runtime.__nativeImageCalls!.push({method: 'revealImage', imageId});
+      },
+      sendGalleryArrowInput: () => undefined,
+      diagnosticsBegin: async () => ({}),
+      diagnosticsCheckpoint: async () => ({}),
+      diagnosticsFinalize: async () => ({}),
+      diagnosticsStatus: async () => ({}),
+    };
+  });
+  await installPreviewFixture(page, {immediateOriginals: true});
+  await openFixture(page);
+
+  const modal = page.locator('#preview-modal');
+  await page.locator('.card[data-id="preview-a"]').click();
+  await page.locator('#preview-open').click();
+  await page.locator('#preview-next').click();
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-b');
+  await expect.poll(() => page.evaluate(() => (
+    (window as Window & {__nativeImageCalls?: unknown[]}).__nativeImageCalls?.length || 0
+  ))).toBe(1);
+
+  await modal.click({button: 'right', position: {x: 320, y: 240}});
+  const menu = page.locator('#quickMenu');
+  await expect(menu.locator('button:visible')).toHaveText([
+    'Tag',
+    'Reveal in folder',
+    'Original',
+  ]);
+  await menu.locator('[data-quick-action="Reveal in folder"]').click();
+  await expect.poll(() => page.evaluate(() => (
+    (window as Window & {__nativeImageCalls?: unknown[]}).__nativeImageCalls?.length || 0
+  ))).toBe(2);
+  expect(await page.evaluate(() => (
+    (window as Window & {__nativeImageCalls?: unknown[]}).__nativeImageCalls
+  ))).toEqual([
+    {method: 'openOriginal', imageId: 'preview-a'},
+    {method: 'revealImage', imageId: 'preview-b'},
+  ]);
+
+  await page.evaluate(() => {
+    (window as Window & {__nativeImageFailure?: boolean}).__nativeImageFailure = true;
+  });
+  const dialogPromise = page.waitForEvent('dialog');
+  await page.locator('#preview-open').click();
+  const dialog = await dialogPromise;
+  expect(dialog.message()).toContain('No system application is available');
+  await dialog.accept();
+  await expect(modal).toBeVisible();
+  await expect(modal).toHaveAttribute('data-image-id', 'preview-b');
 });
 
 test('multi-select keeps cards mounted and exposes the literal selection tray', async ({page}) => {
