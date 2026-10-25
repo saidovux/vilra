@@ -1,10 +1,52 @@
 import {expect, test, type Page, type Route} from '@playwright/test';
+import zlib from 'node:zlib';
 import {ViewerCoordinator} from '../static/src/viewer/preview-coordinator';
 
 const IMAGE_BYTES = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
   'base64',
 );
+
+function crc32(buffer: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type: string, data = Buffer.alloc(0)): Buffer {
+  const typeBytes = Buffer.from(type, 'ascii');
+  const length = Buffer.alloc(4);
+  const checksum = Buffer.alloc(4);
+  length.writeUInt32BE(data.length);
+  checksum.writeUInt32BE(crc32(Buffer.concat([typeBytes, data])));
+  return Buffer.concat([length, typeBytes, data, checksum]);
+}
+
+function solidPng(width: number, height: number, rgb: [number, number, number]): Buffer {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8;
+  header[9] = 2;
+  const row = Buffer.alloc(1 + width * 3);
+  for (let x = 0; x < width; x += 1) {
+    row[1 + x * 3] = rgb[0];
+    row[2 + x * 3] = rgb[1];
+    row[3 + x * 3] = rgb[2];
+  }
+  const raw = Buffer.concat(Array.from({length: height}, () => row));
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk('IHDR', header),
+    pngChunk('IDAT', zlib.deflateSync(raw)),
+    pngChunk('IEND'),
+  ]);
+}
 
 type Deferred = {
   promise: Promise<void>;
@@ -25,6 +67,7 @@ type PreviewFixtureOptions = {
   items?: PreviewFixtureImage[];
   lastImageId?: string | null;
   immediateOriginals?: boolean;
+  imageBytes?: Map<string, Buffer>;
 };
 
 type PreviewFixtureImage = {
@@ -56,6 +99,13 @@ type PreviewGeometry = {
   viewport: {x: number; y: number; width: number; height: number};
 };
 
+type RenderedPreviewGeometry = PreviewGeometry & {
+  media: {x: number; y: number; width: number; height: number};
+  pixels: {x: number; y: number; width: number; height: number};
+  natural: {width: number; height: number};
+  objectFit: string;
+};
+
 type PaginatedPreviewFixture = {
   cursorRequests: string[];
   sessionWrites: Array<{last_image_id?: string | null}>;
@@ -84,9 +134,9 @@ function image(id: string, index: number, options: PreviewFixtureOptions = {}): 
   };
 }
 
-async function fulfillOriginal(route: Route, wait: Deferred): Promise<void> {
+async function fulfillOriginal(route: Route, wait: Deferred, bytes = IMAGE_BYTES): Promise<void> {
   await wait.promise;
-  await route.fulfill({status: 200, contentType: 'image/png', body: IMAGE_BYTES}).catch(() => undefined);
+  await route.fulfill({status: 200, contentType: 'image/png', body: bytes}).catch(() => undefined);
 }
 
 async function installPreviewFixture(page: Page, options: PreviewFixtureOptions = {}): Promise<PreviewFixture> {
@@ -136,7 +186,7 @@ async function installPreviewFixture(page: Page, options: PreviewFixtureOptions 
   await page.route('**/thumb-file/preview-*.jpg*', route => route.fulfill({
     status: 200,
     contentType: 'image/png',
-    body: IMAGE_BYTES,
+    body: options.imageBytes?.get(new URL(route.request().url()).pathname.split('/').pop()?.replace(/\.jpg$/, '') || '') || IMAGE_BYTES,
   }));
   await page.route('**/thumb/preview-*', route => route.fulfill({
     status: 200,
@@ -147,7 +197,11 @@ async function installPreviewFixture(page: Page, options: PreviewFixtureOptions 
     const id = new URL(route.request().url()).pathname.split('/').pop() || '';
     originalRequests.push(id);
     if (options.immediateOriginals) {
-      await route.fulfill({status: 200, contentType: 'image/png', body: IMAGE_BYTES});
+      await route.fulfill({
+        status: 200,
+        contentType: 'image/png',
+        body: options.imageBytes?.get(id) || IMAGE_BYTES,
+      });
       return;
     }
     const control = controls.get(id);
@@ -155,7 +209,7 @@ async function installPreviewFixture(page: Page, options: PreviewFixtureOptions 
       await route.fulfill({status: 404});
       return;
     }
-    await fulfillOriginal(route, control);
+    await fulfillOriginal(route, control, options.imageBytes?.get(id) || IMAGE_BYTES);
   });
 
   return {controls, originalRequests, tagRequests, sessionWrites};
@@ -325,6 +379,67 @@ function expectTrueFit(
   const rightGap = viewport.x + viewport.width - stage.x - stage.width;
   const topGap = stage.y - viewport.y;
   const bottomGap = viewport.y + viewport.height - stage.y - stage.height;
+  expect(Math.abs(leftGap - rightGap)).toBeLessThanOrEqual(tolerance);
+  expect(Math.abs(topGap - bottomGap)).toBeLessThanOrEqual(tolerance);
+}
+
+async function renderedPreviewGeometry(
+  page: Page,
+  clickSelector?: string,
+  mediaId = 'preview-modal-image',
+): Promise<RenderedPreviewGeometry> {
+  return page.evaluate(({selector, targetId}) => {
+    if (selector) (document.querySelector<HTMLElement>(selector))?.click();
+    const rect = (id: string) => {
+      const box = document.getElementById(id)!.getBoundingClientRect();
+      return {x: box.x, y: box.y, width: box.width, height: box.height};
+    };
+    const image = document.getElementById(targetId) as HTMLImageElement;
+    const media = rect(targetId);
+    const scale = Math.min(media.width / image.naturalWidth, media.height / image.naturalHeight);
+    const width = image.naturalWidth * scale;
+    const height = image.naturalHeight * scale;
+    return {
+      viewport: rect('preview-stage-viewport'),
+      stage: rect('preview-image-stage'),
+      media,
+      pixels: {
+        x: media.x + (media.width - width) / 2,
+        y: media.y + (media.height - height) / 2,
+        width,
+        height,
+      },
+      natural: {width: image.naturalWidth, height: image.naturalHeight},
+      objectFit: getComputedStyle(image).objectFit,
+    };
+  }, {selector: clickSelector, targetId: mediaId});
+}
+
+function expectRenderedTrueFit(
+  geometry: RenderedPreviewGeometry,
+  imageWidth: number,
+  imageHeight: number,
+  tolerance = 2,
+): void {
+  expect(geometry.natural).toEqual({width: imageWidth, height: imageHeight});
+  expect(geometry.objectFit).toBe('contain');
+  expect(Math.abs(geometry.media.x - geometry.stage.x)).toBeLessThanOrEqual(tolerance);
+  expect(Math.abs(geometry.media.y - geometry.stage.y)).toBeLessThanOrEqual(tolerance);
+  expect(Math.abs(geometry.media.width - geometry.stage.width)).toBeLessThanOrEqual(tolerance);
+  expect(Math.abs(geometry.media.height - geometry.stage.height)).toBeLessThanOrEqual(tolerance);
+  expect(geometry.pixels.width).toBeLessThanOrEqual(geometry.viewport.width + tolerance);
+  expect(geometry.pixels.height).toBeLessThanOrEqual(geometry.viewport.height + tolerance);
+  expect(Math.min(
+    Math.abs(geometry.pixels.width - geometry.viewport.width),
+    Math.abs(geometry.pixels.height - geometry.viewport.height),
+  )).toBeLessThanOrEqual(tolerance);
+  expect(geometry.pixels.width / geometry.pixels.height).toBeCloseTo(imageWidth / imageHeight, 4);
+  const leftGap = geometry.pixels.x - geometry.viewport.x;
+  const rightGap = geometry.viewport.x + geometry.viewport.width
+    - geometry.pixels.x - geometry.pixels.width;
+  const topGap = geometry.pixels.y - geometry.viewport.y;
+  const bottomGap = geometry.viewport.y + geometry.viewport.height
+    - geometry.pixels.y - geometry.pixels.height;
   expect(Math.abs(leftGap - rightGap)).toBeLessThanOrEqual(tolerance);
   expect(Math.abs(topGap - bottomGap)).toBeLessThanOrEqual(tolerance);
 }
@@ -869,6 +984,86 @@ test('closing during original load releases media and late completion cannot mut
   await expect(page.locator('#preview-modal')).not.toBeVisible();
   await expect(page.locator('#preview-modal-image')).toHaveAttribute('data-state', 'idle');
   await expect(page.locator('#preview-modal')).not.toHaveAttribute('data-image-id', /.+/);
+});
+
+test('real-aspect originals keep true FIT through progressive load and Viewer layouts', async ({page}) => {
+  const specs = [
+    {id: 'preview-fit-portrait', width: 1080, height: 1920, color: [210, 60, 70] as [number, number, number]},
+    {id: 'preview-fit-landscape', width: 1920, height: 1080, color: [50, 160, 210] as [number, number, number]},
+    {id: 'preview-fit-square', width: 800, height: 800, color: [90, 180, 80] as [number, number, number]},
+    {id: 'preview-fit-standard', width: 1200, height: 900, color: [160, 90, 190] as [number, number, number]},
+  ];
+  const items = specs.map((spec, index) => image(spec.id, index, spec));
+  const imageBytes = new Map(specs.map(spec => [
+    spec.id,
+    solidPng(spec.width, spec.height, spec.color),
+  ]));
+  const fixture = await installPreviewFixture(page, {items, imageBytes});
+  await page.setViewportSize({width: 1366, height: 768});
+  await page.goto('/');
+  await expect(page.locator('.card[data-id="preview-fit-portrait"]')).toBeVisible();
+
+  await page.locator('.card[data-id="preview-fit-portrait"]').click();
+  await expect(page.locator('#preview-modal-thumbnail')).toHaveAttribute('data-state', 'ready');
+  await expect(page.locator('#preview-modal-image')).toHaveAttribute('data-state', 'loading');
+  const loadingPortrait = await renderedPreviewGeometry(
+    page,
+    undefined,
+    'preview-modal-thumbnail',
+  );
+  expectRenderedTrueFit(loadingPortrait, 1080, 1920);
+  fixture.controls.get('preview-fit-portrait')?.resolve();
+  await expect(page.locator('#preview-modal-image')).toHaveAttribute('data-state', 'ready');
+  const readyPortrait = await renderedPreviewGeometry(page);
+  expectRenderedTrueFit(readyPortrait, 1080, 1920);
+  expect(readyPortrait.stage).toEqual(loadingPortrait.stage);
+
+  const inspectorToggle = '#preview-inspector [data-action="toggle-preview-inspector"]';
+  const portraitInspectorHidden = await renderedPreviewGeometry(page, inspectorToggle);
+  expectRenderedTrueFit(portraitInspectorHidden, 1080, 1920);
+  const portraitInspectorRestored = await renderedPreviewGeometry(page, inspectorToggle);
+  expectRenderedTrueFit(portraitInspectorRestored, 1080, 1920);
+  const portraitFocusHidden = await renderedPreviewGeometry(page, '#preview-focus-toggle');
+  expectRenderedTrueFit(portraitFocusHidden, 1080, 1920);
+  const portraitFocusInspector = await renderedPreviewGeometry(page, inspectorToggle);
+  expectRenderedTrueFit(portraitFocusInspector, 1080, 1920);
+
+  await page.locator('#preview-next').evaluate(element => (element as HTMLElement).click());
+  await expect(page.locator('#preview-modal')).toHaveAttribute('data-image-id', 'preview-fit-landscape');
+  fixture.controls.get('preview-fit-landscape')?.resolve();
+  await expect(page.locator('#preview-modal-image')).toHaveAttribute('data-state', 'ready');
+  expectRenderedTrueFit(await renderedPreviewGeometry(page), 1920, 1080);
+  const landscapeNormal = await renderedPreviewGeometry(page, '#preview-focus-toggle');
+  expectRenderedTrueFit(landscapeNormal, 1920, 1080);
+
+  await page.locator('[data-action="preview-one-to-one"]').click();
+  await expect(page.locator('#zoom-level')).toHaveText('100%');
+  const landscapeFitRestored = await renderedPreviewGeometry(
+    page,
+    '[data-action="preview-fit"]',
+  );
+  expectRenderedTrueFit(landscapeFitRestored, 1920, 1080);
+  await page.setViewportSize({width: 1600, height: 900});
+  await expect.poll(async () => {
+    const geometry = await renderedPreviewGeometry(page);
+    return Math.min(
+      Math.abs(geometry.pixels.width - geometry.viewport.width),
+      Math.abs(geometry.pixels.height - geometry.viewport.height),
+    );
+  }).toBeLessThanOrEqual(2);
+  expectRenderedTrueFit(await renderedPreviewGeometry(page), 1920, 1080);
+
+  for (const spec of specs.slice(2)) {
+    await page.locator('#preview-next').click();
+    await expect(page.locator('#preview-modal')).toHaveAttribute('data-image-id', spec.id);
+    fixture.controls.get(spec.id)?.resolve();
+    await expect(page.locator('#preview-modal-image')).toHaveAttribute('data-state', 'ready');
+    expectRenderedTrueFit(
+      await renderedPreviewGeometry(page),
+      spec.width,
+      spec.height,
+    );
+  }
 });
 
 test('FIT uses the full limiting axis for a portrait image in Focus mode', async ({page}) => {

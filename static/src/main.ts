@@ -2165,10 +2165,8 @@ async function runNativeImageAction(
 
 function refreshPreviewLayout(): void {
   if (!viewerCoordinator.isOpen) return;
-  requestAnimationFrame(() => {
-    previewModal?.refreshLayout();
-    viewerCoordinator.scheduleFilmstripLayoutRefresh();
-  });
+  previewModal?.refreshLayout();
+  viewerCoordinator.scheduleFilmstripLayoutRefresh();
 }
 
 function focusPreviewTagInput(): void {
