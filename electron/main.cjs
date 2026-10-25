@@ -344,7 +344,7 @@ function registerNativeBridge() {
   });
 }
 
-async function createMainWindow(port) {
+async function createMainWindow(port, {show = true} = {}) {
   const window = new BrowserWindow({
     title: 'Vilra',
     width: 1280,
@@ -352,6 +352,7 @@ async function createMainWindow(port) {
     minWidth: 760,
     minHeight: 520,
     center: true,
+    show,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -379,6 +380,8 @@ async function createMainWindow(port) {
 }
 
 async function startRuntime() {
+  const smokeMode = process.argv.includes('--smoke')
+    || process.env.VILRA_RELEASE_SMOKE === '1';
   const sqlitePath = resolveSqlitePath();
   const layout = runtimeLayout();
   const staticDir = layout.staticDirectory;
@@ -407,9 +410,26 @@ async function startRuntime() {
   await waitForApi(apiPort);
   console.log(`[electron] API ready: ${localOrigin}`);
 
-  if (process.argv.includes('--smoke')) {
-    console.log('[electron] smoke PASS');
+  if (smokeMode) {
+    const window = await createMainWindow(apiPort, {show: false});
+    const renderer = await window.webContents.executeJavaScript(`({
+      title: document.title,
+      readyState: document.readyState,
+      hasGallery: Boolean(document.querySelector('#gallery-screen')),
+      hasDesktopBridge: typeof window.vilraDesktop?.pickFolder === 'function'
+        && typeof window.vilraDesktop?.openOriginal === 'function'
+        && typeof window.vilraDesktop?.revealImage === 'function'
+    })`);
+    if (renderer.title !== 'Vilra'
+      || renderer.readyState !== 'complete'
+      || !renderer.hasGallery
+      || !renderer.hasDesktopBridge) {
+      throw new Error(`Renderer smoke failed: ${JSON.stringify(renderer)}`);
+    }
+    console.log('[electron] renderer smoke PASS');
     await stopSidecars();
+    window.destroy();
+    console.log('[electron] smoke PASS');
     app.exit(0);
     return;
   }

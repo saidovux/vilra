@@ -92,15 +92,20 @@ function resolveRuntimeBuildId(layout, developmentResolver) {
 }
 
 function requiredPackageResources(resourcesRoot) {
+  return requiredPackageResourcesForPlatform(resourcesRoot, process.platform);
+}
+
+function requiredPackageResourcesForPlatform(resourcesRoot, platform) {
+  const extension = platform === 'win32' ? '.exe' : '';
   return [
-    ...SIDECAR_NAMES.map(name => path.join(resourcesRoot, 'bin', name)),
+    ...SIDECAR_NAMES.map(name => path.join(resourcesRoot, 'bin', `${name}${extension}`)),
     ...REQUIRED_STATIC_FILES.map(file => path.join(resourcesRoot, 'static', file)),
     path.join(resourcesRoot, 'build-info.json'),
   ];
 }
 
 function assertPackagedResources(resourcesRoot, platform = process.platform) {
-  for (const resource of requiredPackageResources(resourcesRoot)) {
+  for (const resource of requiredPackageResourcesForPlatform(resourcesRoot, platform)) {
     let stat;
     try {
       stat = fs.statSync(resource);
@@ -126,6 +131,7 @@ module.exports = {
   assertPackagedResources,
   loadBuildInfo,
   requiredPackageResources,
+  requiredPackageResourcesForPlatform,
   resolveRuntimeBuildId,
   resolveRuntimeLayout,
 };

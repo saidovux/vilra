@@ -47,6 +47,17 @@ test('packaged layout uses external resources and resolves relative static overr
   assert.equal(layout.sidecarPath('imgviewer-thumb-worker'), `${resourcesPath}/bin/imgviewer-thumb-worker`);
   assert.equal(layout.buildInfoPath, `${resourcesPath}/build-info.json`);
 
+  const windowsLayout = resolveRuntimeLayout({
+    isPackaged: true,
+    resourcesPath,
+    platform: 'win32',
+    env: {},
+  });
+  assert.equal(
+    windowsLayout.sidecarPath('imgviewer-metadata-worker'),
+    `${resourcesPath}/bin/imgviewer-metadata-worker.exe`,
+  );
+
   const overridden = resolveRuntimeLayout({
     isPackaged: true,
     resourcesPath,
@@ -62,7 +73,7 @@ test('packaged build ID is loaded without invoking the development Git resolver'
   fs.writeFileSync(path.join(root, 'build-info.json'), JSON.stringify({
     gitHead: 'a'.repeat(40),
     buildId: 'aaaaaaaaaaaa',
-    version: '0.2.0',
+    version: '0.2.1',
   }));
   const layout = resolveRuntimeLayout({
     isPackaged: true,
@@ -92,13 +103,40 @@ test('packaged resource validation requires all sidecars, frontend files, and bu
   fs.writeFileSync(path.join(root, 'build-info.json'), JSON.stringify({
     gitHead: 'b'.repeat(40),
     buildId: 'bbbbbbbbbbbb',
-    version: '0.2.0',
+    version: '0.2.1',
   }));
 
   assert.doesNotThrow(() => assertPackagedResources(root, 'linux'));
   fs.rmSync(path.join(root, 'static', 'dist', 'app.js'));
   assert.throws(
     () => assertPackagedResources(root, 'linux'),
+    /Required Electron package resource is missing/,
+  );
+});
+
+test('Windows packaged resource validation requires exe sidecars', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vilra-win-package-resources-'));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  for (const name of SIDECAR_NAMES) {
+    const file = path.join(root, 'bin', `${name}.exe`);
+    fs.mkdirSync(path.dirname(file), {recursive: true});
+    fs.writeFileSync(file, name);
+  }
+  for (const relative of REQUIRED_STATIC_FILES) {
+    const file = path.join(root, 'static', relative);
+    fs.mkdirSync(path.dirname(file), {recursive: true});
+    fs.writeFileSync(file, relative);
+  }
+  fs.writeFileSync(path.join(root, 'build-info.json'), JSON.stringify({
+    gitHead: 'c'.repeat(40),
+    buildId: 'cccccccccccc',
+    version: '0.2.1',
+  }));
+
+  assert.doesNotThrow(() => assertPackagedResources(root, 'win32'));
+  fs.rmSync(path.join(root, 'bin', `${SIDECAR_NAMES[0]}.exe`));
+  assert.throws(
+    () => assertPackagedResources(root, 'win32'),
     /Required Electron package resource is missing/,
   );
 });

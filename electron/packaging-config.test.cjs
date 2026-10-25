@@ -7,7 +7,7 @@ const {DebugLogger} = require('builder-util/out/DebugLogger');
 
 const repoRoot = path.resolve(__dirname, '..');
 
-test('electron-builder configuration is valid, explicit, and AppImage-only', async () => {
+test('electron-builder configuration is valid for Linux AppImage and Windows NSIS', async () => {
   const parsed = await getConfig(repoRoot, 'electron-builder.yml', null);
   await validateConfiguration(parsed, new DebugLogger(false));
   assert.equal(parsed.appId, 'app.tagimage.desktop');
@@ -15,6 +15,9 @@ test('electron-builder configuration is valid, explicit, and AppImage-only', asy
   assert.equal(parsed.asar, true);
   assert.equal(parsed.linux.artifactName, 'Vilra_${version}_amd64.${ext}');
   assert.equal(parsed.linux.syncDesktopName, true);
+  assert.equal(parsed.win.artifactName, 'Vilra_Setup_${version}_x64.${ext}');
+  assert.equal(parsed.nsis.oneClick, false);
+  assert.equal(parsed.nsis.perMachine, false);
 
   const config = fs.readFileSync(path.join(repoRoot, 'electron-builder.yml'), 'utf8');
   for (const expected of [
@@ -33,6 +36,9 @@ test('electron-builder configuration is valid, explicit, and AppImage-only', asy
     'Vilra_${version}_amd64.${ext}',
     'icon: app-icon.png',
     'syncDesktopName: true',
+    'target: nsis',
+    'Vilra_Setup_${version}_x64.${ext}',
+    'oneClick: false',
   ]) {
     assert.ok(config.includes(expected), `missing builder configuration: ${expected}`);
   }
@@ -54,13 +60,47 @@ test('package scripts keep dev runtime and make Electron build self-contained', 
   assert.equal(packageJson.desktopName, 'Vilra');
   assert.equal(packageJson.main, 'electron/main.cjs');
   assert.ok(packageJson.scripts['electron:dev'].includes('electron:prepare'));
-  assert.ok(packageJson.scripts['electron:build'].includes('electron:prepare'));
-  assert.ok(packageJson.scripts['electron:build'].includes('electron:package:prepare'));
-  assert.ok(packageJson.scripts['electron:build'].includes('--linux AppImage --x64'));
+  assert.equal(packageJson.scripts['electron:build'], 'npm run build:linux');
+  assert.ok(packageJson.scripts['build:linux'].includes('electron:prepare'));
+  assert.ok(packageJson.scripts['build:linux'].includes('electron:package:prepare'));
+  assert.ok(packageJson.scripts['build:linux'].includes('--linux AppImage --x64'));
+  assert.ok(packageJson.scripts['build:win'].includes('electron:prepare'));
+  assert.ok(packageJson.scripts['build:win'].includes('electron:package:prepare'));
+  assert.ok(packageJson.scripts['build:win'].includes('--win nsis --x64'));
   assert.equal(packageJson.scripts.dev, 'npm run electron:dev');
-  assert.equal(packageJson.scripts.build, 'npm run electron:build');
+  assert.equal(packageJson.scripts.build, 'npm run build:linux');
   assert.equal(packageJson.scripts.smoke, 'npm run electron:smoke');
   assert.equal(packageJson.scripts.check, 'npm run typecheck && npm run electron:check');
+  assert.equal(
+    packageJson.scripts['build:frontend'],
+    'tsc --noEmit && node scripts/build-frontend.mjs',
+  );
+});
+
+test('packaged smoke loads the renderer bridge before shutting sidecars down', () => {
+  const mainSource = fs.readFileSync(path.join(repoRoot, 'electron', 'main.cjs'), 'utf8');
+  const smokeStart = mainSource.indexOf('if (smokeMode)');
+  const smokeEnd = mainSource.indexOf('await createMainWindow(apiPort);', smokeStart);
+  const smoke = mainSource.slice(smokeStart, smokeEnd);
+
+  assert.match(smoke, /createMainWindow\(apiPort, \{show: false\}\)/);
+  assert.match(smoke, /document\.querySelector\('#gallery-screen'\)/);
+  assert.match(smoke, /window\.vilraDesktop\?\.pickFolder/);
+  assert.ok(smoke.indexOf('renderer smoke PASS') < smoke.indexOf('await stopSidecars()'));
+  assert.ok(smoke.indexOf('await stopSidecars()') < smoke.indexOf('app.exit(0)'));
+  assert.match(mainSource, /process\.env\.VILRA_RELEASE_SMOKE === '1'/);
+});
+
+test('native folder picker and file actions use Electron platform APIs', () => {
+  const mainSource = fs.readFileSync(path.join(repoRoot, 'electron', 'main.cjs'), 'utf8');
+  const actionSource = fs.readFileSync(
+    path.join(repoRoot, 'electron', 'native-file-actions.cjs'),
+    'utf8',
+  );
+  assert.match(mainSource, /properties: \['openDirectory'\]/);
+  assert.match(mainSource, /dialog\.showOpenDialog/);
+  assert.match(actionSource, /shell\.openPath\(absolutePath\)/);
+  assert.match(actionSource, /shell\.showItemInFolder\(absolutePath\)/);
 });
 
 test('Electron removes both application and BrowserWindow menus', () => {

@@ -1,26 +1,13 @@
-# Windows Notes
+# Windows x64 build
 
-Основной пользовательский runtime реализован через Electron.
+Use a native x64 Windows environment with Node.js 22+, npm, the stable MSVC Rust toolchain, and the Visual C++ build tools.
 
-Для отдельного browser development launcher на Windows потребуется PowerShell-обёртка с эквивалентным поведением:
+```powershell
+npm ci
+npm run electron:check
+npm run build:win
+```
 
-- команды: `start`, `stop`, `restart`, `status`;
-- Rust API с live filesystem watcher;
-- Rust thumbnail worker;
-- Rust metadata worker;
-- pid/state файлы (или ProcessId registry в `.run`);
-- отдельные log файлы в `.logs`;
-- поддержка параметров:
-  - `-BuildRust`,
-  - `-RustBinPath <path>`.
+The build produces `dist-electron\Vilra_Setup_0.2.1_x64.exe`. The three Rust sidecars are compiled natively as `.exe` files and packaged with the frontend. Do not use a normal Linux build to cross-compile the Windows release.
 
-## Требования к parity
-
-- Контракты API не отличаются между Linux/Windows.
-- `IMGVIEWER_THUMB_JOB_MODE=queue` включает Rust thumb очередь одинаково.
-- Поведение `/thumb/{id}` (`200`/`202`) и `/api/events` идентично.
-
-## Минимальные зависимости
-
-- PowerShell 7+
-- Rust toolchain (опционально, если нет prebuilt бинарника)
+For development, use `npm run electron:dev`. `run.ps1` remains a browser-only debug helper and is not part of the release package.

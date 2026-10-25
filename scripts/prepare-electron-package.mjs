@@ -22,14 +22,18 @@ const {
   assertPackagedResources,
 } = require('../electron/runtime-layout.cjs');
 
-if (process.platform !== 'linux' || process.arch !== 'x64') {
-  throw new Error('Vilra AppImage packaging currently supports Linux x86_64 only');
-}
-
 const targetTriple = hostTriple();
-if (!targetTriple.includes('linux') || !targetTriple.startsWith('x86_64-')) {
-  throw new Error(`Electron AppImage requires an x86_64 Linux Rust target, got ${targetTriple}`);
+const supportedPlatform = process.platform === 'linux' || process.platform === 'win32';
+if (!supportedPlatform || process.arch !== 'x64') {
+  throw new Error(`Vilra packaging supports Linux x86_64 and Windows x64, got ${process.platform} ${process.arch}`);
 }
+const expectedTarget = process.platform === 'win32'
+  ? targetTriple.startsWith('x86_64-') && targetTriple.includes('windows-msvc')
+  : targetTriple.startsWith('x86_64-') && targetTriple.includes('linux');
+if (!expectedTarget) {
+  throw new Error(`Electron ${process.platform} x64 package cannot use Rust target ${targetTriple}`);
+}
+const binaryExtension = process.platform === 'win32' ? '.exe' : '';
 
 const resourcesRoot = join(repoRoot, 'electron', 'package-resources');
 const binDirectory = join(resourcesRoot, 'bin');
@@ -39,9 +43,9 @@ mkdirSync(binDirectory, {recursive: true});
 
 for (const name of binaryNames) {
   const source = releaseBinaryPath(name, targetTriple);
-  const destination = join(binDirectory, name);
+  const destination = join(binDirectory, `${name}${binaryExtension}`);
   copyFileSync(source, destination);
-  chmodSync(destination, 0o755);
+  if (process.platform !== 'win32') chmodSync(destination, 0o755);
 }
 
 for (const relative of REQUIRED_STATIC_FILES) {

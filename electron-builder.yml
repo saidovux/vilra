@@ -31,3 +31,15 @@ linux:
   icon: app-icon.png
   category: Graphics
   syncDesktopName: true
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: Vilra_Setup_${version}_x64.${ext}
+  icon: app-icon.png
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false

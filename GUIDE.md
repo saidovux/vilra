@@ -4,25 +4,38 @@ Vilra — локальная галерея для просмотра изобр
 
 ## 1. Установка
 
-Требования для desktop-сборки:
+Vilra 0.2.1 распространяется как alpha для Linux x86-64 и Windows x64 через [GitHub Releases](https://github.com/saidovux/vilra/releases).
 
-| Компонент | Версия |
-|---|---|
-| Rust | актуальный stable Rust/Cargo |
-| Node.js | актуальный LTS |
-| Electron/AppImage system libraries | для вашей ОС |
+Linux:
 
-Основной desktop-запуск:
+```bash
+chmod +x Vilra_0.2.1_amd64.AppImage
+./Vilra_0.2.1_amd64.AppImage
+```
+
+Windows: запустите `Vilra_Setup_0.2.1_x64.exe`. Инсталлятор пока не подписан, поэтому SmartScreen может показать предупреждение. Не отключайте системную защиту; сверьте файл с `SHA256SUMS.txt`.
+
+Поддерживаемые форматы: `jpg`, `jpeg`, `png`, `webp`. Для сообщения об ошибке используйте [GitHub Issues](https://github.com/saidovux/vilra/issues) и укажите ОС, версию Vilra и шаги воспроизведения.
+
+Для сборки из исходников нужны Node.js 22+, npm, stable Rust/Cargo и platform build tools. Windows installer собирается на Windows x64 с MSVC Rust toolchain.
+
+Desktop-запуск из исходников:
 
 ```bash
 npm ci
 npm run dev
 ```
 
-Сборка desktop-пакета:
+Сборка Linux AppImage:
 
 ```bash
-npm run build
+npm run build:linux
+```
+
+Сборка Windows NSIS installer на Windows:
+
+```powershell
+npm run build:win
 ```
 
 Electron хранит `tagimage.sqlite` в системном каталоге данных приложения, запускает три Rust sidecar-процесса и останавливает их вместе с окном. Python в desktop runtime не используется.

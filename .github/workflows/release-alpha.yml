@@ -1,0 +1,169 @@
+name: Release alpha packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: Git commit or tag to build
+        required: true
+        default: main
+        type: string
+      publish_release:
+        description: Publish v0.2.1 after both platform validations pass
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux x64 AppImage
+    runs-on: ubuntu-24.04
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+      - id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run electron:check
+      - run: cargo test --manifest-path rust/Cargo.toml --workspace
+      - run: npm run build:linux
+      - name: Verify packaged resources and artifact
+        run: >-
+          npm run release:verify --
+          --platform linux
+          --resources dist-electron/linux-unpacked/resources
+          --artifact dist-electron/Vilra_0.2.1_amd64.AppImage
+          --expected-head "${{ steps.source.outputs.sha }}"
+      - name: Smoke packaged Linux runtime
+        env:
+          XDG_DATA_HOME: ${{ runner.temp }}/vilra-appdata
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          VILRA_RELEASE_SMOKE: "1"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          chmod +x dist-electron/Vilra_0.2.1_amd64.AppImage
+          env -u ELECTRON_RUN_AS_NODE -u ELECTRON_NO_ATTACH_CONSOLE xvfb-run -a dist-electron/Vilra_0.2.1_amd64.AppImage
+          test -f "$XDG_DATA_HOME/app.tagimage.desktop/tagimage.sqlite"
+          ! pgrep -f 'imgviewer-(api-server|thumb-worker|metadata-worker)'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vilra-linux-x64
+          path: dist-electron/Vilra_0.2.1_amd64.AppImage
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64 NSIS
+    runs-on: windows-2025
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+      - id: source
+        shell: pwsh
+        run: '"sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run electron:check
+      - run: cargo check --manifest-path rust/Cargo.toml --workspace
+      - run: npm run build:win
+      - name: Verify packaged resources and artifact
+        shell: pwsh
+        run: >-
+          npm run release:verify --
+          --platform win32
+          --resources dist-electron/win-unpacked/resources
+          --artifact dist-electron/Vilra_Setup_0.2.1_x64.exe
+          --expected-head "${{ steps.source.outputs.sha }}"
+      - name: Smoke packaged Windows runtime and child shutdown
+        shell: pwsh
+        run: |
+          $env:APPDATA = Join-Path $env:RUNNER_TEMP 'vilra-appdata'
+          $env:VILRA_RELEASE_SMOKE = '1'
+          & (Join-Path $PWD 'dist-electron\win-unpacked\Vilra.exe')
+          if ($LASTEXITCODE -ne 0) { throw "Vilra smoke exited with $LASTEXITCODE" }
+          $database = Join-Path $env:APPDATA 'app.tagimage.desktop\tagimage.sqlite'
+          if (-not (Test-Path $database)) { throw "SQLite database was not created at $database" }
+          Start-Sleep -Seconds 1
+          $leftovers = Get-Process -Name imgviewer-api-server,imgviewer-thumb-worker,imgviewer-metadata-worker -ErrorAction SilentlyContinue
+          if ($leftovers) {
+            $leftovers | Format-Table -AutoSize | Out-String | Write-Error
+            throw 'Rust sidecar processes remained after Electron shutdown'
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vilra-windows-x64
+          path: dist-electron/Vilra_Setup_0.2.1_x64.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish verified prerelease
+    if: ${{ inputs.publish_release }}
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+      - name: Confirm both jobs built the same commit
+        env:
+          LINUX_SHA: ${{ needs.linux.outputs.source_sha }}
+          WINDOWS_SHA: ${{ needs.windows.outputs.source_sha }}
+        run: |
+          test "$LINUX_SHA" = "$WINDOWS_SHA"
+          test "$(git rev-parse HEAD)" = "$LINUX_SHA"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vilra-*-x64
+          path: release-assets
+          merge-multiple: true
+      - name: Create checksums and draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.linux.outputs.source_sha }}
+        run: |
+          cd release-assets
+          test -s Vilra_0.2.1_amd64.AppImage
+          test -s Vilra_Setup_0.2.1_x64.exe
+          sha256sum Vilra_0.2.1_amd64.AppImage Vilra_Setup_0.2.1_x64.exe > SHA256SUMS.txt
+          cd ..
+          if gh release view v0.2.1 >/dev/null 2>&1; then
+            test "$(gh release view v0.2.1 --json isDraft --jq .isDraft)" = true
+          else
+            gh release create v0.2.1 --target "$SOURCE_SHA" --title "Vilra v0.2.1 — Alpha" --notes-file docs/releases/v0.2.1-alpha.md --draft --prerelease
+          fi
+          gh release upload v0.2.1 release-assets/Vilra_0.2.1_amd64.AppImage release-assets/Vilra_Setup_0.2.1_x64.exe release-assets/SHA256SUMS.txt --clobber
+      - name: Verify uploaded assets and publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir downloaded
+          gh release download v0.2.1 --dir downloaded
+          cd downloaded
+          test -s Vilra_0.2.1_amd64.AppImage
+          test -s Vilra_Setup_0.2.1_x64.exe
+          sha256sum -c SHA256SUMS.txt
+          cd ..
+          gh release edit v0.2.1 --draft=false --prerelease
+          gh release view v0.2.1 --json url,isDraft,isPrerelease
