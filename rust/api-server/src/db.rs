@@ -15,12 +15,14 @@ use std::{
 use tagimage_db::sqlite::{
     self, clean_sqlite_tag_list, count_sqlite_jobs, count_sqlite_stale_running_jobs,
     create_sqlite_user_tag_entry, delete_sqlite_tag_definition, fetch_sqlite_tags_for_image_ids,
-    folder_sqlite_tree_rows, get_sqlite_file_issue_by_id, get_sqlite_file_issue_for_image,
-    get_sqlite_image_by_id, get_sqlite_image_by_id_including_hidden, get_sqlite_job_api_value,
-    list_sqlite_file_issue_recheck_targets, list_sqlite_jobs, list_sqlite_thumb_rebuild_rows,
-    load_sqlite_session, mutate_sqlite_session_value_with_root, open_sqlite_runtime_db,
-    query_sqlite_file_issues, query_sqlite_images_page, set_sqlite_session_root,
-    sqlite_roots_from_session, summarize_sqlite_file_issues, tag_sqlite_summary_rows,
+    folder_sqlite_tree_rows, get_sqlite_file_issue_by_id_for_roots,
+    get_sqlite_file_issue_for_image, get_sqlite_image_by_id,
+    get_sqlite_image_by_id_including_hidden, get_sqlite_job_api_value,
+    list_sqlite_file_issue_recheck_targets_for_roots, list_sqlite_jobs,
+    list_sqlite_thumb_rebuild_rows, load_sqlite_session, mutate_sqlite_session_value_with_root,
+    open_sqlite_runtime_db, query_sqlite_file_issues_for_roots, query_sqlite_images_page,
+    remove_sqlite_session_root, set_sqlite_session_root, sqlite_roots_from_session,
+    summarize_sqlite_file_issues_for_roots, tag_sqlite_summary_rows_for_roots,
     update_sqlite_tag_definition, SqliteAutoTagCleanupResult, SqliteFileIssue,
     SqliteFileIssueRecheckTarget, SqliteImageRecord, SqliteImagesQuery, SqliteSession,
     SqliteSessionMutation,
@@ -33,6 +35,7 @@ pub struct AppState {
     pub live: LiveIndexer,
     pub events: Arc<EventHub>,
     pub problems_recheck_running: Arc<AtomicBool>,
+    pub root_change_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +114,7 @@ impl AppState {
             live,
             events,
             problems_recheck_running: Arc::new(AtomicBool::new(false)),
+            root_change_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -215,7 +219,8 @@ pub fn file_issue_api_value(issue: &SqliteFileIssue) -> Value {
 }
 
 pub fn problems_summary(conn: &Connection) -> Result<Value, ApiError> {
-    let summary = summarize_sqlite_file_issues(conn).map_err(map_db_error)?;
+    let roots = roots_from_session(&load_session(conn)?);
+    let summary = summarize_sqlite_file_issues_for_roots(conn, &roots).map_err(map_db_error)?;
     Ok(json!({
         "total": summary.total,
         "errors": summary.errors,
@@ -231,8 +236,9 @@ pub fn problems_page(
     limit: i64,
     offset: i64,
 ) -> Result<Value, ApiError> {
-    let page =
-        query_sqlite_file_issues(conn, severity, search, limit, offset).map_err(map_db_error)?;
+    let roots = roots_from_session(&load_session(conn)?);
+    let page = query_sqlite_file_issues_for_roots(conn, &roots, severity, search, limit, offset)
+        .map_err(map_db_error)?;
     Ok(json!({
         "items": page.items.iter().map(file_issue_api_value).collect::<Vec<_>>(),
         "page": {
@@ -245,13 +251,15 @@ pub fn problems_page(
 }
 
 pub fn get_problem(conn: &Connection, issue_id: i64) -> Result<Option<SqliteFileIssue>, ApiError> {
-    get_sqlite_file_issue_by_id(conn, issue_id).map_err(map_db_error)
+    let roots = roots_from_session(&load_session(conn)?);
+    get_sqlite_file_issue_by_id_for_roots(conn, issue_id, &roots).map_err(map_db_error)
 }
 
 pub fn problem_recheck_targets(
     conn: &Connection,
 ) -> Result<Vec<SqliteFileIssueRecheckTarget>, ApiError> {
-    list_sqlite_file_issue_recheck_targets(conn).map_err(map_db_error)
+    let roots = roots_from_session(&load_session(conn)?);
+    list_sqlite_file_issue_recheck_targets_for_roots(conn, &roots).map_err(map_db_error)
 }
 
 fn session_from_sqlite(session: SqliteSession) -> Session {
@@ -293,6 +301,15 @@ pub fn set_root(conn: &Connection, path: &str, append: bool) -> Result<Session, 
         .map_err(map_db_error)
 }
 
+pub fn remove_root(conn: &Connection, path: &str) -> Result<SessionMutation, ApiError> {
+    remove_sqlite_session_root(conn, path)
+        .map(|SqliteSessionMutation { before, after }| SessionMutation {
+            before: session_from_sqlite(before),
+            after: session_from_sqlite(after),
+        })
+        .map_err(map_db_error)
+}
+
 pub fn roots_from_session(session: &Session) -> Vec<String> {
     sqlite_roots_from_session(&SqliteSession {
         root_path: session.root_path.clone(),
@@ -316,14 +333,12 @@ pub fn require_roots(session: &Session) -> Result<Vec<String>, ApiError> {
 }
 
 pub fn active_root(session: &Session) -> Option<String> {
-    roots_from_session(session)
-        .last()
-        .cloned()
-        .or_else(|| session.root_path.clone())
+    roots_from_session(session).last().cloned()
 }
 
 pub fn tag_summary_rows(conn: &Connection) -> Result<Vec<Value>, ApiError> {
-    tag_sqlite_summary_rows(conn).map_err(map_db_error)
+    let roots = roots_from_session(&load_session(conn)?);
+    tag_sqlite_summary_rows_for_roots(conn, &roots).map_err(map_db_error)
 }
 
 #[allow(dead_code)]
@@ -357,8 +372,10 @@ pub fn get_image_record(
     conn: &Connection,
     image_id: &str,
 ) -> Result<Option<ImageRecord>, ApiError> {
+    let roots = roots_from_session(&load_session(conn)?);
     Ok(get_sqlite_image_by_id(conn, image_id)
         .map_err(map_db_error)?
+        .filter(|row| roots.iter().any(|root| root == &row.root_path))
         .map(image_record_from_sqlite))
 }
 
@@ -366,9 +383,10 @@ pub fn get_image_record_for_delivery(
     conn: &Connection,
     image_id: &str,
 ) -> Result<Option<ImageRecord>, ApiError> {
+    let roots = roots_from_session(&load_session(conn)?);
     Ok(get_sqlite_image_by_id_including_hidden(conn, image_id)
         .map_err(map_db_error)?
-        .filter(|row| !row.hidden)
+        .filter(|row| !row.hidden && roots.iter().any(|root| root == &row.root_path))
         .map(image_record_from_sqlite))
 }
 
@@ -637,7 +655,7 @@ pub fn status_payload(state: &AppState, conn: &Connection) -> Result<Value, ApiE
     );
 
     Ok(json!({
-        "ready": root.is_some() && !syncing && sync_error.is_none(),
+        "ready": health["db_ready"].as_bool().unwrap_or(false) && !syncing && sync_error.is_none(),
         "root": root,
         "root_paths": roots,
         "running": syncing,

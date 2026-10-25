@@ -419,6 +419,46 @@ pub fn summarize_sqlite_file_issues(conn: &Connection) -> Result<SqliteFileIssue
     .map_err(|e| format!("summarize sqlite file issues: {e}"))
 }
 
+pub fn summarize_sqlite_file_issues_for_roots(
+    conn: &Connection,
+    roots: &[String],
+) -> Result<SqliteFileIssueSummary, String> {
+    if roots.is_empty() {
+        return Ok(SqliteFileIssueSummary {
+            total: 0,
+            errors: 0,
+            warnings: 0,
+            latest_updated_at: None,
+        });
+    }
+    let root_sql = placeholders(roots.len());
+    let params = roots
+        .iter()
+        .cloned()
+        .map(SqlValue::Text)
+        .collect::<Vec<_>>();
+    let sql = format!(
+        r#"
+        SELECT
+            count(*) AS total,
+            count(*) FILTER (WHERE severity = 'error') AS errors,
+            count(*) FILTER (WHERE severity = 'warning') AS warnings,
+            max(updated_at) AS latest_updated_at
+        FROM file_issues
+        WHERE root_path IN ({root_sql})
+        "#
+    );
+    conn.query_row(&sql, params_from_iter(params.iter()), |row| {
+        Ok(SqliteFileIssueSummary {
+            total: row.get("total")?,
+            errors: row.get("errors")?,
+            warnings: row.get("warnings")?,
+            latest_updated_at: row.get("latest_updated_at")?,
+        })
+    })
+    .map_err(|e| format!("summarize active sqlite file issues: {e}"))
+}
+
 pub fn query_sqlite_file_issues(
     conn: &Connection,
     severity: &str,
@@ -501,6 +541,119 @@ pub fn query_sqlite_file_issues(
     })
 }
 
+pub fn query_sqlite_file_issues_for_roots(
+    conn: &Connection,
+    roots: &[String],
+    severity: &str,
+    search: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<SqliteFileIssuePage, String> {
+    if roots.is_empty() {
+        return Ok(SqliteFileIssuePage {
+            items: Vec::new(),
+            total: 0,
+            limit,
+            offset,
+        });
+    }
+    let root_sql = placeholders(roots.len());
+    let root_params = roots
+        .iter()
+        .cloned()
+        .map(SqlValue::Text)
+        .collect::<Vec<_>>();
+    let mut params = root_params.clone();
+    params.push(SqlValue::Text(severity.to_string()));
+    let severity_index = params.len();
+    if search.is_empty() {
+        let count_sql = format!(
+            "SELECT count(*) FROM file_issues WHERE root_path IN ({root_sql}) AND (?{severity_index} = 'all' OR severity = ?{severity_index})"
+        );
+        let total = conn
+            .query_row(&count_sql, params_from_iter(params.iter()), |row| {
+                row.get(0)
+            })
+            .map_err(|e| format!("count active sqlite file issues: {e}"))?;
+        let limit_index = params.len() + 1;
+        params.push(SqlValue::Integer(limit));
+        let offset_index = params.len() + 1;
+        params.push(SqlValue::Integer(offset));
+        let sql = format!(
+            r#"
+            SELECT *
+            FROM file_issues
+            WHERE root_path IN ({root_sql})
+              AND (?{severity_index} = 'all' OR severity = ?{severity_index})
+            ORDER BY CASE severity WHEN 'error' THEN 0 ELSE 1 END,
+                     lower(path), path, id
+            LIMIT ?{limit_index} OFFSET ?{offset_index}
+            "#
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("prepare active sqlite file issue page: {e}"))?;
+        let rows = stmt
+            .query_map(
+                params_from_iter(params.iter()),
+                raw_sqlite_file_issue_from_row,
+            )
+            .map_err(|e| format!("query active sqlite file issue page: {e}"))?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(SqliteFileIssue::try_from(row.map_err(|e| {
+                format!("read active sqlite file issue page: {e}")
+            })?)?);
+        }
+        return Ok(SqliteFileIssuePage {
+            items,
+            total,
+            limit,
+            offset,
+        });
+    }
+
+    let sql = format!(
+        "SELECT * FROM file_issues WHERE root_path IN ({root_sql}) AND (?{severity_index} = 'all' OR severity = ?{severity_index})"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("prepare active sqlite Unicode file issue search: {e}"))?;
+    let rows = stmt
+        .query_map(
+            params_from_iter(params.iter()),
+            raw_sqlite_file_issue_from_row,
+        )
+        .map_err(|e| format!("query active sqlite Unicode file issue search: {e}"))?;
+    let search_key = unicode_search_key(search);
+    let mut matches = Vec::new();
+    for row in rows {
+        let issue = SqliteFileIssue::try_from(
+            row.map_err(|e| format!("read active sqlite Unicode file issue search: {e}"))?,
+        )?;
+        if unicode_search_key(&issue.path).contains(&search_key) {
+            matches.push(issue);
+        }
+    }
+    matches.sort_by(|left, right| {
+        file_issue_severity_rank(left.severity)
+            .cmp(&file_issue_severity_rank(right.severity))
+            .then_with(|| unicode_search_key(&left.path).cmp(&unicode_search_key(&right.path)))
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let total = matches.len() as i64;
+    let start = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
+    let take = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+    let items = matches.into_iter().skip(start).take(take).collect();
+    Ok(SqliteFileIssuePage {
+        items,
+        total,
+        limit,
+        offset,
+    })
+}
+
 fn unicode_search_key(value: &str) -> String {
     UniCase::new(value).to_folded_case()
 }
@@ -529,6 +682,66 @@ pub fn list_sqlite_file_issue_recheck_targets(
         .map_err(|e| format!("query sqlite file issue recheck targets: {e}"))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("read sqlite file issue recheck targets: {e}"))
+}
+
+pub fn list_sqlite_file_issue_recheck_targets_for_roots(
+    conn: &Connection,
+    roots: &[String],
+) -> Result<Vec<SqliteFileIssueRecheckTarget>, String> {
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root_sql = placeholders(roots.len());
+    let params = roots
+        .iter()
+        .cloned()
+        .map(SqlValue::Text)
+        .collect::<Vec<_>>();
+    let sql = format!(
+        "SELECT id, root_path, path FROM file_issues WHERE root_path IN ({root_sql}) ORDER BY id"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("prepare active sqlite file issue recheck targets: {e}"))?;
+    let rows = stmt
+        .query_map(params_from_iter(params.iter()), |row| {
+            Ok(SqliteFileIssueRecheckTarget {
+                id: row.get(0)?,
+                root_path: row.get(1)?,
+                path: row.get(2)?,
+            })
+        })
+        .map_err(|e| format!("query active sqlite file issue recheck targets: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read active sqlite file issue recheck targets: {e}"))
+}
+
+pub fn get_sqlite_file_issue_by_id_for_roots(
+    conn: &Connection,
+    issue_id: i64,
+    roots: &[String],
+) -> Result<Option<SqliteFileIssue>, String> {
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    let mut params = vec![SqlValue::Integer(issue_id)];
+    params.extend(roots.iter().cloned().map(SqlValue::Text));
+    let sql = format!(
+        "SELECT * FROM file_issues WHERE id = ?1 AND root_path IN ({root_sql})",
+        root_sql = (2..=roots.len() + 1)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let issue = conn
+        .query_row(
+            &sql,
+            params_from_iter(params.iter()),
+            raw_sqlite_file_issue_from_row,
+        )
+        .optional()
+        .map_err(|e| format!("get active sqlite file issue {issue_id}: {e}"))?;
+    issue.map(SqliteFileIssue::try_from).transpose()
 }
 
 pub fn get_sqlite_file_issue_for_image(
@@ -1375,9 +1588,6 @@ pub fn query_sqlite_images_page(
     roots: &[String],
     query: SqliteImagesQuery,
 ) -> Result<JsonValue, String> {
-    if roots.is_empty() {
-        return Err("No folder set".to_string());
-    }
     let limit = query
         .limit
         .unwrap_or(DEFAULT_PAGE_LIMIT)
@@ -1388,6 +1598,21 @@ pub fn query_sqlite_images_page(
             "Unsupported sort. Allowed: {}",
             IMAGE_SORTS.join(", ")
         ));
+    }
+    if roots.is_empty() {
+        return Ok(json!({
+            "rows": [],
+            "items": [],
+            "page": {
+                "next_cursor": null,
+                "has_more": false,
+                "limit": limit,
+                "returned": 0,
+                "total": if query.include_total { Some(0_i64) } else { None },
+                "include_total": query.include_total,
+                "sort": sort_mode,
+            }
+        }));
     }
 
     let include_source = query.include_tags.as_deref().or(query.tags.as_deref());
@@ -1592,6 +1817,32 @@ pub fn parse_csv_sqlite_tags(raw: Option<&str>) -> Vec<String> {
 }
 
 pub fn tag_sqlite_summary_rows(conn: &Connection) -> Result<Vec<JsonValue>, String> {
+    tag_sqlite_summary_rows_impl(conn, None)
+}
+
+pub fn tag_sqlite_summary_rows_for_roots(
+    conn: &Connection,
+    roots: &[String],
+) -> Result<Vec<JsonValue>, String> {
+    tag_sqlite_summary_rows_impl(conn, Some(roots))
+}
+
+fn tag_sqlite_summary_rows_impl(
+    conn: &Connection,
+    roots: Option<&[String]>,
+) -> Result<Vec<JsonValue>, String> {
+    let (root_filter, params) = match roots {
+        None => (String::new(), Vec::new()),
+        Some([]) => (" AND 0".to_string(), Vec::new()),
+        Some(roots) => (
+            format!(" AND i.root_path IN ({})", placeholders(roots.len())),
+            roots
+                .iter()
+                .cloned()
+                .map(SqlValue::Text)
+                .collect::<Vec<_>>(),
+        ),
+    };
     let sql = format!(
         r#"
             SELECT
@@ -1605,7 +1856,7 @@ pub fn tag_sqlite_summary_rows(conn: &Connection) -> Result<Vec<JsonValue>, Stri
                 COUNT(DISTINCT CASE WHEN i.id IS NOT NULL AND it.kind = 'user' THEN it.image_id END) AS user_count
             FROM tags t
             LEFT JOIN image_tags it ON it.tag_id = t.id
-            LEFT JOIN images i ON i.id = it.image_id AND {ACTIVE_IMAGE_PREDICATE}
+            LEFT JOIN images i ON i.id = it.image_id AND {ACTIVE_IMAGE_PREDICATE}{root_filter}
             GROUP BY t.id
             HAVING t.user_defined = 1 OR COUNT(DISTINCT i.id) > 0
             ORDER BY lower(t.name), t.name
@@ -1615,7 +1866,7 @@ pub fn tag_sqlite_summary_rows(conn: &Connection) -> Result<Vec<JsonValue>, Stri
         .prepare(&sql)
         .map_err(|e| format!("prepare sqlite tag summary: {e}"))?;
     let rows = stmt
-        .query_map([], |row| {
+        .query_map(params_from_iter(params.iter()), |row| {
             let auto_count = row.get::<_, i64>("auto_count")?;
             let user_count = row.get::<_, i64>("user_count")?;
             let user_defined = row.get::<_, i64>("user_defined")? != 0;
@@ -2255,6 +2506,32 @@ pub fn set_sqlite_session_root(
     append: bool,
 ) -> Result<SqliteSession, String> {
     Ok(mutate_sqlite_session_value_with_root(conn, &json!({}), Some(path), append)?.after)
+}
+
+pub fn remove_sqlite_session_root(
+    conn: &Connection,
+    root: &str,
+) -> Result<SqliteSessionMutation, String> {
+    mutate_sqlite_session(conn, |session| {
+        let roots = sqlite_roots_from_session(session);
+        if !roots.iter().any(|candidate| candidate == root) {
+            return Err(format!("Library is not connected: {root}"));
+        }
+        session.root_paths = roots
+            .into_iter()
+            .filter(|candidate| candidate != root)
+            .collect();
+        session.root_path = match session.root_path.as_deref() {
+            Some(active)
+                if active != root && session.root_paths.iter().any(|item| item == active) =>
+            {
+                Some(active.to_string())
+            }
+            _ => session.root_paths.last().cloned(),
+        };
+        session.last_image_id = None;
+        Ok(())
+    })
 }
 
 pub fn sqlite_roots_from_session(session: &SqliteSession) -> Vec<String> {
@@ -5159,6 +5436,108 @@ mod tests {
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn removing_session_roots_is_exact_atomic_and_preserves_index_history() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let root_a = tempfile::tempdir().expect("root a");
+        let root_b = tempfile::tempdir().expect("root b");
+        let canonical_a =
+            canonicalize_sqlite_session_root(root_a.path()).expect("canonical root a");
+        let canonical_b =
+            canonicalize_sqlite_session_root(root_b.path()).expect("canonical root b");
+        set_sqlite_session_root(&conn, root_a.path(), true).expect("connect root a");
+        set_sqlite_session_root(&conn, root_b.path(), true).expect("connect root b");
+        upsert_fixture(&conn, "image-a", &canonical_a, "a.jpg", 10, 10);
+        upsert_fixture(&conn, "image-b", &canonical_b, "b.jpg", 20, 20);
+        replace_sqlite_image_tags(&conn, "image-a", &["Keep me".to_string()], "user")
+            .expect("user tag");
+        replace_sqlite_image_tags(&conn, "image-a", &["Folder A".to_string()], "auto")
+            .expect("auto tag");
+        conn.execute(
+            r#"
+            INSERT INTO file_issues (
+                root_path, path, severity, kind, size, mtime_ns
+            ) VALUES (?1, 'broken-a.jpg', 'error', 'decode_error', 1, 1),
+                     (?2, 'broken-b.jpg', 'warning', 'format_mismatch', 1, 1)
+            "#,
+            params![canonical_a, canonical_b],
+        )
+        .expect("seed issues");
+
+        let removed = remove_sqlite_session_root(&conn, &canonical_a).expect("remove root a");
+        assert_eq!(removed.after.root_paths, vec![canonical_b.clone()]);
+        assert_eq!(
+            removed.after.root_path.as_deref(),
+            Some(canonical_b.as_str())
+        );
+        assert!(get_sqlite_image_by_id_including_hidden(&conn, "image-a")
+            .expect("preserved image")
+            .is_some());
+        assert_eq!(
+            list_sqlite_tags_for_image(&conn, "image-a").expect("preserved tags"),
+            (vec!["Folder A".to_string()], vec!["Keep me".to_string()])
+        );
+
+        let active_tags = tag_sqlite_summary_rows_for_roots(&conn, &removed.after.root_paths)
+            .expect("active tags");
+        let keep = active_tags
+            .iter()
+            .find(|tag| tag["normalized"] == "keep me")
+            .expect("manual tag definition remains");
+        assert_eq!(keep["image_count"], 0);
+        assert!(!active_tags
+            .iter()
+            .any(|tag| tag["normalized"] == "folder a"));
+        let issues = summarize_sqlite_file_issues_for_roots(&conn, &removed.after.root_paths)
+            .expect("active issue summary");
+        assert_eq!(issues.total, 1);
+        assert_eq!(issues.errors, 0);
+        assert_eq!(issues.warnings, 1);
+
+        let before_unknown = load_sqlite_session(&conn).expect("before unknown");
+        assert!(remove_sqlite_session_root(&conn, "/not/a/connected/root").is_err());
+        assert_eq!(
+            load_sqlite_session(&conn).expect("after unknown"),
+            before_unknown
+        );
+
+        let empty = remove_sqlite_session_root(&conn, &canonical_b).expect("remove last root");
+        assert!(empty.after.root_paths.is_empty());
+        assert_eq!(empty.after.root_path, None);
+        let page = query_sqlite_images_page(
+            &conn,
+            &[],
+            SqliteImagesQuery {
+                include_total: true,
+                ..SqliteImagesQuery::default()
+            },
+        )
+        .expect("empty gallery page");
+        assert_eq!(page["items"], json!([]));
+        assert_eq!(page["page"]["total"], 0);
+
+        drop(conn);
+        let conn = open_sqlite_runtime_db(&db_path).expect("reopen after removing last root");
+        let persisted = load_sqlite_session(&conn).expect("persisted empty session");
+        assert!(persisted.root_paths.is_empty());
+        assert_eq!(persisted.root_path, None);
+
+        let restored = set_sqlite_session_root(&conn, root_a.path(), true).expect("reconnect a");
+        assert_eq!(restored.root_paths, vec![canonical_a]);
+        assert_eq!(
+            get_sqlite_image_by_root_path_including_hidden(&conn, &restored.root_paths[0], "a.jpg")
+                .expect("restored image")
+                .expect("existing row")
+                .id,
+            "image-a"
+        );
+        assert_eq!(
+            list_sqlite_tags_for_image(&conn, "image-a").expect("restored tags"),
+            (vec!["Folder A".to_string()], vec!["Keep me".to_string()])
         );
     }
 

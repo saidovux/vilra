@@ -165,6 +165,10 @@ enum LiveCommand {
         root: PathBuf,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
+    RemoveRoot {
+        root: PathBuf,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
     ReconcileRoot(PathBuf),
     #[cfg_attr(not(test), allow(dead_code))]
     RecheckPath {
@@ -245,6 +249,10 @@ impl LiveIndexer {
                                 processor.reconcile_or_set_offline(&root);
                             }
                         }
+                        LiveCommand::RemoveRoot { root, reply } => {
+                            let result = processor.remove_root(&mut debouncer, &root);
+                            let _ = reply.send(result);
+                        }
                         LiveCommand::ReconcileRoot(root) => {
                             if processor.roots.contains(&root) {
                                 processor.reconcile_or_set_offline(&root);
@@ -281,6 +289,20 @@ impl LiveIndexer {
         response
             .recv()
             .map_err(|_| "filesystem event processor stopped while adding root".to_string())?
+    }
+
+    pub fn remove_root(&self, root: &Path) -> Result<(), String> {
+        let (reply, response) = mpsc::sync_channel(0);
+        self.inner
+            .commands
+            .send(LiveCommand::RemoveRoot {
+                root: root.to_path_buf(),
+                reply,
+            })
+            .map_err(|_| "filesystem event processor is not running".to_string())?;
+        response
+            .recv()
+            .map_err(|_| "filesystem event processor stopped while removing root".to_string())?
     }
 
     pub fn request_reconcile(&self, root: PathBuf) -> Result<(), String> {
@@ -362,6 +384,63 @@ impl Processor {
         self.roots.insert(root.clone());
         self.set_online(&root);
         Ok(true)
+    }
+
+    fn remove_root<W, C>(
+        &mut self,
+        debouncer: &mut notify_debouncer_full::Debouncer<W, C>,
+        root: &Path,
+    ) -> Result<(), String>
+    where
+        W: notify::Watcher,
+        C: notify_debouncer_full::FileIdCache,
+    {
+        if self.roots.remove(root) {
+            if let Err(error) = debouncer.unwatch(root) {
+                if root.exists() && !ignorable_unwatch_error(&error, root) {
+                    self.roots.insert(root.to_path_buf());
+                    return Err(format!("stop watching {}: {error}", root.display()));
+                }
+                eprintln!(
+                    "[live-index] ignored stale unwatch entry for {}: {error}",
+                    root.display()
+                );
+            }
+            let mut overlapping = self
+                .roots
+                .iter()
+                .filter(|candidate| candidate.starts_with(root) || root.starts_with(candidate))
+                .cloned()
+                .collect::<Vec<_>>();
+            overlapping.sort_by_key(|candidate| candidate.components().count());
+            for candidate in overlapping {
+                let _ = debouncer.unwatch(&candidate);
+                if let Err(error) = debouncer.watch(&candidate, RecursiveMode::Recursive) {
+                    self.roots.insert(root.to_path_buf());
+                    let mut restore = self.roots.iter().cloned().collect::<Vec<_>>();
+                    restore.sort_by_key(|item| item.components().count());
+                    for item in &restore {
+                        let _ = debouncer.unwatch(item);
+                    }
+                    for item in &restore {
+                        if let Err(restore_error) = debouncer.watch(item, RecursiveMode::Recursive)
+                        {
+                            eprintln!(
+                                "[live-index] watcher compensation failed for {}: {restore_error}",
+                                item.display()
+                            );
+                        }
+                    }
+                    return Err(format!(
+                        "restore watcher {} after removing {}: {error}",
+                        candidate.display(),
+                        root.display()
+                    ));
+                }
+            }
+        }
+        lock(&self.statuses).remove(root);
+        Ok(())
     }
 
     fn handle_filesystem_result(&mut self, result: DebounceEventResult) {
@@ -1071,6 +1150,20 @@ impl Processor {
     }
 }
 
+fn ignorable_unwatch_error(error: &notify::Error, root: &Path) -> bool {
+    let paths_belong_to_root = error.paths.is_empty()
+        || error
+            .paths
+            .iter()
+            .all(|path| path == root || path.starts_with(root));
+    paths_belong_to_root
+        && match &error.kind {
+            notify::ErrorKind::WatchNotFound | notify::ErrorKind::PathNotFound => true,
+            notify::ErrorKind::Io(io_error) => io_error.kind() == std::io::ErrorKind::InvalidInput,
+            _ => false,
+        }
+}
+
 fn should_reuse_known_issue(issue: &SqliteFileIssue, fingerprint: &FileFingerprint) -> bool {
     issue.kind.is_fingerprint_cacheable()
         && issue.size == fingerprint.size
@@ -1598,6 +1691,130 @@ mod tests {
         .unwrap()
         .is_some_and(|row| row.id == image.id && !row.hidden));
         drop(indexer);
+    }
+
+    #[test]
+    fn removing_parent_root_keeps_nested_watcher_and_allows_reconnect() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("library");
+        let nested = parent.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let db_path = dir.path().join("vilra.sqlite");
+        drop(init_sqlite_db(&db_path).unwrap());
+        let hub = EventHub::new();
+        let mut events = hub.subscribe();
+        let indexer =
+            LiveIndexer::start(db_path.clone(), hub, vec![parent.clone(), nested.clone()]).unwrap();
+        for _ in 0..2 {
+            wait_for_event(
+                "initial nested-root sync",
+                &mut events,
+                Duration::from_secs(5),
+                |event| event.kind == "sync_finished",
+            );
+        }
+
+        indexer.remove_root(&parent).expect("disconnect parent");
+        assert_eq!(
+            indexer
+                .status()
+                .into_iter()
+                .map(|status| status.root_path)
+                .collect::<Vec<_>>(),
+            vec![root_string(&nested)]
+        );
+
+        let ignored = parent.join("parent-only.png");
+        let retained = nested.join("retained.png");
+        write_image(&ignored, [1, 2, 3]);
+        write_image(&retained, [4, 5, 6]);
+        wait_for(
+            "nested watcher remains active",
+            Duration::from_secs(5),
+            || {
+                let conn = open_sqlite_runtime_db(&db_path).unwrap();
+                get_sqlite_image_by_root_path_including_hidden(
+                    &conn,
+                    &root_string(&nested),
+                    "retained.png",
+                )
+                .unwrap()
+                .is_some_and(|image| !image.hidden)
+            },
+        );
+        let conn = open_sqlite_runtime_db(&db_path).unwrap();
+        assert!(get_sqlite_image_by_root_path_including_hidden(
+            &conn,
+            &root_string(&parent),
+            "parent-only.png"
+        )
+        .unwrap()
+        .is_none());
+        drop(conn);
+
+        indexer.add_root(parent.clone()).expect("reconnect parent");
+        wait_for(
+            "reconnected parent reconciles",
+            Duration::from_secs(5),
+            || {
+                let conn = open_sqlite_runtime_db(&db_path).unwrap();
+                get_sqlite_image_by_root_path_including_hidden(
+                    &conn,
+                    &root_string(&parent),
+                    "parent-only.png",
+                )
+                .unwrap()
+                .is_some_and(|image| !image.hidden)
+            },
+        );
+        drop(indexer);
+    }
+
+    #[test]
+    fn removing_offline_registered_root_does_not_require_a_watcher() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("offline-library");
+        let db_path = dir.path().join("vilra.sqlite");
+        drop(init_sqlite_db(&db_path).unwrap());
+        let indexer = LiveIndexer::start(db_path, EventHub::new(), vec![root.clone()]).unwrap();
+        wait_for("offline status", Duration::from_secs(5), || {
+            indexer
+                .status()
+                .iter()
+                .any(|status| status.root_path == root_string(&root) && !status.online)
+        });
+        indexer.remove_root(&root).expect("disconnect offline root");
+        assert!(indexer.status().is_empty());
+    }
+
+    #[test]
+    fn removing_root_tolerates_stale_recursive_watch_entries() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("library");
+        let removed_directory = root.join("vanishing");
+        fs::create_dir_all(&removed_directory).unwrap();
+        let db_path = dir.path().join("vilra.sqlite");
+        drop(init_sqlite_db(&db_path).unwrap());
+        let hub = EventHub::new();
+        let mut events = hub.subscribe();
+        let indexer = LiveIndexer::start(db_path, hub, vec![root.clone()]).unwrap();
+        wait_for_event(
+            "initial stale-watch sync",
+            &mut events,
+            Duration::from_secs(5),
+            |event| event.kind == "sync_finished",
+        );
+        fs::remove_dir(&removed_directory).unwrap();
+        wait_for_event(
+            "directory removal",
+            &mut events,
+            Duration::from_secs(5),
+            |event| event.kind == "directory_removed",
+        );
+        indexer
+            .remove_root(&root)
+            .expect("disconnect root with stale recursive entry");
+        assert!(indexer.status().is_empty());
     }
 
     #[test]

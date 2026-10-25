@@ -94,6 +94,11 @@ pub struct EventsRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct DisconnectFolderRequest {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ProblemsRequest {
     severity: Option<String>,
     search: Option<String>,
@@ -312,7 +317,7 @@ pub async fn list_images(
     let started = Instant::now();
     let client = state.connect()?;
     let session = db::load_session(&client)?;
-    let roots = require_roots(&session)?;
+    let roots = roots_from_session(&session);
     let page = db::query_images_page(
         &client,
         &roots,
@@ -489,28 +494,18 @@ pub async fn patch_session(
     let Some(object) = payload.as_object() else {
         return Err(ApiError::bad_request("Request body must be an object"));
     };
-    let root_path = object
-        .get("root_path")
-        .and_then(Value::as_str)
-        .filter(|root| !root.is_empty())
-        .map(PathBuf::from);
+    let mut session_fields = object.clone();
+    session_fields.remove("root_path");
+    session_fields.remove("root_paths");
+    let payload = Value::Object(session_fields);
     let db_state = state.clone();
-    let db_root_path = root_path.clone();
     let mutation = tokio::task::spawn_blocking(move || {
         let client = db_state.connect()?;
-        db::mutate_session_value(&client, &payload, db_root_path.as_deref(), true)
+        db::mutate_session_value(&client, &payload, None, true)
     })
     .await
     .map_err(|error| ApiError::internal(format!("Patch session task failed: {error}")))??;
     let session = mutation.after;
-    if root_path.is_some() {
-        if let Some(root) = session.root_path.as_deref() {
-            state
-                .live
-                .add_root(PathBuf::from(root))
-                .map_err(ApiError::internal)?;
-        }
-    }
     if session.folder_tag_sync != mutation.before.folder_tag_sync {
         state.events.publish(
             "settings_changed",
@@ -538,18 +533,85 @@ pub async fn set_folder(
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::bad_request("Not a directory: "))?;
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|_| ApiError::bad_request(format!("Not a directory: {path}")))?;
+    if !canonical.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "Not a directory: {}",
+            canonical.display()
+        )));
+    }
+    let canonical_string = canonical.to_string_lossy().into_owned();
+    let _root_guard = state.root_change_lock.lock().await;
     let client = state.connect()?;
-    let session = set_root(&client, path, true)?;
-    let root = active_root(&session).ok_or_else(|| ApiError::bad_request("No folder set"))?;
+    let before = db::load_session(&client)?;
+    let was_connected = roots_from_session(&before)
+        .iter()
+        .any(|root| root == &canonical_string);
     state
         .live
-        .add_root(PathBuf::from(&root))
+        .add_root(canonical.clone())
         .map_err(ApiError::internal)?;
+    let session = match set_root(&client, &canonical_string, true) {
+        Ok(session) => session,
+        Err(error) => {
+            if !was_connected {
+                let _ = state.live.remove_root(&canonical);
+            }
+            return Err(error);
+        }
+    };
+    let root = active_root(&session).ok_or_else(|| ApiError::bad_request("No folder set"))?;
     Ok(json_response(json!({
         "ok": true,
         "root": root,
         "root_paths": roots_from_session(&session),
         "job_id": null,
+    })))
+}
+
+pub async fn disconnect_folder(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<DisconnectFolderRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let root = payload.path.trim();
+    if root.is_empty() {
+        return Err(ApiError::bad_request("Library path is empty"));
+    }
+    let _root_guard = state.root_change_lock.lock().await;
+    let client = state.connect()?;
+    let session = db::load_session(&client)?;
+    if !roots_from_session(&session)
+        .iter()
+        .any(|candidate| candidate == root)
+    {
+        return Err(ApiError::bad_request(format!(
+            "Library is not connected: {root}"
+        )));
+    }
+
+    state
+        .live
+        .remove_root(std::path::Path::new(root))
+        .map_err(ApiError::internal)?;
+    let mutation = match db::remove_root(&client, root) {
+        Ok(mutation) => mutation,
+        Err(error) => {
+            let _ = state.live.add_root(PathBuf::from(root));
+            return Err(error);
+        }
+    };
+    let roots = roots_from_session(&mutation.after);
+    let active = active_root(&mutation.after);
+    state.events.publish(
+        "library_disconnected",
+        json!({"removed": root, "root": active, "root_paths": roots}),
+    );
+    Ok(json_response(json!({
+        "ok": true,
+        "removed": root,
+        "root": active,
+        "root_paths": roots,
     })))
 }
 
@@ -952,6 +1014,16 @@ mod tests {
         db_path: PathBuf,
         roots: Vec<PathBuf>,
     ) -> Arc<AppState> {
+        let conn = tagimage_db::sqlite::open_sqlite_runtime_db(&db_path).unwrap();
+        let session_roots = if roots.is_empty() {
+            vec![repo_root.to_path_buf()]
+        } else {
+            roots.clone()
+        };
+        for root in &session_roots {
+            tagimage_db::sqlite::set_sqlite_session_root(&conn, root, true).unwrap();
+        }
+        drop(conn);
         let events = EventHub::new();
         let live = LiveIndexer::start(db_path.clone(), events.clone(), roots).unwrap();
         Arc::new(AppState::new(
@@ -1280,6 +1352,250 @@ mod tests {
                 mime
             );
         }
+    }
+
+    #[tokio::test]
+    async fn disconnecting_libraries_filters_active_apis_and_preserves_index_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_a = dir.path().join("library-a");
+        let root_b = dir.path().join("library-b");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        for (root, id, color) in [
+            (&root_a, "image-a", [10, 20, 30]),
+            (&root_b, "image-b", [40, 50, 60]),
+        ] {
+            let source = root.join("photo.jpg");
+            fs::write(&source, encoded(ImageFormat::Jpeg)).unwrap();
+            let fingerprint = file_fingerprint(&source).unwrap();
+            upsert_sqlite_image(
+                &conn,
+                &SqliteImageUpsert {
+                    id: Some(id.to_string()),
+                    root_path: root.to_string_lossy().into_owned(),
+                    path: "photo.jpg".to_string(),
+                    thumb: format!(".imgindex/thumbs/{id}.jpg"),
+                    size: fingerprint.size,
+                    mtime: fingerprint.mtime,
+                    width: 4,
+                    height: 3,
+                    ext: "jpg".to_string(),
+                },
+            )
+            .unwrap();
+            tagimage_db::sqlite::replace_sqlite_image_tags(
+                &conn,
+                id,
+                &[format!("keep-{id}")],
+                "user",
+            )
+            .unwrap();
+            let thumb = root.join(format!(".imgindex/thumbs/{id}.jpg"));
+            fs::create_dir_all(thumb.parent().unwrap()).unwrap();
+            fs::write(thumb, color).unwrap();
+        }
+        insert_problem(&conn, &root_a, "broken-a.jpg", FileIssueSeverity::Error);
+        insert_problem(&conn, &root_b, "broken-b.jpg", FileIssueSeverity::Warning);
+        drop(conn);
+        let state = test_state_with_roots(
+            dir.path(),
+            db_path.clone(),
+            vec![root_a.clone(), root_b.clone()],
+        );
+
+        let disconnected = disconnect_folder(
+            State(state.clone()),
+            Json(DisconnectFolderRequest {
+                path: root_a.to_string_lossy().into_owned(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(disconnected["removed"], root_a.to_string_lossy().as_ref());
+        assert_eq!(
+            disconnected["root_paths"],
+            json!([root_b.to_string_lossy().as_ref()])
+        );
+        assert!(state
+            .live
+            .status()
+            .iter()
+            .all(|status| status.root_path != root_a.to_string_lossy()));
+
+        assert_eq!(
+            get_file(State(state.clone()), Path("image-a".to_string()))
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get_thumb_file(
+                State(state.clone()),
+                Path("image-a.jpg".to_string()),
+                HeaderMap::new(),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get_file(State(state.clone()), Path("image-b".to_string()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let images = list_images(
+            State(state.clone()),
+            Query(ImagesRequest {
+                tags: None,
+                include_tags: None,
+                exclude_tags: None,
+                match_mode: None,
+                mode: None,
+                limit: Some(20),
+                cursor: None,
+                sort: None,
+                include_total: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let images: Value =
+            serde_json::from_slice(&to_bytes(images.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(images["page"]["total"], 1);
+        assert_eq!(images["items"][0]["id"], "image-b");
+
+        let tags = list_tags(State(state.clone())).await.unwrap().0;
+        let keep_a = tags["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tag| tag["normalized"] == "keep-image-a")
+            .unwrap();
+        assert_eq!(keep_a["image_count"], 0);
+        let problems = get_problems_summary(State(state.clone())).await.unwrap().0;
+        assert_eq!(problems["total"], 1);
+        assert_eq!(problems["errors"], 0);
+        assert_eq!(problems["warnings"], 1);
+
+        let conn = state.connect().unwrap();
+        assert_eq!(
+            tagimage_db::sqlite::get_sqlite_image_by_id_including_hidden(&conn, "image-a")
+                .unwrap()
+                .unwrap()
+                .id,
+            "image-a"
+        );
+        assert_eq!(
+            tagimage_db::sqlite::list_sqlite_tags_for_image(&conn, "image-a")
+                .unwrap()
+                .1,
+            vec!["keep-image-a".to_string()]
+        );
+        drop(conn);
+
+        let unknown = disconnect_folder(
+            State(state.clone()),
+            Json(DisconnectFolderRequest {
+                path: root_a.to_string_lossy().into_owned(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
+
+        let empty = disconnect_folder(
+            State(state.clone()),
+            Json(DisconnectFolderRequest {
+                path: root_b.to_string_lossy().into_owned(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(empty["root"], Value::Null);
+        assert_eq!(empty["root_paths"], json!([]));
+        let session = db::load_session(&state.connect().unwrap()).unwrap();
+        assert_eq!(session.root_path, None);
+        assert!(session.root_paths.is_empty());
+        let patched = patch_session(
+            State(state.clone()),
+            Json(json!({
+                "root_path": root_a.to_string_lossy(),
+                "root_paths": [root_a.to_string_lossy()],
+                "search_mode": "all",
+            })),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(patched["root_path"], Value::Null);
+        assert_eq!(patched["root_paths"], json!([]));
+        assert_eq!(patched["search_mode"], "all");
+        let status = get_status(State(state.clone())).await.unwrap().0;
+        assert_eq!(status["ready"], true);
+        assert_eq!(status["root"], Value::Null);
+
+        let empty_images = list_images(
+            State(state.clone()),
+            Query(ImagesRequest {
+                include_total: true,
+                ..ImagesRequest {
+                    tags: None,
+                    include_tags: None,
+                    exclude_tags: None,
+                    match_mode: None,
+                    mode: None,
+                    limit: None,
+                    cursor: None,
+                    sort: None,
+                    include_total: false,
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let empty_images: Value = serde_json::from_slice(
+            &to_bytes(empty_images.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(empty_images["items"], json!([]));
+        assert_eq!(empty_images["page"]["total"], 0);
+
+        let _ = set_folder(
+            State(state.clone()),
+            Json(json!({"path": root_a.to_string_lossy()})),
+        )
+        .await
+        .unwrap();
+        let conn = state.connect().unwrap();
+        assert_eq!(
+            tagimage_db::sqlite::get_sqlite_image_by_root_path_including_hidden(
+                &conn,
+                &root_a.to_string_lossy(),
+                "photo.jpg",
+            )
+            .unwrap()
+            .unwrap()
+            .id,
+            "image-a"
+        );
+        assert_eq!(
+            tagimage_db::sqlite::list_sqlite_tags_for_image(&conn, "image-a")
+                .unwrap()
+                .1,
+            vec!["keep-image-a".to_string()]
+        );
     }
 
     #[tokio::test]

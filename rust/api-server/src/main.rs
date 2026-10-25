@@ -80,7 +80,10 @@ async fn run() -> Result<(), String> {
             get(handlers::get_session).patch(handlers::patch_session),
         )
         .route("/api/folder", post(handlers::set_folder))
-        .route("/api/folders", get(handlers::list_folders))
+        .route(
+            "/api/folders",
+            get(handlers::list_folders).delete(handlers::disconnect_folder),
+        )
         .route("/api/jobs", get(handlers::list_jobs_handler))
         .route("/api/jobs/:job_id", get(handlers::get_job_handler))
         .route("/api/thumbs/rebuild", post(handlers::rebuild_thumbs))

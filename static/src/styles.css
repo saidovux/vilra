@@ -1554,12 +1554,31 @@ body.modal-open { overflow: hidden; }
   border-bottom: 1px solid #181818;
 }
 .library-root:last-child { border-bottom: 0; }
+.library-root-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
 .library-root-name {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   color: var(--text);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.library-disconnect-btn {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+  font: 9px/1 var(--font-mono);
+  padding: 3px 0;
+}
+.library-disconnect-btn:hover { color: #E88A85; }
+.library-disconnect-btn:disabled { cursor: wait; opacity: .45; }
 .library-root-path {
   overflow: hidden;
   color: var(--faint);

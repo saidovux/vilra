@@ -205,6 +205,8 @@ function isTextEntryTarget(target: EventTarget | null): boolean {
 let allImages: ImageItem[] = [];
 let visibleImages: ImageItem[] = [];
 let scannedRoots: string[] = [];
+let libraryStateRevision = 0;
+const disconnectingRoots = new Set<string>();
 let folderTagSync = true;
 const galleryTabs = new GalleryTabsState();
 const tagCatalog = new TagCatalog();
@@ -330,7 +332,10 @@ async function openFolder(pathOverride = '') {
     if (!r.ok) throw new Error(await readError(r));
     const data = await readJsonRecord(r);
     setFolderInputValues(p);
-    if (Array.isArray(data.root_paths)) scannedRoots = stringArray(data.root_paths);
+    if (Array.isArray(data.root_paths)) {
+      libraryStateRevision += 1;
+      scannedRoots = stringArray(data.root_paths);
+    }
     showGallery();
     renderTabs();
     renderFilterControls();
@@ -381,15 +386,56 @@ async function pickFolder() {
 }
 
 async function refreshFolderTree() {
+  const revision = libraryStateRevision;
   try {
     const r = await fetch('/api/folders');
     if (!r.ok) return;
     const data = await readJsonRecord(r);
+    if (revision !== libraryStateRevision) return;
     const roots = stringArray(data.roots);
-    if (roots.length) scannedRoots = roots;
+    scannedRoots = roots;
     renderFolderTree();
     updateRootSummary();
+    updateEmptyStateMessage();
   } catch {}
+}
+
+async function disconnectFolder(root: string): Promise<void> {
+  if (!root || disconnectingRoots.has(root)) return;
+  if (!window.confirm('Убрать папку из Vilra? Файлы на диске не будут удалены')) return;
+  disconnectingRoots.add(root);
+  renderFolderTree();
+  try {
+    const response = await fetch('/api/folders', {
+      method: 'DELETE',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path: root}),
+    });
+    if (!response.ok) throw new Error(await readError(response));
+    const data = await readJsonRecord(response);
+    libraryStateRevision += 1;
+    scannedRoots = stringArray(data.root_paths);
+    setFolderInputValues(typeof data.root === 'string' ? data.root : '');
+    viewerCoordinator.suppressRestoreFromActiveTab();
+    viewerCoordinator.close(false, false);
+    clearImageSelection();
+    renderFolderTree();
+    updateRootSummary();
+    updateEmptyStateMessage();
+    showGallery();
+    await refreshImages(true);
+    await refreshFolderTree();
+    problemsWorkspace.scheduleRefresh();
+    await pollStatus();
+  } catch (error) {
+    alert('Не удалось отключить библиотеку: ' + errorMessage(error));
+    libraryStateRevision += 1;
+    await refreshFolderTree();
+    await refreshImages(true);
+  } finally {
+    disconnectingRoots.delete(root);
+    renderFolderTree();
+  }
 }
 
 function renderGalleryUiState(): void {
@@ -467,11 +513,28 @@ function renderFolderTree(): void {
   el.innerHTML = scannedRoots.length
     ? scannedRoots.map(root => `
       <div class="library-root" title="${escAttr(root)}">
-        <span class="library-root-name">${escHtml(pathName(root))}</span>
+        <div class="library-root-head">
+          <span class="library-root-name">${escHtml(pathName(root))}</span>
+          <button class="library-disconnect-btn" type="button" data-action="disconnect-folder" data-root="${escAttr(root)}" ${disconnectingRoots.has(root) ? 'disabled' : ''}>Отключить</button>
+        </div>
         <span class="library-root-path">${escHtml(root)}</span>
       </div>
     `).join('')
     : '<div class="folder-empty">Библиотеки не добавлены</div>';
+}
+
+function updateEmptyStateMessage(): void {
+  const empty = requiredHtml('empty-state');
+  const label = empty.querySelector<HTMLElement>('.label');
+  const detail = label?.nextElementSibling;
+  if (!label || !(detail instanceof HTMLElement)) return;
+  if (!scannedRoots.length) {
+    label.textContent = 'Библиотеки не добавлены';
+    detail.textContent = 'Добавьте папку, чтобы показать изображения';
+  } else {
+    label.textContent = 'Изображения не найдены';
+    detail.textContent = 'Измените фильтр или анти-список';
+  }
 }
 
 function toggleSettings(force?: boolean): void {
@@ -585,12 +648,14 @@ async function startStatusPolling(): Promise<void> {
 }
 
 async function pollStatus(): Promise<void> {
+  const revision = libraryStateRevision;
   try {
     const r = await fetch('/api/status');
     const s = statusResponse(await readJsonRecord(r));
+    if (revision !== libraryStateRevision) return;
     latestStatus = s;
     renderDbStatus(s);
-    if (Array.isArray(s.root_paths) && s.root_paths.length) {
+    if (Array.isArray(s.root_paths)) {
       scannedRoots = stringArray(s.root_paths);
       updateRootSummary();
       renderFolderTree();
@@ -599,7 +664,8 @@ async function pollStatus(): Promise<void> {
       updateRootSummary();
       renderFolderTree();
     }
-    if (s.root) setFolderInputValues(s.root);
+    setFolderInputValues(s.root || '');
+    updateEmptyStateMessage();
     const prog = optionalHtml('scan-progress');
     const bar = optionalHtml('scan-bar');
     const txt = optionalHtml('status-text');
@@ -658,16 +724,18 @@ function startLiveEvents(): void {
 
 function handleLiveEvent(event: LiveEventEnvelope): void {
   const image = normalizeImageItem(event.data.image);
+  const eventRoot = typeof event.data.root_path === 'string' ? event.data.root_path : '';
+  const disconnectedRootEvent = Boolean(eventRoot) && !scannedRoots.includes(eventRoot);
   switch (event.type) {
     case 'image_created':
-      if (image) applyLiveImage(image);
+      if (image && !disconnectedRootEvent) applyLiveImage(image);
       break;
     case 'image_updated':
     case 'image_renamed':
-      if (image) applyLiveImage(image);
+      if (image && !disconnectedRootEvent) applyLiveImage(image);
       break;
     case 'image_removed':
-      removeLiveImage(String(event.data.image_id || ''));
+      if (!disconnectedRootEvent) removeLiveImage(String(event.data.image_id || ''));
       break;
     case 'directory_created':
     case 'directory_removed':
@@ -695,6 +763,19 @@ function handleLiveEvent(event: LiveEventEnvelope): void {
     case 'root_online':
     case 'root_offline':
       void pollStatus();
+      break;
+    case 'library_disconnected':
+      libraryStateRevision += 1;
+      scannedRoots = stringArray(event.data.root_paths);
+      setFolderInputValues(typeof event.data.root === 'string' ? event.data.root : '');
+      viewerCoordinator.suppressRestoreFromActiveTab();
+      viewerCoordinator.close(false, false);
+      clearImageSelection();
+      renderFolderTree();
+      updateRootSummary();
+      updateEmptyStateMessage();
+      void refreshImages(true);
+      problemsWorkspace.scheduleRefresh();
       break;
     case 'problems_changed':
       problemsWorkspace.handleProblemsChanged();
@@ -780,6 +861,7 @@ function renderLiveGalleryState(): void {
   updateImageCounter();
   viewerCoordinator.refreshGallerySource();
   requiredHtml('empty-state').style.display = visibleImages.length ? 'none' : 'flex';
+  updateEmptyStateMessage();
 }
 
 function updateLivePreviewImage(image: ImageItem): void {
@@ -947,6 +1029,7 @@ function applyFilter(clear = true): void {
   renderFilterControls();
   invalidateVirtualGallery({preserveAnchor: !clear, resetCards: clear});
   requiredHtml('empty-state').style.display = visibleImages.length ? 'none' : 'flex';
+  updateEmptyStateMessage();
 }
 
 function loadNextImagesPage(): Promise<void> {
@@ -2262,7 +2345,7 @@ async function loadSession(): Promise<void> {
     renderTabs();
     renderFilterControls();
     const rootPath = typeof s.root_path === 'string' ? s.root_path : '';
-    scannedRoots = Array.isArray(s.root_paths) && s.root_paths.length ? stringArray(s.root_paths) : (rootPath ? [rootPath] : []);
+    scannedRoots = Array.isArray(s.root_paths) ? stringArray(s.root_paths) : (rootPath ? [rootPath] : []);
     const currentRoot = scannedRoots[scannedRoots.length - 1] || rootPath;
     if (currentRoot) {
       setFolderInputValues(currentRoot);
@@ -2737,6 +2820,9 @@ function runAction(actionEl: HTMLElement): void {
       break;
     case 'delete-all-auto-tags':
       void deleteAllAutoTags();
+      break;
+    case 'disconnect-folder':
+      void disconnectFolder(String(actionEl.dataset.root || ''));
       break;
     case 'open-folder':
       openFolder();
