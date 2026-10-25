@@ -62,6 +62,7 @@ async fn run() -> Result<(), String> {
             post(handlers::recheck_problem),
         )
         .route("/api/images", get(handlers::list_images))
+        .route("/api/images/tags/batch", post(handlers::batch_image_tags))
         .route(
             "/api/tags",
             get(handlers::list_tags).post(handlers::create_tag),

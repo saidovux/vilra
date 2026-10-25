@@ -17,6 +17,7 @@ use axum::{
 use serde::{de, Deserialize, Deserializer};
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
     convert::Infallible,
     path::PathBuf,
     sync::{atomic::Ordering, Arc},
@@ -99,6 +100,16 @@ pub struct DisconnectFolderRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchImageTagsRequest {
+    image_ids: Vec<String>,
+    #[serde(default)]
+    add_tags: Vec<String>,
+    #[serde(default)]
+    remove_tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ProblemsRequest {
     severity: Option<String>,
     search: Option<String>,
@@ -108,6 +119,73 @@ pub struct ProblemsRequest {
 
 fn json_response(value: Value) -> Json<Value> {
     Json(value)
+}
+
+const MAX_BATCH_TAG_IMAGES: usize = 1_000;
+const MAX_BATCH_TAG_CHANGES: usize = 100;
+
+fn validate_batch_image_tags_request(
+    payload: BatchImageTagsRequest,
+) -> Result<(Vec<String>, Vec<String>, Vec<String>), ApiError> {
+    if payload.image_ids.is_empty() {
+        return Err(ApiError::bad_request("image_ids must not be empty"));
+    }
+    if payload.image_ids.len() > MAX_BATCH_TAG_IMAGES {
+        return Err(ApiError::bad_request(format!(
+            "image_ids exceeds the limit of {MAX_BATCH_TAG_IMAGES}"
+        )));
+    }
+    if payload.add_tags.len() > MAX_BATCH_TAG_CHANGES
+        || payload.remove_tags.len() > MAX_BATCH_TAG_CHANGES
+    {
+        return Err(ApiError::bad_request(format!(
+            "tag changes exceed the limit of {MAX_BATCH_TAG_CHANGES} per operation"
+        )));
+    }
+    if payload
+        .image_ids
+        .iter()
+        .any(|image_id| image_id.trim().is_empty())
+    {
+        return Err(ApiError::bad_request(
+            "image_ids must contain non-empty strings",
+        ));
+    }
+    if payload
+        .add_tags
+        .iter()
+        .chain(payload.remove_tags.iter())
+        .any(|tag| tag.split_whitespace().next().is_none())
+    {
+        return Err(ApiError::bad_request("tags must contain non-empty strings"));
+    }
+
+    let mut seen_ids = HashSet::new();
+    let image_ids = payload
+        .image_ids
+        .into_iter()
+        .filter(|image_id| seen_ids.insert(image_id.clone()))
+        .collect::<Vec<_>>();
+    let add_tags = clean_tag_list(&payload.add_tags);
+    let remove_tags = clean_tag_list(&payload.remove_tags);
+    if add_tags.is_empty() && remove_tags.is_empty() {
+        return Err(ApiError::bad_request(
+            "add_tags or remove_tags must contain at least one tag",
+        ));
+    }
+    let remove_norms = remove_tags
+        .iter()
+        .map(|tag| db::normalize_tag(tag))
+        .collect::<HashSet<_>>();
+    if let Some(conflict) = add_tags
+        .iter()
+        .find(|tag| remove_norms.contains(&db::normalize_tag(tag)))
+    {
+        return Err(ApiError::bad_request(format!(
+            "tag cannot be both added and removed: {conflict}"
+        )));
+    }
+    Ok((image_ids, add_tags, remove_tags))
 }
 
 pub async fn serve_index(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
@@ -477,6 +555,43 @@ pub async fn set_image_tags(
     .await
     .map_err(|error| ApiError::internal(format!("Set image tags task failed: {error}")))??;
     Ok(json_response(value))
+}
+
+pub async fn batch_image_tags(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<BatchImageTagsRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let (image_ids, add_tags, remove_tags) = validate_batch_image_tags_request(payload)?;
+    let _root_guard = state.root_change_lock.lock().await;
+    let db_state = state.clone();
+    let db_image_ids = image_ids.clone();
+    let db_add_tags = add_tags.clone();
+    let db_remove_tags = remove_tags.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = db_state.connect()?;
+        db::batch_update_image_user_tags(&client, &db_image_ids, &db_add_tags, &db_remove_tags)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Batch image tags task failed: {error}")))??;
+
+    state.events.publish(
+        "tags_changed",
+        json!({
+            "reason": "batch_user_tags",
+            "image_ids": image_ids.clone(),
+            "add_tags": add_tags.clone(),
+            "remove_tags": remove_tags.clone(),
+            "updated_count": result.updated_count,
+        }),
+    );
+    Ok(json_response(json!({
+        "ok": true,
+        "matched_count": result.matched_count,
+        "updated_count": result.updated_count,
+        "unchanged_count": result.unchanged_count,
+        "add_tags": add_tags,
+        "remove_tags": remove_tags,
+    })))
 }
 
 pub async fn get_session(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
@@ -1596,6 +1711,111 @@ mod tests {
                 .1,
             vec!["keep-image-a".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn batch_image_tags_are_single_commit_active_only_and_strictly_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        upsert_sqlite_image(
+            &conn,
+            &SqliteImageUpsert {
+                id: Some("image-a".to_string()),
+                root_path: root.clone(),
+                path: "a.jpg".to_string(),
+                thumb: ".imgindex/thumbs/image-a.jpg".to_string(),
+                size: 1,
+                mtime: 1,
+                width: 1,
+                height: 1,
+                ext: "jpg".to_string(),
+            },
+        )
+        .unwrap();
+        upsert_sqlite_image(
+            &conn,
+            &SqliteImageUpsert {
+                id: Some("image-b".to_string()),
+                root_path: root,
+                path: "b.jpg".to_string(),
+                thumb: ".imgindex/thumbs/image-b.jpg".to_string(),
+                size: 1,
+                mtime: 1,
+                width: 1,
+                height: 1,
+                ext: "jpg".to_string(),
+            },
+        )
+        .unwrap();
+        tagimage_db::sqlite::attach_sqlite_tag_to_image(&conn, "image-a", "Folder", "auto")
+            .unwrap();
+        drop(conn);
+        let state = test_state(dir.path(), db_path);
+        let mut events = state.events.subscribe();
+
+        let response = batch_image_tags(
+            State(state.clone()),
+            Json(BatchImageTagsRequest {
+                image_ids: vec!["image-a".to_string(), "image-b".to_string()],
+                add_tags: vec!["Night".to_string(), "Favorite".to_string()],
+                remove_tags: vec![],
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(response["matched_count"], 2);
+        assert_eq!(response["updated_count"], 2);
+        assert_eq!(response["unchanged_count"], 0);
+        let event = events.try_recv().expect("one committed batch event");
+        assert_eq!(event.kind, "tags_changed");
+        assert_eq!(event.data["reason"], "batch_user_tags");
+        assert_eq!(event.data["updated_count"], 2);
+        assert!(events.try_recv().is_err());
+        let conn = state.connect().unwrap();
+        let (auto, user) = tagimage_db::sqlite::list_sqlite_tags_for_image(&conn, "image-a")
+            .expect("updated tags");
+        assert_eq!(auto, vec!["Folder"]);
+        assert_eq!(user, vec!["Favorite", "Night"]);
+        drop(conn);
+
+        let unavailable = batch_image_tags(
+            State(state.clone()),
+            Json(BatchImageTagsRequest {
+                image_ids: vec!["image-a".to_string(), "missing".to_string()],
+                add_tags: vec!["Rollback".to_string()],
+                remove_tags: vec![],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unavailable.status, StatusCode::BAD_REQUEST);
+        assert!(!tagimage_db::sqlite::list_sqlite_tags_for_image(
+            &state.connect().unwrap(),
+            "image-a"
+        )
+        .unwrap()
+        .1
+        .contains(&"Rollback".to_string()));
+
+        let conflict = validate_batch_image_tags_request(BatchImageTagsRequest {
+            image_ids: vec!["image-a".to_string()],
+            add_tags: vec![" Mixed Case ".to_string()],
+            remove_tags: vec!["mixed   case".to_string()],
+        })
+        .unwrap_err();
+        assert_eq!(conflict.status, StatusCode::BAD_REQUEST);
+        let too_many = validate_batch_image_tags_request(BatchImageTagsRequest {
+            image_ids: (0..=MAX_BATCH_TAG_IMAGES)
+                .map(|index| format!("image-{index}"))
+                .collect(),
+            add_tags: vec!["tag".to_string()],
+            remove_tags: vec![],
+        })
+        .unwrap_err();
+        assert_eq!(too_many.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

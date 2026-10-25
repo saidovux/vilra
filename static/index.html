@@ -220,12 +220,30 @@
     </main>
 
     <div id="selection-tray" aria-live="polite" aria-label="Действия над выбранными изображениями">
-      <span class="selection-count"><span id="selection-count">0</span> selected</span>
+      <div id="batch-tag-panel" aria-label="Пакетное управление тегами">
+        <div class="batch-tag-head">
+          <div>
+            <strong>Теги для выбранных</strong>
+            <span id="batch-tag-summary" class="muted-inline"></span>
+          </div>
+          <button class="btn btn-ghost icon-btn" type="button" data-action="close-batch-tags" title="Закрыть">×</button>
+        </div>
+        <div class="batch-tag-add-row">
+          <input id="batch-tag-input" type="text" list="batch-tag-suggestions" autocomplete="off" placeholder="Найти или создать тег">
+          <datalist id="batch-tag-suggestions"></datalist>
+          <button class="btn btn-ghost btn-sm" type="button" data-action="queue-batch-tag">Добавить</button>
+        </div>
+        <div id="batch-tag-additions" class="batch-tag-draft"></div>
+        <div class="batch-tag-label">Пользовательские теги в выделении</div>
+        <div id="batch-tag-existing" class="batch-tag-existing"></div>
+        <div class="batch-tag-footer">
+          <span id="batch-tag-status" role="status"></span>
+          <button id="batch-tag-apply" class="btn btn-primary btn-sm" type="button" data-action="apply-batch-tags">Применить</button>
+        </div>
+      </div>
+      <span class="selection-count"><span id="selection-count">0</span> выбрано</span>
       <span class="selection-separator" aria-hidden="true"></span>
-      <button class="btn btn-ghost btn-sm" type="button" data-action="batch-add-tag">Tags</button>
-      <button class="btn btn-ghost btn-sm" type="button" disabled title="Links require a separate backend implementation">Link</button>
-      <button class="btn btn-ghost btn-sm" type="button" disabled title="Move requires a separate backend implementation">Move</button>
-      <button class="btn btn-ghost btn-sm" type="button" disabled title="Batch removal requires a separate backend implementation">Remove</button>
+      <button class="btn btn-ghost btn-sm" type="button" data-action="toggle-batch-tags">Теги</button>
       <button class="btn btn-ghost icon-btn" type="button" data-action="clear-image-selection" title="Снять выделение">×</button>
     </div>
 

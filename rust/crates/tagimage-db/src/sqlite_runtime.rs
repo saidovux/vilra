@@ -233,6 +233,13 @@ pub struct SqliteAutoTagCleanupResult {
     pub tags_removed: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteBatchImageTagsResult {
+    pub matched_count: i64,
+    pub updated_count: i64,
+    pub unchanged_count: i64,
+}
+
 #[derive(Debug, Clone)]
 struct SqliteImageListRow {
     id: String,
@@ -2198,6 +2205,154 @@ pub fn replace_sqlite_image_user_tags(
     tags: &[String],
 ) -> Result<(), String> {
     replace_sqlite_image_tags(conn, image_id, tags, "user")
+}
+
+pub fn batch_update_sqlite_image_user_tags(
+    conn: &Connection,
+    image_ids: &[String],
+    add_tags: &[String],
+    remove_tags: &[String],
+) -> Result<SqliteBatchImageTagsResult, String> {
+    let mut seen_ids = HashSet::new();
+    let image_ids = image_ids
+        .iter()
+        .filter(|image_id| seen_ids.insert((*image_id).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if image_ids.is_empty() {
+        return Err("Batch image IDs are empty".to_string());
+    }
+
+    let add_tags = clean_sqlite_tag_list(add_tags);
+    let remove_tags = clean_sqlite_tag_list(remove_tags);
+    let remove_norms = remove_tags
+        .iter()
+        .map(|tag| normalize_sqlite_tag(tag))
+        .collect::<HashSet<_>>();
+    if let Some(conflict) = add_tags
+        .iter()
+        .find(|tag| remove_norms.contains(&normalize_sqlite_tag(tag)))
+    {
+        return Err(format!("Batch tag is both added and removed: {conflict}"));
+    }
+    if add_tags.is_empty() && remove_tags.is_empty() {
+        return Err("Batch tag changes are empty".to_string());
+    }
+
+    with_immediate_tx(conn, || {
+        let roots = sqlite_roots_from_session(&load_sqlite_session(conn)?);
+        if roots.is_empty() {
+            return Err(format!("Batch image unavailable: {}", image_ids.join(", ")));
+        }
+
+        let mut params = image_ids
+            .iter()
+            .cloned()
+            .map(SqlValue::Text)
+            .collect::<Vec<_>>();
+        params.extend(roots.iter().cloned().map(SqlValue::Text));
+        let sql = format!(
+            r#"
+            SELECT i.id
+            FROM images i
+            WHERE i.id IN ({image_sql})
+              AND i.root_path IN ({root_sql})
+              AND {ACTIVE_IMAGE_PREDICATE}
+            "#,
+            image_sql = placeholders(image_ids.len()),
+            root_sql = placeholders(roots.len()),
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("prepare sqlite batch image validation: {e}"))?;
+        let rows = stmt
+            .query_map(params_from_iter(params.iter()), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| format!("query sqlite batch image validation: {e}"))?;
+        let matched = collect_rows(rows, "read sqlite batch image validation")?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let unavailable = image_ids
+            .iter()
+            .filter(|image_id| !matched.contains(*image_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unavailable.is_empty() {
+            return Err(format!(
+                "Batch image unavailable: {}",
+                unavailable.join(", ")
+            ));
+        }
+
+        let mut add_tag_ids = Vec::with_capacity(add_tags.len());
+        for tag in &add_tags {
+            let norm = normalize_sqlite_tag(tag);
+            let tag_id = if let Some(existing) = find_sqlite_tag_lookup(conn, &norm)? {
+                conn.execute(
+                    "DELETE FROM suppressed_auto_tags WHERE normalized = ?1",
+                    params![norm],
+                )
+                .map_err(|e| format!("delete sqlite suppressed batch tag: {e}"))?;
+                if !existing.user_defined {
+                    conn.execute(
+                        "UPDATE tags SET user_defined = 1 WHERE id = ?1",
+                        params![existing.id],
+                    )
+                    .map_err(|e| format!("promote sqlite batch user tag: {e}"))?;
+                }
+                Some(existing.id)
+            } else {
+                ensure_sqlite_tag(conn, tag, true)?
+            };
+            if let Some(tag_id) = tag_id {
+                add_tag_ids.push(tag_id);
+            }
+        }
+        let mut remove_tag_ids = Vec::with_capacity(remove_tags.len());
+        for tag in &remove_tags {
+            if let Some(tag_id) = find_sqlite_tag_id(conn, &normalize_sqlite_tag(tag))? {
+                remove_tag_ids.push(tag_id);
+            }
+        }
+
+        let mut updated_count = 0_i64;
+        for image_id in &image_ids {
+            let mut changed = false;
+            for tag_id in &add_tag_ids {
+                changed |= conn
+                    .execute(
+                        r#"
+                        INSERT INTO image_tags (image_id, tag_id, kind)
+                        VALUES (?1, ?2, 'user')
+                        ON CONFLICT DO NOTHING
+                        "#,
+                        params![image_id, tag_id],
+                    )
+                    .map_err(|e| format!("attach sqlite batch user tag: {e}"))?
+                    > 0;
+            }
+            for tag_id in &remove_tag_ids {
+                changed |= conn
+                    .execute(
+                        "DELETE FROM image_tags WHERE image_id = ?1 AND tag_id = ?2 AND kind = 'user'",
+                        params![image_id, tag_id],
+                    )
+                    .map_err(|e| format!("detach sqlite batch user tag: {e}"))?
+                    > 0;
+            }
+            if changed {
+                updated_count += 1;
+            }
+        }
+
+        let matched_count = image_ids.len() as i64;
+        Ok(SqliteBatchImageTagsResult {
+            matched_count,
+            updated_count,
+            unchanged_count: matched_count - updated_count,
+        })
+    })
 }
 
 pub fn sync_sqlite_image_auto_tags(
@@ -5300,6 +5455,128 @@ mod tests {
         let folders = folder_sqlite_tree_rows(&conn, &[root]).expect("folders");
         assert_eq!(folders[0]["path"], "animals/cat.jpg");
         assert_eq!(folders[1]["path"], "zebra.jpg");
+    }
+
+    #[test]
+    fn batch_user_tags_are_atomic_idempotent_and_preserve_other_tags() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let active_dir = tempfile::tempdir().expect("active root");
+        let inactive_dir = tempfile::tempdir().expect("inactive root");
+        let active_root = canonicalize_sqlite_session_root(active_dir.path()).expect("active root");
+        let inactive_root =
+            canonicalize_sqlite_session_root(inactive_dir.path()).expect("inactive root");
+        set_sqlite_session_root(&conn, active_dir.path(), true).expect("connect active root");
+        upsert_fixture(&conn, "img-1", &active_root, "one.jpg", 10, 10);
+        upsert_fixture(&conn, "img-2", &active_root, "two.jpg", 20, 20);
+        upsert_fixture(&conn, "img-3", &inactive_root, "three.jpg", 30, 30);
+        attach_sqlite_tag_to_image(&conn, "img-1", "Folder", "auto").expect("auto tag");
+        attach_sqlite_tag_to_image(&conn, "img-1", "Keep", "user").expect("keep tag");
+        for image_id in ["img-1", "img-2"] {
+            attach_sqlite_tag_to_image(&conn, image_id, "Old", "user").expect("old tag");
+        }
+
+        let result = batch_update_sqlite_image_user_tags(
+            &conn,
+            &["img-1".to_string(), "img-2".to_string()],
+            &["Landscape".to_string(), " Night ".to_string()],
+            &["old".to_string()],
+        )
+        .expect("batch update");
+        assert_eq!(
+            result,
+            SqliteBatchImageTagsResult {
+                matched_count: 2,
+                updated_count: 2,
+                unchanged_count: 0,
+            }
+        );
+        let (auto, user) = list_sqlite_tags_for_image(&conn, "img-1").expect("first tags");
+        assert_eq!(auto, vec!["Folder"]);
+        assert_eq!(user, vec!["Keep", "Landscape", "Night"]);
+        let (_, user) = list_sqlite_tags_for_image(&conn, "img-2").expect("second tags");
+        assert_eq!(user, vec!["Landscape", "Night"]);
+
+        let repeated = batch_update_sqlite_image_user_tags(
+            &conn,
+            &["img-1".to_string(), "img-2".to_string()],
+            &["landscape".to_string(), "night".to_string()],
+            &["Old".to_string()],
+        )
+        .expect("idempotent batch");
+        assert_eq!(repeated.updated_count, 0);
+        assert_eq!(repeated.unchanged_count, 2);
+        assert_eq!(
+            find_sqlite_tag_lookup(&conn, "landscape")
+                .expect("existing tag lookup")
+                .expect("existing tag")
+                .name,
+            "Landscape"
+        );
+
+        let rollback = batch_update_sqlite_image_user_tags(
+            &conn,
+            &["img-1".to_string(), "missing".to_string()],
+            &["Must Roll Back".to_string()],
+            &[],
+        );
+        assert!(rollback.is_err());
+        assert!(!list_sqlite_tags_for_image(&conn, "img-1")
+            .expect("tags after rollback")
+            .1
+            .contains(&"Must Roll Back".to_string()));
+        assert!(find_sqlite_tag_id(&conn, "must roll back")
+            .expect("rolled back tag lookup")
+            .is_none());
+
+        let inactive = batch_update_sqlite_image_user_tags(
+            &conn,
+            &["img-3".to_string()],
+            &["Forbidden".to_string()],
+            &[],
+        );
+        assert!(inactive.is_err());
+        assert!(list_sqlite_tags_for_image(&conn, "img-3")
+            .expect("inactive tags")
+            .1
+            .is_empty());
+    }
+
+    #[test]
+    fn concurrent_batch_user_tag_additions_do_not_lose_updates() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let root_dir = tempfile::tempdir().expect("root");
+        let root = canonicalize_sqlite_session_root(root_dir.path()).expect("canonical root");
+        set_sqlite_session_root(&conn, root_dir.path(), true).expect("connect root");
+        upsert_fixture(&conn, "img-1", &root, "one.jpg", 10, 10);
+        drop(conn);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut writers = Vec::new();
+        for tag in ["Alpha", "Beta"] {
+            let writer_db = db_path.clone();
+            let writer_barrier = barrier.clone();
+            writers.push(std::thread::spawn(move || {
+                let conn = open_sqlite_runtime_db(&writer_db).expect("open batch writer");
+                writer_barrier.wait();
+                batch_update_sqlite_image_user_tags(
+                    &conn,
+                    &["img-1".to_string()],
+                    &[tag.to_string()],
+                    &[],
+                )
+                .expect("concurrent batch")
+            }));
+        }
+        barrier.wait();
+        for writer in writers {
+            assert_eq!(writer.join().expect("join writer").updated_count, 1);
+        }
+
+        let conn = open_sqlite_runtime_db(&db_path).expect("open final db");
+        let (_, user_tags) = list_sqlite_tags_for_image(&conn, "img-1").expect("final tags");
+        assert_eq!(user_tags, vec!["Alpha", "Beta"]);
     }
 
     #[test]

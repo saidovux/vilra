@@ -231,6 +231,12 @@ let gallerySidebarVisible = true;
 let gallerySidebarBeforeFocus = true;
 let gallerySidebarChangedDuringFocus = false;
 const selectedImageIds = new Set<string>();
+let batchTagPanelOpen = false;
+let batchTagSubmitting = false;
+let batchTagAdditions: string[] = [];
+let batchTagRemovals: string[] = [];
+let batchTagStatus = '';
+let batchTagStatusIsError = false;
 let latestStatus: StatusResponse | null = null;
 let filterSuggestionOpen = false;
 let settingsActiveTab: SettingsTab = 'general';
@@ -844,6 +850,10 @@ function applyLiveImage(image: ImageItem): void {
 
 function removeLiveImage(imageId: string): void {
   if (!imageId) return;
+  if (selectedImageIds.delete(imageId)) {
+    if (!batchTagSubmitting) resetBatchTagDraft();
+    updateImageSelectionUi();
+  }
   const existingIndex = allImages.findIndex(item => item.id === imageId);
   const previousMembership = liveTotalReconciler.knownMembership(imageId, existingIndex);
   if (existingIndex >= 0) allImages.splice(existingIndex, 1);
@@ -1150,47 +1160,226 @@ function updateImageSelectionUi(): void {
   virtualGalleryView.forEachMounted((mounted, imageId) => {
     mounted.card.classList.toggle('selected', selectedImageIds.has(imageId));
   });
+  renderBatchTagPanel();
 }
 
 function toggleImageSelection(imageId: string): void {
   if (!imageId) return;
   if (selectedImageIds.has(imageId)) selectedImageIds.delete(imageId);
   else selectedImageIds.add(imageId);
+  if (!batchTagSubmitting) resetBatchTagDraft();
   updateImageSelectionUi();
 }
 
 function clearImageSelection(): void {
   selectedImageIds.clear();
+  batchTagPanelOpen = false;
+  if (!batchTagSubmitting) resetBatchTagDraft();
   updateImageSelectionUi();
 }
 
-async function addTagToSelectedImages(): Promise<void> {
-  if (!selectedImageIds.size) return;
-  const raw = window.prompt('Добавить тег к выбранным изображениям:');
-  const value = raw ? tagCatalog.findDisplayTag(raw.trim()) : '';
-  if (!value) return;
-  const targets = allImages.filter(image => selectedImageIds.has(image.id));
-  const failures: string[] = [];
-  await Promise.all(targets.map(async image => {
-    const userTags = dedupeDisplayTags([...(image.user_tags || []), value]);
-    try {
-      const response = await fetch(`/api/tag/${image.id}`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({tags: userTags})
-      });
-      if (!response.ok) throw new Error(await readError(response));
-      updateImageTags(image.id, await readJsonRecord(response));
-    } catch (error) {
-      failures.push(`${fileName(image.path)}: ${errorMessage(error)}`);
+function resetBatchTagDraft(): void {
+  batchTagAdditions = [];
+  batchTagRemovals = [];
+  batchTagStatus = '';
+  batchTagStatusIsError = false;
+}
+
+function selectedLoadedImages(): ImageItem[] {
+  return allImages.filter(image => selectedImageIds.has(image.id));
+}
+
+function selectedUserTagCounts(): Map<string, {name: string; count: number}> {
+  const counts = new Map<string, {name: string; count: number}>();
+  for (const image of selectedLoadedImages()) {
+    const seen = new Set<string>();
+    for (const tag of image.user_tags || []) {
+      const normalized = normalizeTag(tag);
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      const current = counts.get(normalized);
+      if (current) current.count += 1;
+      else counts.set(normalized, {name: tag, count: 1});
     }
-  }));
-  await refreshTagPool();
-  if (failures.length) {
-    alert(`Не удалось обновить ${failures.length} изображений.\n${failures.slice(0, 5).join('\n')}`);
+  }
+  return counts;
+}
+
+function renderBatchTagPanel(): void {
+  const panel = optionalHtml('batch-tag-panel');
+  if (!panel) return;
+  panel.classList.toggle('open', batchTagPanelOpen && selectedImageIds.size > 0);
+  const summary = optionalHtml('batch-tag-summary');
+  if (summary) summary.textContent = `${selectedImageIds.size} фото`;
+  const selectedCount = selectedImageIds.size;
+  const counts = selectedUserTagCounts();
+  const removeNorms = new Set(batchTagRemovals.map(normalizeTag));
+  const existing = optionalHtml('batch-tag-existing');
+  if (existing) {
+    const tags = [...counts.values()].sort((left, right) => left.name.localeCompare(right.name));
+    existing.innerHTML = tags.length
+      ? tags.map(tag => {
+        const pending = removeNorms.has(normalizeTag(tag.name));
+        const coverage = tag.count === selectedCount ? 'все' : `${tag.count}/${selectedCount}`;
+        return `<button class="batch-tag-token ${pending ? 'pending-remove' : ''}" type="button" data-action="toggle-batch-remove" data-tag="${escAttr(tag.name)}" title="${pending ? 'Отменить удаление' : 'Удалить у выбранных'}"><span>${escHtml(tag.name)}</span><span class="tag-coverage">${coverage}</span></button>`;
+      }).join('')
+      : '<span class="batch-tag-empty">У выбранных изображений нет пользовательских тегов</span>';
+  }
+  const additions = optionalHtml('batch-tag-additions');
+  if (additions) {
+    additions.innerHTML = batchTagAdditions.map(tag => `
+      <button class="batch-tag-token pending-add" type="button" data-action="cancel-batch-add" data-tag="${escAttr(tag)}" title="Не добавлять этот тег">+ ${escHtml(tag)} ×</button>
+    `).join('');
+  }
+  const suggestions = document.getElementById('batch-tag-suggestions');
+  if (suggestions instanceof HTMLDataListElement) {
+    suggestions.innerHTML = tagCatalog.names
+      .filter(tag => {
+        const meta = tagCatalog.getMeta(tag);
+        return meta.user_defined || meta.user_count > 0;
+      })
+      .map(tag => `<option value="${escAttr(tag)}"></option>`)
+      .join('');
+  }
+  const status = optionalHtml('batch-tag-status');
+  if (status) {
+    status.textContent = batchTagStatus;
+    status.classList.toggle('error', batchTagStatusIsError);
+  }
+  const apply = optionalElement('batch-tag-apply', HTMLButtonElement);
+  if (apply) {
+    apply.disabled = batchTagSubmitting
+      || !selectedImageIds.size
+      || (!batchTagAdditions.length && !batchTagRemovals.length);
+    apply.textContent = batchTagSubmitting ? 'Применение…' : 'Применить';
+  }
+}
+
+function toggleBatchTagPanel(force?: boolean): void {
+  if (!selectedImageIds.size) return;
+  batchTagPanelOpen = force === undefined ? !batchTagPanelOpen : force;
+  renderBatchTagPanel();
+  if (batchTagPanelOpen) requiredInput('batch-tag-input').focus();
+}
+
+function queueBatchTagFromInput(): void {
+  if (batchTagSubmitting) return;
+  const input = requiredInput('batch-tag-input');
+  const value = tagCatalog.findDisplayTag(input.value);
+  const normalized = normalizeTag(value);
+  if (!normalized) return;
+  batchTagRemovals = batchTagRemovals.filter(tag => normalizeTag(tag) !== normalized);
+  const assignedCount = selectedUserTagCounts().get(normalized)?.count || 0;
+  if (assignedCount < selectedImageIds.size
+      && !batchTagAdditions.some(tag => normalizeTag(tag) === normalized)) {
+    batchTagAdditions.push(value);
+  }
+  input.value = '';
+  batchTagStatus = assignedCount === selectedImageIds.size ? 'Этот тег уже назначен всем выбранным' : '';
+  batchTagStatusIsError = false;
+  renderBatchTagPanel();
+}
+
+function cancelBatchTagAddition(tag: string): void {
+  if (batchTagSubmitting) return;
+  const normalized = normalizeTag(tag);
+  batchTagAdditions = batchTagAdditions.filter(item => normalizeTag(item) !== normalized);
+  renderBatchTagPanel();
+}
+
+function toggleBatchTagRemoval(tag: string): void {
+  if (batchTagSubmitting) return;
+  const normalized = normalizeTag(tag);
+  const removing = batchTagRemovals.some(item => normalizeTag(item) === normalized);
+  batchTagRemovals = removing
+    ? batchTagRemovals.filter(item => normalizeTag(item) !== normalized)
+    : [...batchTagRemovals, tag];
+  if (!removing) {
+    batchTagAdditions = batchTagAdditions.filter(item => normalizeTag(item) !== normalized);
+  }
+  batchTagStatus = '';
+  batchTagStatusIsError = false;
+  renderBatchTagPanel();
+}
+
+function applyBatchTagDeltaLocally(imageIds: string[], addTags: string[], removeTags: string[]): void {
+  const targetIds = new Set(imageIds);
+  const removeNorms = new Set(removeTags.map(normalizeTag));
+  const updated = new Map<string, ImageItem>();
+  const applyToImage = (image: ImageItem): void => {
+    const retained = (image.user_tags || []).filter(tag => !removeNorms.has(normalizeTag(tag)));
+    image.user_tags = dedupeDisplayTags([...retained, ...addTags]);
+    image.auto_tags = image.auto_tags || image.folder_tags || [];
+    image.folder_tags = image.auto_tags;
+    image.tags = dedupeDisplayTags([...(image.auto_tags || []), ...image.user_tags]);
+  };
+  for (const images of [allImages, visibleImages]) {
+    for (const image of images) {
+      if (!targetIds.has(image.id)) continue;
+      applyToImage(image);
+      updated.set(image.id, image);
+    }
+  }
+  for (const image of updated.values()) updateCardForImage(image);
+  const previewImage = viewerCoordinator.currentImage;
+  if (previewImage && targetIds.has(previewImage.id)) {
+    applyToImage(previewImage);
+    renderPreviewTags(previewImage);
+  }
+  setTagPool([...tagCatalog.names, ...addTags]);
+  updateFishGhosts();
+}
+
+function batchChangesAffectActiveFilter(addTags: string[], removeTags: string[]): boolean {
+  const tab = activeTab();
+  const changed = new Set([...addTags, ...removeTags].map(normalizeTag));
+  return [...(tab.includeTags || []), ...(tab.excludeTags || [])]
+    .some(tag => changed.has(normalizeTag(tag)));
+}
+
+async function applyBatchTagChanges(): Promise<void> {
+  if (batchTagSubmitting || !selectedImageIds.size) return;
+  if (selectedImageIds.size > 1000) {
+    batchTagStatus = 'За один раз можно изменить не более 1000 изображений';
+    batchTagStatusIsError = true;
+    renderBatchTagPanel();
     return;
   }
-  clearImageSelection();
+  const imageIds = [...selectedImageIds];
+  const addTags = batchTagAdditions.slice();
+  const removeTags = batchTagRemovals.slice();
+  if (!addTags.length && !removeTags.length) return;
+  batchTagSubmitting = true;
+  batchTagStatus = 'Сохранение…';
+  batchTagStatusIsError = false;
+  renderBatchTagPanel();
+  try {
+    const response = await fetch('/api/images/tags/batch', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({image_ids: imageIds, add_tags: addTags, remove_tags: removeTags}),
+    });
+    if (!response.ok) throw new Error(await readError(response));
+    const result = await readJsonRecord(response);
+    const appliedAdditions = stringArray(result.add_tags);
+    const appliedRemovals = stringArray(result.remove_tags);
+    activeImagesRequest += 1;
+    activePageLoad = null;
+    isLoadingPage = false;
+    tagCatalogRevision += 1;
+    applyBatchTagDeltaLocally(imageIds, appliedAdditions, appliedRemovals);
+    const resetGallery = batchChangesAffectActiveFilter(appliedAdditions, appliedRemovals);
+    batchTagAdditions = [];
+    batchTagRemovals = [];
+    batchTagStatus = `Обновлено: ${Number(result.updated_count || 0)}, без изменений: ${Number(result.unchanged_count || 0)}`;
+    await refreshImages(resetGallery);
+  } catch (error) {
+    batchTagStatus = errorMessage(error);
+    batchTagStatusIsError = true;
+  } finally {
+    batchTagSubmitting = false;
+    renderBatchTagPanel();
+  }
 }
 
 function makeCard(
@@ -1309,7 +1498,7 @@ function acceptActiveImage(imageId: string): void {
 function handleTerminalImageUnavailable(imageId: string): void {
   if (!imageId || terminalThumbIds.has(imageId)) return;
   terminalThumbIds.add(imageId);
-  selectedImageIds.delete(imageId);
+  if (selectedImageIds.delete(imageId) && !batchTagSubmitting) resetBatchTagDraft();
   updateImageSelectionUi();
   thumbnailLifecycles.cancel(imageId);
   if (viewerCoordinator.currentImageId === imageId) {
@@ -2709,6 +2898,7 @@ function setTagPool(rawTags: unknown): void {
   tagCatalogRevision += 1;
   tagCatalog.replace(rawTags);
   renderSidebarTags();
+  renderBatchTagPanel();
 }
 
 function renderSidebarTags(): void {
@@ -2800,8 +2990,14 @@ function runAction(actionEl: HTMLElement): void {
     case 'add-tab':
       addTab();
       break;
-    case 'batch-add-tag':
-      void addTagToSelectedImages();
+    case 'apply-batch-tags':
+      void applyBatchTagChanges();
+      break;
+    case 'cancel-batch-add':
+      cancelBatchTagAddition(String(actionEl.dataset.tag || ''));
+      break;
+    case 'close-batch-tags':
+      toggleBatchTagPanel(false);
       break;
     case 'add-tag-from-preview-input':
       addTagFromPreviewInput();
@@ -2829,6 +3025,9 @@ function runAction(actionEl: HTMLElement): void {
       break;
     case 'open-gallery-diagnostics':
       galleryDiagnostics.openPanel();
+      break;
+    case 'queue-batch-tag':
+      queueBatchTagFromInput();
       break;
     case 'show-gallery-view':
       showGalleryView();
@@ -2884,6 +3083,12 @@ function runAction(actionEl: HTMLElement): void {
     case 'toggle-folder-sidebar':
       toggleFolderSidebar();
       break;
+    case 'toggle-batch-remove':
+      toggleBatchTagRemoval(String(actionEl.dataset.tag || ''));
+      break;
+    case 'toggle-batch-tags':
+      toggleBatchTagPanel();
+      break;
     case 'toggle-gallery-focus':
       toggleGalleryFocusMode();
       break;
@@ -2937,6 +3142,11 @@ requiredInput('sidebar-tag-search').addEventListener('input', renderSidebarTags)
 requiredInput('problems-search').addEventListener('input', () => problemsWorkspace.handleSearchInput());
 requiredInput('tag-admin-create').addEventListener('keydown', e => {
   if (e.key === 'Enter') createTagFromSettings();
+});
+requiredInput('batch-tag-input').addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  queueBatchTagFromInput();
 });
 window.addEventListener('scroll', updateScrollTopButton, {passive: true});
 window.addEventListener('resize', () => {

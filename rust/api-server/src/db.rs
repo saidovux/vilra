@@ -13,19 +13,19 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 use tagimage_db::sqlite::{
-    self, clean_sqlite_tag_list, count_sqlite_jobs, count_sqlite_stale_running_jobs,
-    create_sqlite_user_tag_entry, delete_sqlite_tag_definition, fetch_sqlite_tags_for_image_ids,
-    folder_sqlite_tree_rows, get_sqlite_file_issue_by_id_for_roots,
-    get_sqlite_file_issue_for_image, get_sqlite_image_by_id,
+    self, batch_update_sqlite_image_user_tags, clean_sqlite_tag_list, count_sqlite_jobs,
+    count_sqlite_stale_running_jobs, create_sqlite_user_tag_entry, delete_sqlite_tag_definition,
+    fetch_sqlite_tags_for_image_ids, folder_sqlite_tree_rows,
+    get_sqlite_file_issue_by_id_for_roots, get_sqlite_file_issue_for_image, get_sqlite_image_by_id,
     get_sqlite_image_by_id_including_hidden, get_sqlite_job_api_value,
     list_sqlite_file_issue_recheck_targets_for_roots, list_sqlite_jobs,
     list_sqlite_thumb_rebuild_rows, load_sqlite_session, mutate_sqlite_session_value_with_root,
     open_sqlite_runtime_db, query_sqlite_file_issues_for_roots, query_sqlite_images_page,
     remove_sqlite_session_root, set_sqlite_session_root, sqlite_roots_from_session,
     summarize_sqlite_file_issues_for_roots, tag_sqlite_summary_rows_for_roots,
-    update_sqlite_tag_definition, SqliteAutoTagCleanupResult, SqliteFileIssue,
-    SqliteFileIssueRecheckTarget, SqliteImageRecord, SqliteImagesQuery, SqliteSession,
-    SqliteSessionMutation,
+    update_sqlite_tag_definition, SqliteAutoTagCleanupResult, SqliteBatchImageTagsResult,
+    SqliteFileIssue, SqliteFileIssueRecheckTarget, SqliteImageRecord, SqliteImagesQuery,
+    SqliteSession, SqliteSessionMutation,
 };
 
 const VALID_JOB_STATES: &[&str] = &["queued", "running", "succeeded", "failed", "canceled"];
@@ -186,6 +186,8 @@ fn map_db_error(error: String) -> ApiError {
         _ if error.starts_with("No folder set") => ApiError::bad_request(error),
         _ if error.starts_with("Unsupported sort") => ApiError::bad_request(error),
         _ if error.starts_with("Not a directory") => ApiError::bad_request(error),
+        _ if error.starts_with("Batch image") => ApiError::bad_request(error),
+        _ if error.starts_with("Batch tag") => ApiError::bad_request(error),
         _ if error.starts_with("image unavailable:") => {
             ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, error)
         }
@@ -418,6 +420,16 @@ pub fn replace_image_user_tags(
     tags: &[String],
 ) -> Result<(), ApiError> {
     sqlite::replace_sqlite_image_user_tags(conn, image_id, tags).map_err(map_db_error)
+}
+
+pub fn batch_update_image_user_tags(
+    conn: &Connection,
+    image_ids: &[String],
+    add_tags: &[String],
+    remove_tags: &[String],
+) -> Result<SqliteBatchImageTagsResult, ApiError> {
+    batch_update_sqlite_image_user_tags(conn, image_ids, add_tags, remove_tags)
+        .map_err(map_db_error)
 }
 
 pub fn fetch_tags_for_image_ids(
