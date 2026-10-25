@@ -114,7 +114,7 @@ function assertPackagedResources(resourcesRoot, platform = process.platform) {
     }
     if (!stat.isFile()) throw new Error(`Electron package resource is not a file: ${resource}`);
   }
-  if (platform !== 'win32') {
+  if (platform !== 'win32' && process.platform !== 'win32') {
     for (const name of SIDECAR_NAMES) {
       const binary = path.join(resourcesRoot, 'bin', name);
       if ((fs.statSync(binary).mode & 0o111) === 0) {

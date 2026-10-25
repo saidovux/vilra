@@ -10,14 +10,17 @@ const {
 
 test('resolves the stable Vilra Linux application data path', () => {
   const options = {platform: 'linux', env: {}, home: '/home/example'};
-  assert.equal(resolveVilraAppData(options), '/home/example/.local/share/app.tagimage.desktop');
+  assert.equal(
+    resolveVilraAppData(options),
+    path.join('/home/example', '.local', 'share', 'app.tagimage.desktop'),
+  );
   assert.equal(
     resolveSqlitePath(options),
-    '/home/example/.local/share/app.tagimage.desktop/tagimage.sqlite',
+    path.join('/home/example', '.local', 'share', 'app.tagimage.desktop', 'tagimage.sqlite'),
   );
   assert.equal(
     resolveDiagnosticsPath(options),
-    '/home/example/.local/share/app.tagimage.desktop/diagnostics',
+    path.join('/home/example', '.local', 'share', 'app.tagimage.desktop', 'diagnostics'),
   );
 });
 
@@ -28,7 +31,7 @@ test('respects XDG data and explicit absolute or relative overrides', () => {
       home: '/home/example',
       env: {XDG_DATA_HOME: '/data', TAGIMAGE_SQLITE_PATH: 'custom.sqlite'},
     }),
-    '/data/app.tagimage.desktop/custom.sqlite',
+    path.join('/data', 'app.tagimage.desktop', 'custom.sqlite'),
   );
   assert.equal(
     resolveSqlitePath({
@@ -43,7 +46,13 @@ test('respects XDG data and explicit absolute or relative overrides', () => {
 test('resolves macOS and Windows application data conventions', () => {
   assert.equal(
     resolveSqlitePath({platform: 'darwin', env: {}, home: '/Users/example'}),
-    '/Users/example/Library/Application Support/app.tagimage.desktop/tagimage.sqlite',
+    path.join(
+      '/Users/example',
+      'Library',
+      'Application Support',
+      'app.tagimage.desktop',
+      'tagimage.sqlite',
+    ),
   );
   assert.equal(
     resolveSqlitePath({platform: 'win32', env: {APPDATA: 'C:\\Users\\Example\\AppData\\Roaming'}, home: 'C:\\Users\\Example'}),

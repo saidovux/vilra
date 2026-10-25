@@ -23,10 +23,15 @@ test('development layout uses repository static files and Cargo target sidecars'
     env: {},
   });
   assert.equal(layout.workingDirectory, '/workspace/vilra');
-  assert.equal(layout.staticDirectory, '/workspace/vilra/static');
+  assert.equal(layout.staticDirectory, path.join('/workspace/vilra', 'static'));
   assert.equal(
     layout.sidecarPath('imgviewer-api-server'),
-    '/workspace/vilra/target/x86_64-unknown-linux-gnu/release/imgviewer-api-server',
+    path.join(
+      '/workspace/vilra/target',
+      'x86_64-unknown-linux-gnu',
+      'release',
+      'imgviewer-api-server',
+    ),
   );
   assert.equal(layout.buildInfoPath, null);
 });
@@ -43,9 +48,12 @@ test('packaged layout uses external resources and resolves relative static overr
     env: {},
   });
   assert.equal(layout.workingDirectory, resourcesPath);
-  assert.equal(layout.staticDirectory, `${resourcesPath}/static`);
-  assert.equal(layout.sidecarPath('imgviewer-thumb-worker'), `${resourcesPath}/bin/imgviewer-thumb-worker`);
-  assert.equal(layout.buildInfoPath, `${resourcesPath}/build-info.json`);
+  assert.equal(layout.staticDirectory, path.join(resourcesPath, 'static'));
+  assert.equal(
+    layout.sidecarPath('imgviewer-thumb-worker'),
+    path.join(resourcesPath, 'bin', 'imgviewer-thumb-worker'),
+  );
+  assert.equal(layout.buildInfoPath, path.join(resourcesPath, 'build-info.json'));
 
   const windowsLayout = resolveRuntimeLayout({
     isPackaged: true,
@@ -55,7 +63,7 @@ test('packaged layout uses external resources and resolves relative static overr
   });
   assert.equal(
     windowsLayout.sidecarPath('imgviewer-metadata-worker'),
-    `${resourcesPath}/bin/imgviewer-metadata-worker.exe`,
+    path.join(resourcesPath, 'bin', 'imgviewer-metadata-worker.exe'),
   );
 
   const overridden = resolveRuntimeLayout({
@@ -64,7 +72,7 @@ test('packaged layout uses external resources and resolves relative static overr
     platform: 'linux',
     env: {TAGIMAGE_STATIC_DIR: 'alternate-static'},
   });
-  assert.equal(overridden.staticDirectory, `${resourcesPath}/alternate-static`);
+  assert.equal(overridden.staticDirectory, path.join(resourcesPath, 'alternate-static'));
 });
 
 test('packaged build ID is loaded without invoking the development Git resolver', t => {
