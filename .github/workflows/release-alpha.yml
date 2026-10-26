@@ -99,8 +99,8 @@ jobs:
         run: |
           $env:APPDATA = Join-Path $env:RUNNER_TEMP 'vilra-appdata'
           $env:VILRA_RELEASE_SMOKE = '1'
-          & (Join-Path $PWD 'dist-electron\win-unpacked\Vilra.exe')
-          if ($LASTEXITCODE -ne 0) { throw "Vilra smoke exited with $LASTEXITCODE" }
+          $process = Start-Process -FilePath (Join-Path $PWD 'dist-electron\win-unpacked\Vilra.exe') -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Vilra smoke exited with $($process.ExitCode)" }
           $database = Join-Path $env:APPDATA 'app.tagimage.desktop\tagimage.sqlite'
           if (-not (Test-Path $database)) { throw "SQLite database was not created at $database" }
           Start-Sleep -Seconds 1
