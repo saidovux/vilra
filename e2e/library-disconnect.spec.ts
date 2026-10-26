@@ -1,9 +1,10 @@
 import {expect, test, type APIRequestContext, type Page} from '@playwright/test';
+import {createHash} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
 type E2EState = {fixtureDir: string};
-type ImageItem = {id: string; path: string; user_tags?: string[]};
+type ImageItem = {id: string; path: string; auto_tags?: string[]; user_tags?: string[]};
 
 function e2eState(): E2EState {
   return JSON.parse(
@@ -37,11 +38,39 @@ async function findImage(request: APIRequestContext, imagePath: string): Promise
 }
 
 async function disconnectThroughUi(page: Page, root: string): Promise<void> {
-  page.once('dialog', dialog => dialog.accept());
+  page.once('dialog', dialog => {
+    expect(dialog.message()).toBe(
+      'Удалить библиотеку из Vilra?\n\n'
+      + 'Будут удалены индекс изображений, привязки тегов, история ошибок и задания этой библиотеки.\n\n'
+      + 'Оригинальные фотографии, папки и кеш `.imgindex` на диске останутся без изменений.\n\n'
+      + 'При повторном подключении фотографии будут просканированы заново.',
+    );
+    void dialog.accept();
+  });
   const button = page.locator(`[data-action="disconnect-folder"][data-root="${root}"]`);
   await expect(button).toBeVisible();
+  await expect(button).toHaveText('Удалить из Vilra');
   await button.click();
   await expect(button).toHaveCount(0);
+}
+
+function filesystemSnapshot(root: string): Record<string, string> {
+  const snapshot: Record<string, string> = {};
+  const visit = (directory: string) => {
+    for (const entry of fs.readdirSync(directory, {withFileTypes: true})
+      .sort((left, right) => left.name.localeCompare(right.name))) {
+      const absolute = path.join(directory, entry.name);
+      const relative = path.relative(root, absolute).split(path.sep).join('/');
+      if (entry.isDirectory()) {
+        snapshot[`${relative}/`] = 'directory';
+        visit(absolute);
+      } else if (entry.isFile()) {
+        snapshot[relative] = createHash('sha256').update(fs.readFileSync(absolute)).digest('hex');
+      }
+    }
+  };
+  visit(root);
+  return snapshot;
 }
 
 test.beforeEach(async ({page}) => {
@@ -54,37 +83,47 @@ test.beforeEach(async ({page}) => {
   }}).catch(() => undefined);
 });
 
-test('libraries disconnect safely without deleting indexed data or restoring stale roots', async ({page}) => {
+test('library disconnect purges SQLite while preserving files and reconnecting with new identity', async ({page}) => {
   const fixtureRoot = e2eState().fixtureDir;
   const temporaryRoot = path.resolve(__dirname, '..', '.run', 'e2e-disconnect-library');
-  const relativeImage = 'disconnect-only.png';
+  const initialRelativeImage = 'tree/photo1.png';
+  const renamedRelativeImage = 'one/photo1.png';
   const sourceImage = path.join(fixtureRoot, 'batch-a', 'fixture-001.png');
-  const userTag = `disconnect-keep-${Date.now()}`;
+  const userTag = `disconnect-purge-${Date.now()}`;
   fs.rmSync(temporaryRoot, {recursive: true, force: true});
-  fs.mkdirSync(temporaryRoot, {recursive: true});
-  fs.copyFileSync(sourceImage, path.join(temporaryRoot, relativeImage));
+  fs.mkdirSync(path.join(temporaryRoot, 'tree'), {recursive: true});
+  fs.copyFileSync(sourceImage, path.join(temporaryRoot, initialRelativeImage));
   fs.writeFileSync(path.join(temporaryRoot, 'disconnect-problem.jpg'), 'not a jpeg');
 
   try {
+    await page.request.patch('/api/session', {data: {folder_tag_sync: true}});
     await connectRoot(page.request, temporaryRoot);
     await expect.poll(async () => (await connectedRoots(page.request)).sort())
       .toEqual([fixtureRoot, temporaryRoot].sort());
-    await expect.poll(async () => await findImage(page.request, relativeImage), {timeout: 30_000})
+    await expect.poll(async () => await findImage(page.request, initialRelativeImage), {timeout: 30_000})
       .not.toBeNull();
-    const original = await findImage(page.request, relativeImage);
+    const original = await findImage(page.request, initialRelativeImage);
     expect(original).not.toBeNull();
     const imageId = original?.id || '';
+    expect(original?.auto_tags).toContain('tree');
     const tagged = await page.request.post(`/api/tag/${imageId}`, {data: {tags: [userTag]}});
     expect(tagged.ok()).toBeTruthy();
+    const thumbRequest = await page.request.get(`/thumb/${imageId}?class=visible`);
+    expect([200, 202]).toContain(thumbRequest.status());
+    const oldThumb = path.join(temporaryRoot, '.imgindex', 'thumbs', `${imageId}.jpg`);
+    await expect.poll(() => fs.existsSync(oldThumb), {timeout: 30_000}).toBe(true);
+    const sentinel = path.join(temporaryRoot, '.imgindex', 'thumbs', 'disconnect-sentinel.jpg');
+    fs.writeFileSync(sentinel, 'keep-cache-byte-for-byte');
     await expect.poll(async () => {
       const response = await page.request.get('/api/problems?severity=all&search=disconnect-problem&limit=10&offset=0');
       return (await response.json()).page?.total;
     }, {timeout: 30_000}).toBe(1);
+    const beforeDisconnect = filesystemSnapshot(temporaryRoot);
 
     await page.goto('/');
     await expect(page.locator('#gallery-screen')).toBeVisible();
     await disconnectThroughUi(page, temporaryRoot);
-    await expect.poll(async () => await findImage(page.request, relativeImage)).toBeNull();
+    await expect.poll(async () => await findImage(page.request, initialRelativeImage)).toBeNull();
     expect((await page.request.get(`/file/${imageId}`)).status()).toBe(404);
     expect((await page.request.get(`/thumb/${imageId}`)).status()).toBe(404);
     expect((await page.request.get(`/thumb-file/${imageId}.jpg`)).status()).toBe(404);
@@ -92,19 +131,55 @@ test('libraries disconnect safely without deleting indexed data or restoring sta
       const response = await page.request.get('/api/problems?severity=all&search=disconnect-problem&limit=10&offset=0');
       return (await response.json()).page?.total;
     }).toBe(0);
+    expect(filesystemSnapshot(temporaryRoot)).toEqual(beforeDisconnect);
 
     await connectRoot(page.request, temporaryRoot);
-    await expect.poll(async () => await findImage(page.request, relativeImage), {timeout: 30_000})
+    await expect.poll(async () => await findImage(page.request, initialRelativeImage), {timeout: 30_000})
       .not.toBeNull();
-    const restoredImage = await findImage(page.request, relativeImage);
-    expect(restoredImage?.id).toBe(imageId);
-    expect(restoredImage?.user_tags).toContain(userTag);
+    const firstReconnect = await findImage(page.request, initialRelativeImage);
+    expect(firstReconnect?.id).not.toBe(imageId);
+    expect(firstReconnect?.auto_tags).toContain('tree');
+    expect(firstReconnect?.user_tags || []).not.toContain(userTag);
+    expect(fs.readFileSync(sentinel, 'utf8')).toBe('keep-cache-byte-for-byte');
+    const newThumbRequest = await page.request.get(`/thumb/${firstReconnect?.id}?class=visible`);
+    expect([200, 202]).toContain(newThumbRequest.status());
+    const firstReconnectThumb = path.join(
+      temporaryRoot,
+      '.imgindex',
+      'thumbs',
+      `${firstReconnect?.id}.jpg`,
+    );
+    await expect.poll(() => fs.existsSync(firstReconnectThumb), {timeout: 30_000}).toBe(true);
+
+    await disconnectRoot(page.request, temporaryRoot);
+    expect(fs.existsSync(oldThumb)).toBe(true);
+    expect(fs.existsSync(firstReconnectThumb)).toBe(true);
+    fs.rmSync(path.join(temporaryRoot, '.imgindex'), {recursive: true, force: true});
+    fs.renameSync(path.join(temporaryRoot, 'tree'), path.join(temporaryRoot, 'one'));
+    await connectRoot(page.request, temporaryRoot);
+    await expect.poll(async () => {
+      const image = await findImage(page.request, renamedRelativeImage);
+      return image?.auto_tags || [];
+    }, {timeout: 30_000}).toContain('one');
+    const renamedImage = await findImage(page.request, renamedRelativeImage);
+    expect(renamedImage?.id).not.toBe(imageId);
+    expect(renamedImage?.id).not.toBe(firstReconnect?.id);
+    expect(renamedImage?.auto_tags).toContain('one');
+    expect(renamedImage?.auto_tags || []).not.toContain('tree');
+    expect(renamedImage?.user_tags || []).not.toContain(userTag);
+    expect(await findImage(page.request, initialRelativeImage)).toBeNull();
+    const renamedThumbRequest = await page.request.get(`/thumb/${renamedImage?.id}?class=visible`);
+    expect([200, 202]).toContain(renamedThumbRequest.status());
+    await expect.poll(
+      () => fs.existsSync(path.join(temporaryRoot, '.imgindex', 'thumbs', `${renamedImage?.id}.jpg`)),
+      {timeout: 30_000},
+    ).toBe(true);
 
     await page.reload();
     await expect(page.locator('#gallery-screen')).toBeVisible();
     await disconnectRoot(page.request, fixtureRoot);
     await page.reload();
-    const card = page.locator(`.card[data-id="${imageId}"]`);
+    const card = page.locator(`.card[data-id="${renamedImage?.id}"]`);
     await expect(card).toBeVisible({timeout: 30_000});
     await card.click();
     await expect(page.locator('#preview-modal')).toBeVisible();

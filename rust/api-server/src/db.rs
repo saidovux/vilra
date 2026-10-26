@@ -20,8 +20,8 @@ use tagimage_db::sqlite::{
     get_sqlite_image_by_id_including_hidden, get_sqlite_job_api_value,
     list_sqlite_file_issue_recheck_targets_for_roots, list_sqlite_jobs,
     list_sqlite_thumb_rebuild_rows, load_sqlite_session, mutate_sqlite_session_value_with_root,
-    open_sqlite_runtime_db, query_sqlite_file_issues_for_roots, query_sqlite_images_page,
-    remove_sqlite_session_root, set_sqlite_session_root, sqlite_roots_from_session,
+    open_sqlite_runtime_db, purge_sqlite_library, query_sqlite_file_issues_for_roots,
+    query_sqlite_images_page, set_sqlite_session_root, sqlite_roots_from_session,
     summarize_sqlite_file_issues_for_roots, tag_sqlite_summary_rows_for_roots,
     update_sqlite_tag_definition, SqliteAutoTagCleanupResult, SqliteBatchImageTagsResult,
     SqliteFileIssue, SqliteFileIssueRecheckTarget, SqliteImageRecord, SqliteImagesQuery,
@@ -304,10 +304,10 @@ pub fn set_root(conn: &Connection, path: &str, append: bool) -> Result<Session, 
 }
 
 pub fn remove_root(conn: &Connection, path: &str) -> Result<SessionMutation, ApiError> {
-    remove_sqlite_session_root(conn, path)
-        .map(|SqliteSessionMutation { before, after }| SessionMutation {
-            before: session_from_sqlite(before),
-            after: session_from_sqlite(after),
+    purge_sqlite_library(conn, path)
+        .map(|result| SessionMutation {
+            before: session_from_sqlite(result.session.before),
+            after: session_from_sqlite(result.session.after),
         })
         .map_err(map_db_error)
 }

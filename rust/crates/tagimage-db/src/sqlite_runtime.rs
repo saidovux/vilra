@@ -63,6 +63,15 @@ pub struct SqliteSessionMutation {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct SqliteLibraryPurgeResult {
+    pub session: SqliteSessionMutation,
+    pub images_removed: i64,
+    pub issues_removed: i64,
+    pub jobs_removed: i64,
+    pub auto_tags_removed: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SqliteImageRecord {
     pub id: String,
     pub root_path: String,
@@ -2668,25 +2677,151 @@ pub fn remove_sqlite_session_root(
     root: &str,
 ) -> Result<SqliteSessionMutation, String> {
     mutate_sqlite_session(conn, |session| {
-        let roots = sqlite_roots_from_session(session);
-        if !roots.iter().any(|candidate| candidate == root) {
-            return Err(format!("Library is not connected: {root}"));
-        }
-        session.root_paths = roots
-            .into_iter()
-            .filter(|candidate| candidate != root)
-            .collect();
-        session.root_path = match session.root_path.as_deref() {
-            Some(active)
-                if active != root && session.root_paths.iter().any(|item| item == active) =>
-            {
-                Some(active.to_string())
-            }
-            _ => session.root_paths.last().cloned(),
-        };
-        session.last_image_id = None;
-        Ok(())
+        remove_sqlite_session_root_in_memory(session, root)
     })
+}
+
+pub fn purge_sqlite_library(
+    conn: &Connection,
+    root: &str,
+) -> Result<SqliteLibraryPurgeResult, String> {
+    with_immediate_tx(conn, || {
+        let before = load_sqlite_session(conn)?;
+        let mut pending = before.clone();
+        remove_sqlite_session_root_in_memory(&mut pending, root)?;
+
+        let image_ids = {
+            let mut stmt = conn
+                .prepare("SELECT id FROM images WHERE root_path = ?1")
+                .map_err(|e| format!("prepare sqlite library image ids: {e}"))?;
+            let rows = stmt
+                .query_map(params![root], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("query sqlite library image ids: {e}"))?;
+            collect_rows(rows, "read sqlite library image id")?
+                .into_iter()
+                .collect::<HashSet<_>>()
+        };
+
+        let job_ids = sqlite_library_job_ids(conn, root, &image_ids)?;
+        let jobs_removed = {
+            let mut delete = conn
+                .prepare("DELETE FROM jobs WHERE id = ?1")
+                .map_err(|e| format!("prepare sqlite library job deletion: {e}"))?;
+            let mut removed = 0_i64;
+            for job_id in job_ids {
+                removed += delete
+                    .execute(params![job_id])
+                    .map_err(|e| format!("delete sqlite library job: {e}"))?
+                    as i64;
+            }
+            removed
+        };
+
+        let issues_removed =
+            conn.execute(
+                "DELETE FROM file_issues WHERE root_path = ?1",
+                params![root],
+            )
+            .map_err(|e| format!("delete sqlite library file issues: {e}"))? as i64;
+        let images_removed =
+            conn.execute("DELETE FROM images WHERE root_path = ?1", params![root])
+                .map_err(|e| format!("delete sqlite library images: {e}"))? as i64;
+        let auto_tags_removed = conn
+            .execute(
+                r#"
+                DELETE FROM tags
+                WHERE user_defined = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM image_tags WHERE image_tags.tag_id = tags.id
+                  )
+                "#,
+                [],
+            )
+            .map_err(|e| format!("delete sqlite library orphan auto tags: {e}"))?
+            as i64;
+
+        clear_removed_image_references(&mut pending.tabs, &image_ids);
+        persist_sqlite_session_in_tx(conn, &pending)?;
+        let after = load_sqlite_session(conn)?;
+        Ok(SqliteLibraryPurgeResult {
+            session: SqliteSessionMutation { before, after },
+            images_removed,
+            issues_removed,
+            jobs_removed,
+            auto_tags_removed,
+        })
+    })
+}
+
+fn remove_sqlite_session_root_in_memory(
+    session: &mut SqliteSession,
+    root: &str,
+) -> Result<(), String> {
+    let roots = sqlite_roots_from_session(session);
+    if !roots.iter().any(|candidate| candidate == root) {
+        return Err(format!("Library is not connected: {root}"));
+    }
+    session.root_paths = roots
+        .into_iter()
+        .filter(|candidate| candidate != root)
+        .collect();
+    session.root_path = match session.root_path.as_deref() {
+        Some(active) if active != root && session.root_paths.iter().any(|item| item == active) => {
+            Some(active.to_string())
+        }
+        _ => session.root_paths.last().cloned(),
+    };
+    session.last_image_id = None;
+    Ok(())
+}
+
+fn sqlite_library_job_ids(
+    conn: &Connection,
+    root: &str,
+    image_ids: &HashSet<String>,
+) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, payload FROM jobs")
+        .map_err(|e| format!("prepare sqlite library jobs: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| format!("query sqlite library jobs: {e}"))?;
+    let jobs = collect_rows(rows, "read sqlite library job")?;
+    Ok(jobs
+        .into_iter()
+        .filter_map(|(job_id, payload_text)| {
+            let payload = serde_json::from_str::<JsonValue>(&payload_text).ok()?;
+            let belongs_to_root =
+                payload.get("root_path").and_then(JsonValue::as_str) == Some(root);
+            let belongs_to_image = payload
+                .get("image_id")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|image_id| image_ids.contains(image_id));
+            (belongs_to_root || belongs_to_image).then_some(job_id)
+        })
+        .collect())
+}
+
+fn clear_removed_image_references(tabs: &mut JsonValue, image_ids: &HashSet<String>) {
+    let Some(tabs) = tabs.as_array_mut() else {
+        return;
+    };
+    for tab in tabs {
+        let Some(tab) = tab.as_object_mut() else {
+            continue;
+        };
+        for field in ["lastImageId", "last_image_id"] {
+            if tab
+                .get(field)
+                .and_then(JsonValue::as_str)
+                .is_some_and(|image_id| image_ids.contains(image_id))
+            {
+                tab.insert(field.to_string(), JsonValue::Null);
+            }
+        }
+    }
 }
 
 pub fn sqlite_roots_from_session(session: &SqliteSession) -> Vec<String> {
@@ -4198,6 +4333,36 @@ mod tests {
             },
         )
         .expect("upsert fixture")
+    }
+
+    fn seed_job_with_history(
+        conn: &Connection,
+        id: &str,
+        job_type: &str,
+        payload: JsonValue,
+        state: &str,
+    ) {
+        conn.execute(
+            r#"
+            INSERT INTO jobs (id, job_type, payload, state, attempt, max_attempts)
+            VALUES (?1, ?2, ?3, ?4, 1, 3)
+            "#,
+            params![id, job_type, payload.to_string(), state],
+        )
+        .expect("seed job");
+        conn.execute(
+            r#"
+            INSERT INTO job_attempts (job_id, attempt, worker_id, state)
+            VALUES (?1, 1, 'fixture-worker', ?2)
+            "#,
+            params![id, state],
+        )
+        .expect("seed job attempt");
+        conn.execute(
+            "INSERT INTO job_events (job_id, event, data) VALUES (?1, 'fixture', '{}')",
+            params![id],
+        )
+        .expect("seed job event");
     }
 
     #[test]
@@ -5713,6 +5878,427 @@ mod tests {
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn purge_library_is_exact_atomic_and_preserves_files_and_global_state() {
+        let (dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let root_a = dir.path().join("Photos");
+        let nested = root_a.join("Album");
+        let other = dir.path().join("OtherPhotos");
+        std::fs::create_dir_all(root_a.join("tree")).expect("root a");
+        std::fs::create_dir_all(&nested).expect("nested root");
+        std::fs::create_dir_all(&other).expect("other root");
+        let original = root_a.join("tree/photo.jpg");
+        let cached = root_a.join(".imgindex/thumbs/old-thumb.jpg");
+        std::fs::write(&original, b"original-bytes").expect("original fixture");
+        std::fs::create_dir_all(cached.parent().expect("cache parent")).expect("cache dir");
+        std::fs::write(&cached, b"cached-thumbnail").expect("cache fixture");
+        let original_before = std::fs::read(&original).expect("read original before");
+        let cached_before = std::fs::read(&cached).expect("read cache before");
+
+        let root_a = canonicalize_sqlite_session_root(&root_a).expect("canonical root a");
+        let nested = canonicalize_sqlite_session_root(&nested).expect("canonical nested root");
+        let other = canonicalize_sqlite_session_root(&other).expect("canonical other root");
+        set_sqlite_session_root(&conn, Path::new(&root_a), true).expect("connect root a");
+        set_sqlite_session_root(&conn, Path::new(&nested), true).expect("connect nested root");
+        set_sqlite_session_root(&conn, Path::new(&other), true).expect("connect other root");
+
+        upsert_fixture(&conn, "image-a", &root_a, "tree/photo.jpg", 10, 10);
+        upsert_fixture(&conn, "image-hidden", &root_a, "hidden.jpg", 11, 11);
+        conn.execute("UPDATE images SET hidden = 1 WHERE id = 'image-hidden'", [])
+            .expect("hide image");
+        upsert_fixture(&conn, "image-nested", &nested, "nested.jpg", 12, 12);
+        upsert_fixture(&conn, "image-other", &other, "other.jpg", 13, 13);
+        replace_sqlite_image_tags(
+            &conn,
+            "image-a",
+            &["tree".to_string(), "shared-auto".to_string()],
+            "auto",
+        )
+        .expect("root auto tags");
+        replace_sqlite_image_tags(&conn, "image-hidden", &["hidden-only".to_string()], "auto")
+            .expect("hidden auto tag");
+        replace_sqlite_image_tags(&conn, "image-nested", &["shared-auto".to_string()], "auto")
+            .expect("shared auto on nested root");
+        replace_sqlite_image_tags(&conn, "image-a", &["favorite".to_string()], "user")
+            .expect("user tag");
+        conn.execute(
+            "INSERT INTO suppressed_auto_tags (normalized, name) VALUES ('global-hidden', 'Global Hidden')",
+            [],
+        )
+        .expect("suppressed auto tag");
+
+        conn.execute(
+            r#"
+            INSERT INTO file_issues (
+                image_id, root_path, path, severity, kind, size, mtime_ns
+            ) VALUES ('image-a', ?1, 'tree/photo.jpg', 'warning', 'format_mismatch', 1, 1),
+                     (NULL, ?1, 'broken.jpg', 'error', 'decode_error', 1, 1),
+                     ('image-nested', ?2, 'nested.jpg', 'warning', 'format_mismatch', 1, 1)
+            "#,
+            params![root_a, nested],
+        )
+        .expect("seed issues");
+
+        for (id, job_type, payload, state) in [
+            (
+                "a-queued",
+                "thumb",
+                json!({"image_id": "image-a"}),
+                "queued",
+            ),
+            (
+                "a-running",
+                "metadata",
+                json!({"root_path": root_a}),
+                "running",
+            ),
+            (
+                "a-succeeded",
+                "thumb",
+                json!({"root_path": root_a}),
+                "succeeded",
+            ),
+            (
+                "a-failed",
+                "metadata",
+                json!({"root_path": root_a}),
+                "failed",
+            ),
+            (
+                "a-canceled",
+                "metadata",
+                json!({"root_path": root_a}),
+                "canceled",
+            ),
+            (
+                "a-owned-future",
+                "future",
+                json!({"root_path": root_a}),
+                "queued",
+            ),
+            (
+                "nested",
+                "thumb",
+                json!({"root_path": nested, "image_id": "image-nested"}),
+                "queued",
+            ),
+            (
+                "other",
+                "metadata",
+                json!({"image_id": "image-other"}),
+                "succeeded",
+            ),
+            (
+                "unowned-future",
+                "future",
+                json!({"path": "tree/photo.jpg"}),
+                "queued",
+            ),
+        ] {
+            seed_job_with_history(&conn, id, job_type, payload, state);
+        }
+        conn.execute(
+            "INSERT INTO jobs (id, job_type, payload, state) VALUES ('malformed', 'future', '{', 'queued')",
+            [],
+        )
+        .expect("malformed payload job");
+
+        mutate_sqlite_session_value(
+            &conn,
+            &json!({
+                "last_image_id": "image-a",
+                "search_mode": "all",
+                "folder_tag_sync": false,
+                "tabs": [
+                    {"id": "a", "lastImageId": "image-a", "scrollTop": 40},
+                    {"id": "hidden", "last_image_id": "image-hidden"},
+                    {"id": "other", "lastImageId": "image-other", "scrollTop": 70}
+                ],
+                "active_tab_id": "other"
+            }),
+        )
+        .expect("session image references");
+
+        let purged = purge_sqlite_library(&conn, &root_a).expect("purge root a");
+        assert_eq!(purged.images_removed, 2);
+        assert_eq!(purged.issues_removed, 2);
+        assert_eq!(purged.jobs_removed, 6);
+        assert_eq!(purged.auto_tags_removed, 2);
+        assert_eq!(
+            purged.session.after.root_paths,
+            vec![nested.clone(), other.clone()]
+        );
+        assert_eq!(
+            purged.session.after.root_path.as_deref(),
+            Some(other.as_str())
+        );
+        assert_eq!(purged.session.after.last_image_id, None);
+        assert_eq!(purged.session.after.search_mode, "all");
+        assert!(!purged.session.after.folder_tag_sync);
+        assert_eq!(purged.session.after.active_tab_id.as_deref(), Some("other"));
+        assert_eq!(purged.session.after.tabs[0]["lastImageId"], JsonValue::Null);
+        assert_eq!(
+            purged.session.after.tabs[1]["last_image_id"],
+            JsonValue::Null
+        );
+        assert_eq!(purged.session.after.tabs[2]["lastImageId"], "image-other");
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM images WHERE root_path = ?1",
+                params![root_a],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("removed root images"),
+            0
+        );
+        assert!(
+            get_sqlite_image_by_id_including_hidden(&conn, "image-nested")
+                .expect("nested image")
+                .is_some()
+        );
+        assert!(
+            get_sqlite_image_by_id_including_hidden(&conn, "image-other")
+                .expect("other image")
+                .is_some()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM file_issues WHERE root_path = ?1",
+                params![nested],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("nested issue"),
+            1
+        );
+        for removed in [
+            "a-queued",
+            "a-running",
+            "a-succeeded",
+            "a-failed",
+            "a-canceled",
+            "a-owned-future",
+        ] {
+            assert!(get_sqlite_job(&conn, removed)
+                .expect("removed job")
+                .is_none());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM job_attempts WHERE job_id = ?1",
+                    params![removed],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("removed attempts"),
+                0
+            );
+            assert!(list_sqlite_job_events(&conn, removed)
+                .expect("removed events")
+                .is_empty());
+        }
+        for preserved in ["nested", "other", "unowned-future", "malformed"] {
+            assert!(get_sqlite_job(&conn, preserved)
+                .expect("preserved job")
+                .is_some());
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM tags WHERE normalized IN ('tree', 'hidden-only')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("orphan auto tags"),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM tags WHERE normalized IN ('shared-auto', 'favorite')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("global tag definitions"),
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM suppressed_auto_tags", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("suppressed auto tags"),
+            1
+        );
+
+        assert_eq!(
+            std::fs::read(&original).expect("original after"),
+            original_before
+        );
+        assert_eq!(std::fs::read(&cached).expect("cache after"), cached_before);
+
+        set_sqlite_session_root(&conn, Path::new(&root_a), true).expect("reconnect root a");
+        let replacement_id = upsert_sqlite_image(
+            &conn,
+            &SqliteImageUpsert {
+                id: None,
+                root_path: root_a.clone(),
+                path: "one/photo.jpg".to_string(),
+                thumb: String::new(),
+                size: 20,
+                mtime: 20,
+                width: 20,
+                height: 10,
+                ext: "jpg".to_string(),
+            },
+        )
+        .expect("replacement image");
+        assert_ne!(replacement_id, "image-a");
+        assert_eq!(
+            list_sqlite_tags_for_image(&conn, &replacement_id).expect("replacement tags"),
+            (Vec::<String>::new(), Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn purge_library_rolls_back_every_table_on_sql_error() {
+        let (dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let root = canonicalize_sqlite_session_root(&root).expect("canonical root");
+        set_sqlite_session_root(&conn, Path::new(&root), true).expect("connect root");
+        upsert_fixture(&conn, "image-a", &root, "a.jpg", 10, 10);
+        conn.execute(
+            "INSERT INTO file_issues (root_path, path, severity, kind, size, mtime_ns) VALUES (?1, 'bad.jpg', 'error', 'decode_error', 1, 1)",
+            params![root],
+        )
+        .expect("issue");
+        seed_job_with_history(
+            &conn,
+            "job-a",
+            "thumb",
+            json!({"root_path": root, "image_id": "image-a"}),
+            "queued",
+        );
+        conn.execute_batch(
+            r#"
+            CREATE TRIGGER fail_library_image_delete
+            BEFORE DELETE ON images
+            WHEN OLD.id = 'image-a'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected purge failure');
+            END;
+            "#,
+        )
+        .expect("failure trigger");
+
+        let error = purge_sqlite_library(&conn, &root).expect_err("purge must roll back");
+        assert!(error.contains("injected purge failure"));
+        assert_eq!(
+            load_sqlite_session(&conn).expect("session").root_paths,
+            vec![root]
+        );
+        assert!(get_sqlite_image_by_id_including_hidden(&conn, "image-a")
+            .expect("image")
+            .is_some());
+        assert_eq!(
+            summarize_sqlite_file_issues(&conn).expect("issues").total,
+            1
+        );
+        assert!(get_sqlite_job(&conn, "job-a").expect("job").is_some());
+        assert_eq!(
+            list_sqlite_job_events(&conn, "job-a")
+                .expect("events")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn purged_running_jobs_cannot_publish_or_restore_database_rows() {
+        let (dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let root = canonicalize_sqlite_session_root(&root).expect("canonical root");
+        set_sqlite_session_root(&conn, Path::new(&root), true).expect("connect root");
+        upsert_fixture(&conn, "image-a", &root, "a.jpg", 10, 10);
+        let thumb = enqueue_sqlite_job(
+            &conn,
+            "thumb",
+            json!({"image_id": "image-a", "root_path": root, "path": "a.jpg"}),
+            10,
+            3,
+            None,
+        )
+        .expect("thumb enqueue");
+        let metadata = enqueue_sqlite_job(
+            &conn,
+            "metadata",
+            json!({"image_id": "image-a", "root_path": root, "path": "a.jpg"}),
+            10,
+            3,
+            None,
+        )
+        .expect("metadata enqueue");
+        let thumb_claim = claim_next_sqlite_job(&conn, Some("thumb"), "thumb-worker")
+            .expect("thumb claim")
+            .expect("thumb job");
+        let metadata_claim = claim_next_sqlite_job(&conn, Some("metadata"), "metadata-worker")
+            .expect("metadata claim")
+            .expect("metadata job");
+
+        purge_sqlite_library(&conn, &root).expect("purge running jobs");
+        let published = std::cell::Cell::new(false);
+        assert!(
+            !finalize_sqlite_thumb_success(&conn, &thumb_claim, None, None, || {
+                published.set(true);
+                Ok(())
+            })
+            .expect("stale thumb finalize")
+        );
+        assert!(!published.get());
+        let issue = SqliteFileIssueUpsert {
+            image_id: Some("image-a".to_string()),
+            root_path: root.clone(),
+            path: "a.jpg".to_string(),
+            severity: FileIssueSeverity::Warning,
+            kind: FileIssueKind::FormatMismatch,
+            expected_format: Some(SupportedImageFormat::Jpeg),
+            detected_format: Some("png".to_string()),
+            size: 10,
+            mtime_ns: 10,
+            detail: Some("stale metadata callback".to_string()),
+        };
+        assert!(!mark_sqlite_metadata_succeeded_with_issue(
+            &conn,
+            &metadata_claim,
+            json!({"image_id": "image-a"}),
+            true,
+            Some(&issue),
+        )
+        .expect("stale metadata finalize"));
+        assert!(get_sqlite_job(&conn, &thumb.job.id)
+            .expect("thumb gone")
+            .is_none());
+        assert!(get_sqlite_job(&conn, &metadata.job.id)
+            .expect("metadata gone")
+            .is_none());
+        assert_eq!(
+            summarize_sqlite_file_issues(&conn).expect("issues").total,
+            0
+        );
+        drop(conn);
+
+        let reopened = open_sqlite_runtime_db(&db_path).expect("restart db");
+        assert!(
+            get_sqlite_image_by_id_including_hidden(&reopened, "image-a")
+                .expect("image after restart")
+                .is_none()
+        );
+        assert_eq!(
+            count_sqlite_jobs(&reopened, None, None).expect("jobs after restart"),
+            0
         );
     }
 

@@ -482,7 +482,12 @@ async function refreshFolderTree() {
 
 async function disconnectFolder(root: string): Promise<void> {
   if (!root || disconnectingRoots.has(root)) return;
-  if (!window.confirm('Убрать папку из Vilra? Файлы на диске не будут удалены')) return;
+  if (!window.confirm(
+    'Удалить библиотеку из Vilra?\n\n'
+    + 'Будут удалены индекс изображений, привязки тегов, история ошибок и задания этой библиотеки.\n\n'
+    + 'Оригинальные фотографии, папки и кеш `.imgindex` на диске останутся без изменений.\n\n'
+    + 'При повторном подключении фотографии будут просканированы заново.',
+  )) return;
   disconnectingRoots.add(root);
   renderFolderTree();
   try {
@@ -596,7 +601,7 @@ function renderFolderTree(): void {
       <div class="library-root" title="${escAttr(root)}">
         <div class="library-root-head">
           <span class="library-root-name">${escHtml(pathName(root))}</span>
-          <button class="library-disconnect-btn" type="button" data-action="disconnect-folder" data-root="${escAttr(root)}" ${disconnectingRoots.has(root) ? 'disabled' : ''}>Отключить</button>
+          <button class="library-disconnect-btn" type="button" data-action="disconnect-folder" data-root="${escAttr(root)}" ${disconnectingRoots.has(root) ? 'disabled' : ''}>Удалить из Vilra</button>
         </div>
         <span class="library-root-path">${escHtml(root)}</span>
       </div>

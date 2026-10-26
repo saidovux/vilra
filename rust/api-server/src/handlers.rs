@@ -1704,7 +1704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnecting_libraries_filters_active_apis_and_preserves_index_history() {
+    async fn disconnecting_libraries_purges_selected_index_and_preserves_files() {
         let dir = tempfile::tempdir().unwrap();
         let root_a = dir.path().join("library-a");
         let root_b = dir.path().join("library-b");
@@ -1773,6 +1773,11 @@ mod tests {
             .status()
             .iter()
             .all(|status| status.root_path != root_a.to_string_lossy()));
+        assert!(root_a.join("photo.jpg").is_file());
+        assert_eq!(
+            fs::read(root_a.join(".imgindex/thumbs/image-a.jpg")).unwrap(),
+            vec![10, 20, 30]
+        );
 
         assert_eq!(
             get_file(State(state.clone()), Path("image-a".to_string()))
@@ -1836,18 +1841,10 @@ mod tests {
         assert_eq!(problems["warnings"], 1);
 
         let conn = state.connect().unwrap();
-        assert_eq!(
+        assert!(
             tagimage_db::sqlite::get_sqlite_image_by_id_including_hidden(&conn, "image-a")
                 .unwrap()
-                .unwrap()
-                .id,
-            "image-a"
-        );
-        assert_eq!(
-            tagimage_db::sqlite::list_sqlite_tags_for_image(&conn, "image-a")
-                .unwrap()
-                .1,
-            vec!["keep-image-a".to_string()]
+                .is_none()
         );
         drop(conn);
 
@@ -1927,23 +1924,152 @@ mod tests {
         )
         .await
         .unwrap();
+        let replacement = {
+            let mut replacement = None;
+            for _ in 0..100 {
+                let conn = state.connect().unwrap();
+                replacement = tagimage_db::sqlite::get_sqlite_image_by_root_path_including_hidden(
+                    &conn,
+                    &root_a.to_string_lossy(),
+                    "photo.jpg",
+                )
+                .unwrap();
+                if replacement.is_some() {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+            replacement.expect("reconnected image")
+        };
+        assert_ne!(replacement.id, "image-a");
         let conn = state.connect().unwrap();
         assert_eq!(
-            tagimage_db::sqlite::get_sqlite_image_by_root_path_including_hidden(
-                &conn,
-                &root_a.to_string_lossy(),
-                "photo.jpg",
-            )
-            .unwrap()
-            .unwrap()
-            .id,
-            "image-a"
-        );
-        assert_eq!(
-            tagimage_db::sqlite::list_sqlite_tags_for_image(&conn, "image-a")
+            tagimage_db::sqlite::list_sqlite_tags_for_image(&conn, &replacement.id)
                 .unwrap()
                 .1,
-            vec!["keep-image-a".to_string()]
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_sql_failure_restores_watcher_and_rolls_back_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("photo.jpg");
+        fs::write(&source, encoded(ImageFormat::Jpeg)).unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        let fingerprint = file_fingerprint(&source).unwrap();
+        upsert_sqlite_image(
+            &conn,
+            &SqliteImageUpsert {
+                id: Some("rollback-image".to_string()),
+                root_path: root.to_string_lossy().into_owned(),
+                path: "photo.jpg".to_string(),
+                thumb: ".imgindex/thumbs/rollback-image.jpg".to_string(),
+                size: fingerprint.size,
+                mtime: fingerprint.mtime,
+                width: 4,
+                height: 3,
+                ext: "jpg".to_string(),
+            },
+        )
+        .unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TRIGGER fail_disconnect_image_delete
+            BEFORE DELETE ON images
+            WHEN OLD.id = 'rollback-image'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected disconnect failure');
+            END;
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+        let state = test_state_with_roots(dir.path(), db_path, vec![root.clone()]);
+
+        let error = disconnect_folder(
+            State(state.clone()),
+            Json(DisconnectFolderRequest {
+                path: root.to_string_lossy().into_owned(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        let conn = state.connect().unwrap();
+        assert_eq!(
+            db::load_session(&conn).unwrap().root_paths,
+            vec![root.to_string_lossy().into_owned()]
+        );
+        assert!(
+            tagimage_db::sqlite::get_sqlite_image_by_id_including_hidden(&conn, "rollback-image")
+                .unwrap()
+                .is_some()
+        );
+        drop(conn);
+        assert!(state
+            .live
+            .status()
+            .iter()
+            .any(|status| status.root_path == root.to_string_lossy()));
+    }
+
+    #[tokio::test]
+    async fn disconnecting_unavailable_root_still_purges_session_and_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("offline-library");
+        fs::create_dir_all(&root).unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let conn = init_sqlite_db(&db_path).unwrap();
+        upsert_sqlite_image(
+            &conn,
+            &SqliteImageUpsert {
+                id: Some("offline-image".to_string()),
+                root_path: root.to_string_lossy().into_owned(),
+                path: "missing.jpg".to_string(),
+                thumb: ".imgindex/thumbs/offline-image.jpg".to_string(),
+                size: 10,
+                mtime: 10,
+                width: 4,
+                height: 3,
+                ext: "jpg".to_string(),
+            },
+        )
+        .unwrap();
+        drop(conn);
+        let state = test_state_with_roots(dir.path(), db_path, vec![root.clone()]);
+        for _ in 0..100 {
+            if state
+                .live
+                .status()
+                .iter()
+                .any(|status| status.root_path == root.to_string_lossy())
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        fs::remove_dir(&root).unwrap();
+
+        let response = disconnect_folder(
+            State(state.clone()),
+            Json(DisconnectFolderRequest {
+                path: root.to_string_lossy().into_owned(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(response["root_paths"], json!([]));
+        let conn = state.connect().unwrap();
+        assert!(db::load_session(&conn).unwrap().root_paths.is_empty());
+        assert!(
+            tagimage_db::sqlite::get_sqlite_image_by_id_including_hidden(&conn, "offline-image")
+                .unwrap()
+                .is_none()
         );
     }
 
