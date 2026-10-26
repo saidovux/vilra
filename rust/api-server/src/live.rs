@@ -2363,6 +2363,12 @@ mod tests {
         let hub = EventHub::new();
         let mut events = hub.subscribe();
         let indexer = LiveIndexer::start(db_path.clone(), hub, vec![root.clone()]).unwrap();
+        wait_for_event(
+            "initial live watcher sync",
+            &mut events,
+            Duration::from_secs(5),
+            |event| event.kind == "sync_finished",
+        );
 
         let created = root.join("created.png");
         write_image(&created, [20, 30, 40]);
